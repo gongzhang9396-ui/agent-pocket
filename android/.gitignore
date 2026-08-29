@@ -1,0 +1,31 @@
+# Gradle
+.gradle/
+build/
+*/build/
+
+# Local configuration
+local.properties
+keystore.properties
+
+# Signing / output artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Kotlin / native build artifacts
+.kotlin/
+.cxx/
+.externalNativeBuild/
+captures/
+
+# OS
+.DS_Store
+Thumbs.db

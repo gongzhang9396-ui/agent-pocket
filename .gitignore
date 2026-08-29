@@ -1,0 +1,33 @@
+android/.gradle/
+android/**/build/
+android/local.properties
+android/app/google-services.json
+bridge/node_modules/
+bridge/bridge.env.ps1
+bridge/.tmp-real-codex/
+*.jks
+*.keystore
+
+# Local crash reports and runtime state
+*.log
+hs_err_pid*.log
+*.db
+*.db-shm
+*.db-wal
+pairing-*.png
+desktop-attach.json*
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.clixml
+*.key
+*.pem
+*.pfx
+firebase-service-account*.json
+tunnel/
+
+# Private operational notes retained outside the public repository
+HANDOFF.md
+DESKTOP-ATTACH-PLUGIN-POC.md

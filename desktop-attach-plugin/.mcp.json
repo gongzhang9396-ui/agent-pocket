@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "agent_pocket_desktop_attach": {
+      "command": "node",
+      "args": [
+        "./server.mjs"
+      ],
+      "cwd": ".",
+      "enabled": true,
+      "default_tools_approval_mode": "approve",
+      "env_vars": [
+        "CODEX_APP_TOOLS_PIPE_PATH",
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "PATH"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 30
+    }
+  }
+}

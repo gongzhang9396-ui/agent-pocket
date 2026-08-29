@@ -1,0 +1,317 @@
+package com.agentpocket.app.ui.screens
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Difference
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import com.agentpocket.app.data.MockPocketRepository
+import com.agentpocket.app.data.PocketRepository
+import com.agentpocket.app.data.model.ThreadStatus
+import com.agentpocket.app.data.model.TimelineItem
+import com.agentpocket.app.ui.components.ThreadStatusChip
+import com.agentpocket.app.ui.components.TimelineItemContent
+import com.agentpocket.app.ui.theme.AgentPocketTheme
+import com.agentpocket.app.ui.theme.StatusColors
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
+
+/**
+ * 会话详情：流式消息、计划、命令/测试卡、提问卡、审批卡（允许一次/拒绝/取消）、
+ * 底部 composer（运行中发送即 steer）、中断按钮。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SessionDetailScreen(
+    repo: PocketRepository,
+    threadId: String,
+    onBack: () -> Unit,
+    onOpenDiff: (String) -> Unit,
+) {
+    val detailState = remember(repo, threadId) { repo.threadDetail(threadId) }
+    val detail by detailState.collectAsState()
+    val actionError by repo.actionError.collectAsState()
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
+    var initialScrollDone by rememberSaveable(threadId) { mutableStateOf(false) }
+    var followTail by rememberSaveable(threadId) { mutableStateOf(true) }
+    var forceScrollRequest by rememberSaveable(threadId) { mutableStateOf(0) }
+    val desktopOwned = detail.status == ThreadStatus.DesktopOwned
+    val readOnly = detail.status == ThreadStatus.ExternalBusy
+    val running = detail.activeTurnId != null
+    val tailVersion = when (val tail = detail.items.lastOrNull()) {
+        is TimelineItem.Message -> "${tail.id}:${tail.text.length}:${tail.status}"
+        is TimelineItem.Command -> "${tail.id}:${tail.output.length}:${tail.status}"
+        is TimelineItem.Plan -> "${tail.id}:${tail.steps.hashCode()}:${tail.status}"
+        is TimelineItem.Question -> "${tail.id}:${tail.selectedOption}"
+        is TimelineItem.Approval -> "${tail.id}:${tail.decision}"
+        null -> ""
+    }
+
+    LaunchedEffect(threadId) { repo.clearActionError() }
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val layout = listState.layoutInfo
+            val lastVisible = layout.visibleItemsInfo.lastOrNull()?.index ?: -1
+            listState.isScrollInProgress to (
+                layout.totalItemsCount == 0 || lastVisible >= layout.totalItemsCount - 2
+            )
+        }.distinctUntilChanged().collect { (scrolling, nearBottom) ->
+            if (scrolling) followTail = nearBottom
+        }
+    }
+    LaunchedEffect(threadId, detail.items.size, tailVersion, forceScrollRequest) {
+        if (detail.items.isEmpty()) return@LaunchedEffect
+        if (!initialScrollDone || followTail) {
+            // The extra anchor is after the final timeline card, so this lands at
+            // the actual bottom even when the last message is taller than a screen.
+            listState.scrollToItem(detail.items.size)
+            initialScrollDone = true
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                detail.title,
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            ThreadStatusChip(detail.status)
+                        }
+                        Text(
+                            detail.cwd,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { onOpenDiff(threadId) }) {
+                        Icon(Icons.Filled.Difference, contentDescription = "查看变更")
+                    }
+                },
+            )
+        },
+        bottomBar = {
+            Composer(
+                running = running,
+                desktopOwned = desktopOwned,
+                readOnly = readOnly,
+                errorMessage = actionError,
+                onSend = {
+                    followTail = true
+                    repo.sendSteer(threadId, it)
+                    forceScrollRequest += 1
+                },
+                onInterrupt = { repo.interruptTurn(threadId) },
+            )
+        },
+        floatingActionButton = {
+            if (detail.items.isNotEmpty() && listState.canScrollForward) {
+                SmallFloatingActionButton(
+                    onClick = {
+                        followTail = true
+                        coroutineScope.launch { listState.animateScrollToItem(detail.items.size) }
+                    },
+                ) {
+                    Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "回到最新消息")
+                }
+            }
+        },
+    ) { padding ->
+        // keyed LazyColumn：后续接入 50 ms delta 合并时只需替换列表项，无需改动渲染层。
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            state = listState,
+        ) {
+            items(
+                detail.items,
+                key = { it.id },
+                contentType = {
+                    when (it) {
+                        is TimelineItem.Message -> "message"
+                        is TimelineItem.Plan -> "plan"
+                        is TimelineItem.Command -> "command"
+                        is TimelineItem.Question -> "question"
+                        is TimelineItem.Approval -> "approval"
+                    }
+                },
+            ) { item ->
+                TimelineItemContent(
+                    item = item,
+                    actionsEnabled = !desktopOwned && !readOnly,
+                    onAnswerQuestion = { requestId, questionId, option ->
+                        repo.answerQuestion(threadId, requestId, questionId, option)
+                    },
+                    onResolveApproval = { requestId, decision ->
+                        repo.resolveApproval(threadId, requestId, decision)
+                    },
+                )
+            }
+            item(key = "thread-end-anchor", contentType = "anchor") {
+                Spacer(Modifier.height(1.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun Composer(
+    running: Boolean,
+    desktopOwned: Boolean,
+    readOnly: Boolean,
+    errorMessage: String?,
+    onSend: (String) -> Unit,
+    onInterrupt: () -> Unit,
+) {
+    var text by rememberSaveable { mutableStateOf("") }
+    Surface(tonalElevation = 3.dp) {
+        Column(Modifier.imePadding()) {
+            if (desktopOwned) {
+                Text(
+                    "该任务由 Codex Desktop 持有。你可以从手机追加指令；中断、审批和问题回答仍需在电脑端处理。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StatusColors.external,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            } else if (readOnly) {
+                Text(
+                    "该任务被外部进程占用，移动端仅可查看，无法发送或强制接管。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StatusColors.external,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            }
+            if (!errorMessage.isNullOrBlank()) {
+                Text(
+                    errorMessage,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StatusColors.error,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+            }
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.Bottom,
+            ) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    enabled = !readOnly,
+                    placeholder = {
+                        Text(
+                            if (desktopOwned) "通过 Desktop 追加指令…" else if (running) "追加指令以调整当前任务…" else "继续对话…",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    },
+                    shape = RoundedCornerShape(20.dp),
+                    colors = OutlinedTextFieldDefaults.colors(),
+                    maxLines = 4,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                if (running && !desktopOwned && !readOnly) {
+                    FilledIconButton(
+                        onClick = onInterrupt,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = StatusColors.error,
+                            contentColor = MaterialTheme.colorScheme.onError,
+                        ),
+                    ) {
+                        Icon(Icons.Filled.Stop, contentDescription = "中断")
+                    }
+                    Spacer(Modifier.width(6.dp))
+                }
+                FilledIconButton(
+                    onClick = {
+                        if (text.isNotBlank()) {
+                            onSend(text.trim())
+                            text = ""
+                        }
+                    },
+                    enabled = !readOnly && text.isNotBlank(),
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+                }
+            }
+        }
+    }
+}
+
+@Preview(showBackground = true, backgroundColor = 0xFF0B0E13)
+@Composable
+private fun SessionDetailScreenPreview() {
+    AgentPocketTheme {
+        SessionDetailScreen(
+            repo = MockPocketRepository,
+            threadId = "t-payment-tests",
+            onBack = {},
+            onOpenDiff = {},
+        )
+    }
+}
