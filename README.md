@@ -27,6 +27,8 @@ Desktop 原生任务的硬中断、原生审批响应和结构化问题回答目
 
 ## 架构
 
+当前实现的组件职责、加密边界、Desktop/Bridge 两条任务路径和完整消息时序，见 [v0.2.9 架构与信息流](docs/ARCHITECTURE-v0.2.9.md)。
+
 ```text
 Android App (用户/设备密钥)
         │  HTTPS + WSS / Relay protocol v2
