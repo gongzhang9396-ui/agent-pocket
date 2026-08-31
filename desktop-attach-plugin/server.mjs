@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFil
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readAssistantTextFromRollout } from "./rollout-reader.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_RESULT_CHARS = 512 * 1024;
@@ -84,7 +85,7 @@ async function handleLine(line) {
           serverInfo: {
             name: "agent-pocket-desktop-attach",
             title: "Agent Pocket Desktop Attach",
-            version: "0.1.4",
+            version: "0.1.5",
           },
           instructions: "Local Agent Pocket adapter. Its user-facing MCP tools are read-only; authenticated local Bridge IPC may list projects and create, read, or continue Codex Desktop tasks.",
         });
@@ -317,14 +318,25 @@ async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
   const latestAssistantMessage = poll?.latestAssistantMessage && typeof poll.latestAssistantMessage === "object"
     ? poll.latestAssistantMessage
     : poll?.latestTurn?.latestAssistantMessage;
-  const fullAssistantText = typeof latestAssistantMessage?.text === "string"
+  let fullAssistantText = typeof latestAssistantMessage?.text === "string"
     ? latestAssistantMessage.text
     : undefined;
+  const turnId = firstString(wake?.turnId, poll?.latestTurn?.id);
+  if (!fullAssistantText && turnId && ["completed", "failed", "cancelled", "interrupted"].includes(turnStatus)) {
+    for (let attempt = 0; attempt < 4 && !fullAssistantText; attempt += 1) {
+      if (attempt > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      fullAssistantText = readAssistantTextFromRollout({
+        threadId,
+        turnId,
+        maxChars: MAX_DESKTOP_ITEM_CHARS,
+      });
+    }
+  }
   return {
     cursor: firstString(poll?.cursor),
     changed: poll?.changed === true,
     threadStatus,
-    turnId: firstString(wake?.turnId, poll?.latestTurn?.id),
+    turnId,
     turnStatus,
     wakeReason: firstString(wake?.reason),
     timedOut: payload?.timedOut === true,
@@ -526,6 +538,11 @@ async function establishBridgeHost() {
   if (existing && await probeExternalBridge(existing)) {
     externalBridgeHostReady = true;
     return;
+  }
+  if (existing) {
+    try { unlinkSync(bridgeRegistrationFile()); } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
   }
 
   let spawnError;

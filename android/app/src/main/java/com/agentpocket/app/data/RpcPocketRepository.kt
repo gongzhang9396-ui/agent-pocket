@@ -74,6 +74,9 @@ private const val INNER_RPC_TIMEOUT_MS = 30_000L
 internal fun isPendingSessionRejected(error: Throwable): Boolean =
     error is BridgeRpcException && error.nameCode == "AUTH_FAILED"
 
+internal fun shouldMarkSendFailed(currentStatus: MessageStatus?): Boolean =
+    currentStatus != MessageStatus.Done
+
 private data class ChannelState(
     val crypto: PhoneChannel,
     val ready: CompletableDeferred<Unit> = CompletableDeferred(),
@@ -408,7 +411,16 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 if (turnId == null) innerCall(ref.hostId, "turn/start", obj("threadId" to ref.threadId, "text" to text, "clientMessageId" to messageId))
                 else innerCall(ref.hostId, "turn/steer", obj("threadId" to ref.threadId, "expectedTurnId" to turnId, "text" to text, "clientMessageId" to messageId))
             }.onSuccess { updateMessageStatus(ref, messageId, MessageStatus.Done) }
-                .onFailure { updateMessageStatus(ref, messageId, MessageStatus.Failed); _actionError.value = actionError("发送", it) }
+                .onFailure { error ->
+                    val currentStatus = details[key]?.value?.items
+                        ?.filterIsInstance<TimelineItem.Message>()
+                        ?.firstOrNull { it.id == messageId }
+                        ?.status
+                    if (shouldMarkSendFailed(currentStatus)) {
+                        updateMessageStatus(ref, messageId, MessageStatus.Failed)
+                        _actionError.value = actionError("发送", error)
+                    }
+                }
         }
     }
 
