@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <instrumentation
+        android:name="com.agentpocket.app.data.ReleaseNativeCryptoInstrumentation"
+        android:targetPackage="com.agentpocket.app"
+        android:label="Agent Pocket release crypto self-test" />
+</manifest>

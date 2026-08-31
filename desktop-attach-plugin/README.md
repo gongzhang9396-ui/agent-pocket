@@ -18,18 +18,26 @@ These user-facing MCP tools remain read-only. They do not send prompts, interrup
 
 The manifest's `Interactive` capability describes the authenticated local Bridge IPC path documented below; it does not make the three user-facing MCP tools writable.
 
-For the Agent Pocket Bridge, the plugin also creates a random Windows named pipe and writes a short-lived local registration file to `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`. The registration contains a random 32-byte token and is inherited from the current Windows profile ACL. The pipe accepts only:
+For the Agent Pocket Bridge, the first successful Desktop probe starts a hidden, detached local host. That host keeps its own connection to the same Codex Desktop task channel, listens on the fixed local Windows named pipe `\\.\pipe\agent-pocket-desktop-attach-host`, and writes its registration to `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`. The registration contains a fresh random 32-byte token and is inherited from the current Windows profile ACL. The pipe accepts only:
 
 - `attach/probe`
+- `project/list`
 - `thread/list`
 - `thread/read`
+- `thread/create`
 - `thread/send`
 - `thread/wait`
 
-`thread/send` accepts only `{threadId, text}` and only for a Codex task returned by a recent `thread/list` call. It maps to Desktop's own `send_message_to_thread`; it does not delete locks, invoke a second app-server, interrupt tasks, or answer approvals. The pipe does not listen on TCP, LAN, OCI, or the public internet. The registration is removed when the owning plugin process exits, unless another plugin instance has already replaced it.
+`project/list` maps to Desktop's `list_projects`. The Bridge exposes only valid local projects whose canonical paths remain inside its configured project roots.
 
-`thread/wait` accepts only a recently confirmed `threadId`, an optional opaque cursor, and a timeout capped at eight seconds. It maps to Desktop's `wait_threads` and returns only status/cursor metadata; assistant text, prompts, commands, and output are never copied into the IPC response or logs.
+`thread/create` accepts a canonical `cwd`, prompt, model and reasoning effort. The path must match a local project already saved in Codex Desktop, and creation maps to Desktop's own `create_thread`.
 
-The Bridge pipe and registration file are created only when Codex Desktop provides `CODEX_APP_TOOLS_PIPE_PATH`. If an independent app-server loads the plugin, `desktop_attach_probe` reports `not-desktop-host` and that process is not allowed to publish or replace the Desktop registration.
+`thread/read`, `thread/send` and `thread/wait` delegate the supplied task ID to Desktop's own task tools. `thread/read` accepts Desktop's opaque cursor so Android can restore every history page after a reinstall instead of relying on in-memory state. They do not maintain a time-based authorization cache or require a prior list call. Before a remote read or write, the Bridge asks Desktop for the current task and verifies its canonical `cwd` against the configured project roots. Persistent `desktop | bridge` ownership prevents the independent app-server from touching Desktop-owned tasks.
+
+`thread/send` maps to Desktop's `send_message_to_thread`; it does not delete locks, invoke a second app-server, interrupt tasks, or answer approvals. `thread/wait` caps timeouts at eight seconds and returns status/cursor metadata plus at most 20,000 characters from Desktop's latest assistant message. It never returns the user prompt, command output, approval details, or tokens, and the content is not written to plugin logs. When the controlled task is also the host task, the plugin borrows another idle Codex task only as the caller context for `wait_threads`; it never sends content to that task. The pipe does not listen on TCP, LAN, OCI, or the public internet.
+
+The detached host is not a watchdog: it does not monitor, restart, or take ownership of any Codex task. It exists only to keep the authenticated local IPC adapter available after the short-lived MCP process that performed the probe exits. When the underlying Codex Desktop task channel closes, the host exits and removes its registration. A later Desktop probe may start a new host with a new token.
+
+The Bridge pipe and registration file are created only when Codex Desktop provides `CODEX_APP_TOOLS_PIPE_PATH`. If an independent app-server loads the plugin, `desktop_attach_probe` reports `not-desktop-host` and that process is not allowed to publish or replace the Desktop registration. A new plugin process also needs a real Desktop caller task id from the host environment or an initial `desktop_attach_probe`; it never fabricates a caller id for background Bridge requests.
 
 The implementation relies on the internal `CODEX_APP_TOOLS_PIPE_PATH` environment variable supplied by Codex Desktop. This is not a public compatibility contract. If the pipe or required task tools are unavailable, write calls fail closed and Agent Pocket must not fall back to another writer for a Desktop-owned task.

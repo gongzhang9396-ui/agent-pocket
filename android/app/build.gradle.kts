@@ -26,13 +26,20 @@ if (releaseRequested && (signingProperties == null || signingStorePassword.isNul
 android {
     namespace = "com.agentpocket.app"
     compileSdk = 36
+    testBuildType = "release"
 
     defaultConfig {
         applicationId = "com.agentpocket.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.1.5"
+        testInstrumentationRunner = "com.agentpocket.app.data.ReleaseNativeCryptoInstrumentation"
+        versionCode = 20
+        versionName = "0.2.7"
+        buildConfigField(
+            "String",
+            "UPDATE_API_URL",
+            "\"https://api.github.com/repos/gongzhang9396-ui/agent-pocket/releases/latest\"",
+        )
     }
 
     if (signingProperties != null && !signingStorePassword.isNullOrEmpty() && !signingKeyPassword.isNullOrEmpty()) {
@@ -57,6 +64,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            testProguardFiles("proguard-test-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
     }
@@ -82,16 +90,23 @@ android {
             excludes += "META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    sourceSets.getByName("androidTest").assets.srcDir("../../protocol")
 }
 
 dependencies {
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.fragment:fragment-ktx:1.8.9")
+    implementation("androidx.tracing:tracing:1.2.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.lifecycle:lifecycle-process:2.8.7")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    implementation("com.goterl:lazysodium-android:5.2.0") {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.camera:camera-camera2:1.4.2")
     implementation("androidx.camera:camera-lifecycle:1.4.2")
@@ -108,4 +123,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

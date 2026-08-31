@@ -1,7 +1,7 @@
 {
   "name": "agent-pocket-desktop-attach",
-  "version": "0.1.0",
-  "description": "Local adapter that lets Agent Pocket read Codex Desktop tasks and append prompts through authenticated Bridge IPC.",
+  "version": "0.1.4",
+  "description": "Local adapter that lets Agent Pocket create, read, and continue Codex Desktop tasks through authenticated Bridge IPC.",
   "author": {
     "name": "gongzhang9396-ui",
     "url": "https://github.com/gongzhang9396-ui"
@@ -9,11 +9,16 @@
   "homepage": "https://github.com/gongzhang9396-ui/agent-pocket",
   "repository": "https://github.com/gongzhang9396-ui/agent-pocket",
   "license": "Apache-2.0",
-  "keywords": ["android", "codex", "remote-control", "desktop"],
+  "keywords": [
+    "android",
+    "codex",
+    "remote-control",
+    "desktop"
+  ],
   "interface": {
     "displayName": "Agent Pocket Desktop Attach",
     "shortDescription": "Attach Agent Pocket to the Codex Desktop task host.",
-    "longDescription": "A local compatibility adapter for the running Codex Desktop task channel. User-facing plugin tools remain read-only; authenticated Agent Pocket Bridge IPC may append prompts only to recently confirmed Desktop tasks.",
+    "longDescription": "A local compatibility adapter for the running Codex Desktop task channel. User-facing plugin tools remain read-only; authenticated Agent Pocket Bridge IPC may list saved projects and create, read, or continue Codex Desktop tasks.",
     "developerName": "gongzhang9396-ui",
     "category": "Productivity",
     "capabilities": [

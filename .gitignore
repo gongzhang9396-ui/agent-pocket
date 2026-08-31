@@ -3,6 +3,12 @@ android/**/build/
 android/local.properties
 android/app/google-services.json
 bridge/node_modules/
+relay/node_modules/
+relay/dist/
+relay/admin/dist/
+installer/windows/payload/
+installer/windows/output/
+installer/windows/.cache/
 bridge/bridge.env.ps1
 bridge/.tmp-real-codex/
 *.jks

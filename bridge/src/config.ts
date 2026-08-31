@@ -14,20 +14,28 @@ export type BridgeConfig = {
   firebaseServiceAccount?: string;
   hostName: string;
   publicUrl?: string;
+  relayUrl?: string;
+  relayIdentityPath: string;
+  runtimeStatusPath?: string;
+  maintenancePath?: string;
 };
 
-export function loadConfig(env = process.env): BridgeConfig {
+export function loadConfig(
+  env = process.env,
+  options: { requireProjectRoots?: boolean } = {},
+): BridgeConfig {
   const local = env.LOCALAPPDATA || tmpdir();
   const configuredRoots = env.AGENT_POCKET_PROJECT_ROOTS;
-  if (!configuredRoots?.trim()) {
+  const requireProjectRoots = options.requireProjectRoots !== false;
+  if (requireProjectRoots && !configuredRoots?.trim()) {
     throw new Error("缺少 AGENT_POCKET_PROJECT_ROOTS；请显式配置允许访问的项目根目录");
   }
-  const roots = configuredRoots
+  const roots = (configuredRoots || "")
     .split(delimiter)
     .map((value) => value.trim())
     .filter(Boolean)
     .map((value) => resolve(value));
-  if (roots.length === 0) {
+  if (requireProjectRoots && roots.length === 0) {
     throw new Error("AGENT_POCKET_PROJECT_ROOTS 至少需要包含一个项目根目录");
   }
   return {
@@ -41,11 +49,15 @@ export function loadConfig(env = process.env): BridgeConfig {
     firebaseServiceAccount: env.AGENT_POCKET_FIREBASE_SERVICE_ACCOUNT,
     hostName: env.AGENT_POCKET_HOST_NAME || hostname(),
     publicUrl: env.AGENT_POCKET_WSS_URL,
+    relayUrl: env.AGENT_POCKET_RELAY_URL,
+    relayIdentityPath: resolve(env.AGENT_POCKET_RELAY_IDENTITY || join(local, "AgentPocket", "relay-host.json")),
+    runtimeStatusPath: resolve(env.AGENT_POCKET_RUNTIME_STATUS || join(local, "AgentPocket", "host-runtime.json")),
+    maintenancePath: resolve(env.AGENT_POCKET_MAINTENANCE || join(local, "AgentPocket", "host-maintenance.json")),
   };
 }
 
 function canonicalExisting(path: string) {
-  if (!existsSync(path)) throw new RpcError(ErrorName.PATH_DENIED, `路径不存在：${path}`);
+  if (!existsSync(path)) throw new RpcError(ErrorName.PATH_DENIED, "路径不存在或无法访问");
   return realpathSync.native(path);
 }
 
@@ -60,7 +72,7 @@ export function assertAllowedCwd(input: unknown, roots: string[]) {
     const rel = relative(actualRoot, cwd);
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
   });
-  if (!allowed) throw new RpcError(ErrorName.PATH_DENIED, `路径不在项目白名单内：${cwd}`);
+  if (!allowed) throw new RpcError(ErrorName.PATH_DENIED, "路径不在项目白名单内");
   return cwd;
 }
 

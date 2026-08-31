@@ -17,6 +17,20 @@ test("project roots must be configured explicitly", () => {
   );
 });
 
+test("administrative commands may load local state without project roots", () => {
+  const config = loadConfig({}, { requireProjectRoots: false });
+  assert.deepEqual(config.projectRoots, []);
+});
+
+test("relay-only Hosts may request an ephemeral loopback port", () => {
+  const config = loadConfig({
+    AGENT_POCKET_PROJECT_ROOTS: tmpdir(),
+    AGENT_POCKET_PORT: "0",
+  });
+  assert.equal(config.bindHost, "127.0.0.1");
+  assert.equal(config.port, 0);
+});
+
 test("cwd must stay inside a canonical project root", () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-path-"));
   const root = join(base, "allowed");

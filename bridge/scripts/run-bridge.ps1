@@ -3,7 +3,10 @@ $BridgeRoot = Split-Path -Parent $PSScriptRoot
 $ProcessUtils = Join-Path $PSScriptRoot "process-utils.ps1"
 . $ProcessUtils
 $ConfigFile = Join-Path $BridgeRoot "bridge.env.ps1"
-if (Test-Path -LiteralPath $ConfigFile) { . $ConfigFile }
+if (Test-Path -LiteralPath $ConfigFile) {
+    $ConfigScript = [ScriptBlock]::Create((Get-Content -Raw -Encoding UTF8 -LiteralPath $ConfigFile))
+    . $ConfigScript
+}
 
 $LogRoot = Join-Path $env:LOCALAPPDATA "AgentPocket"
 New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null

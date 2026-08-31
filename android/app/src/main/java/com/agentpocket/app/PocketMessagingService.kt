@@ -16,19 +16,21 @@ class PocketMessagingService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
         if (!getSharedPreferences("settings", MODE_PRIVATE).getBoolean("notifications", true)) return
         val type = message.data["type"].orEmpty()
-        val sessionId = message.data["sessionId"].orEmpty()
-        val completed = type == "turn.status"
+        val hostId = message.data["hostId"].orEmpty()
+        val eventId = message.data["eventId"].orEmpty()
+        val completed = type == "completed"
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Codex 任务提醒", NotificationManager.IMPORTANCE_DEFAULT))
         val intent = Intent(this, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        if (sessionId.isNotBlank()) intent.putExtra("threadId", sessionId)
+        if (hostId.isNotBlank()) intent.putExtra("hostId", hostId)
+        if (eventId.isNotBlank()) intent.putExtra("eventId", eventId)
         val pending = PendingIntent.getActivity(
-            this, sessionId.hashCode(), intent,
+            this, eventId.ifBlank { hostId }.hashCode(), intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         manager.notify(
-            message.data["eventId"].orEmpty().hashCode(),
+            eventId.ifBlank { hostId }.hashCode(),
             NotificationCompat.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_notify_more)
                 .setContentTitle(if (completed) "Codex 任务已完成" else "Codex 任务需要关注")

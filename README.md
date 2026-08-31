@@ -1,149 +1,140 @@
 # Agent Pocket
 
-Agent Pocket 是一个面向 Android 的远程 Codex 控制台。Codex、源码和 Bridge 都留在自己的 Windows 电脑；手机通过自己管理的 TLS 中继和 SSH reverse tunnel 查看任务、继续会话和接收实时状态，不需要占用 Android 的 VPN 槽位，也不需要在手机登录 ChatGPT。TLS 在中继终止，因此链路是分段加密，不是端到端加密。
+Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码和执行环境留在自己的 Windows 电脑；手机通过自托管 Relay 查看并继续真实 Desktop 任务，不占用 Android 的 VPN 槽位，也不要求手机登录 ChatGPT。
 
-> 当前项目仍处于实验阶段。Desktop Attach 依赖 Codex Desktop 的内部本地接口，Desktop 更新后可能需要适配。
+当前 v2 是邀请制、多用户、多主机架构，适合个人、家庭或小团队自托管。项目仍处于实验阶段：Desktop Attach 依赖 Codex Desktop 的内部本地能力，Desktop 更新后可能需要适配。
 
 ## 能力
 
-- Android 原生应用：任务收件箱、会话详情、新任务、流式消息、diff、二维码配对和断线重放。
-- Windows Bridge：JSON-RPC、五分钟一次性配对、设备令牌、SQLite 事件重放、项目目录白名单和可选 FCM。
-- 独立 Codex app-server：创建任务、steer、中断、审批和结构化问题回答。
-- Desktop Attach：读取真实 Codex Desktop 任务、向原任务追加消息并等待状态变化。
-- 公网中继：TLS 入口加 Windows 主动建立的 SSH reverse tunnel；Windows 不需要开放入站端口。
+- 一个 Relay 账号可绑定多台 Windows Host 和多部 Android 手机。
+- 首页聚合全部电脑的 Codex 任务，也可按电脑筛选在线状态和任务。
+- 读取历史、创建 Desktop 任务、续写原任务、实时同步回复和查看原生 diff。
+- Bridge 自建任务仍支持 steer、中断、单次审批和结构化问题回答。
+- 新手机需要可信手机批准；Host 使用五分钟二维码绑定。
+- 任务正文、提示词、代码和命令使用端到端加密，Relay 只保存路由元数据和密文。
+- Android 和 Windows Host 都支持签名更新；Host 有活动任务时不会强制替换。
 
-Desktop 原生 turn 的硬中断、原生审批响应和结构化问题回答目前没有稳定插件接口，因此不会通过第二个 app-server、删除 writer lock 或模拟坐标点击来强行实现。
+Desktop 原生任务的硬中断、原生审批响应和结构化问题回答目前没有稳定插件接口。Agent Pocket 不会启动第二个 writer、删除锁或模拟坐标点击来强抢任务。
 
 ## 架构
 
 ```text
-Android App
-  │  WSS + JSON-RPC 2.0 + device token
-  ▼
-Public Linux relay / Caddy / TCP 443
-  │  TLS termination + exact high-entropy route
-  ▼
-Relay loopback port
-  │  Windows-initiated SSH reverse tunnel
-  ▼
-Windows Bridge 127.0.0.1:8787
-  ├─ Desktop Attach plugin → Codex Desktop-owned tasks
-  └─ codex app-server --stdio → Bridge-owned tasks
+Android App (用户/设备密钥)
+        │  HTTPS + WSS / Relay protocol v2
+        │  X25519 signed channel + XChaCha20-Poly1305 secretstream
+        ▼
+Self-hosted Relay / Caddy / TCP 443
+        │  只见 accountId/hostId/deviceId/channelId/counter/kind + 密文
+        │  SQLite WAL：账户、设备、Host、密文快照、近期密文事件、审计
+        ▼
+Windows Host Connector (主动 WSS 出站)
+        │
+        ├─ Desktop Attach plugin → 真实 Codex Desktop 任务
+        └─ codex app-server --stdio → Bridge 自建任务
 ```
 
-公网中继是 TLS 终止点，因此这是分段加密，不是端到端加密。完整 WSS 地址中的高熵路径属于敏感配置；真正的身份认证仍由独立设备令牌完成。
+Relay 只监听 `127.0.0.1:8790`，由独立子域名的 Caddy 站点暴露。Windows Host 主动连接 Relay，不需要 SSH 反向隧道、Windows 入站端口或公网防火墙规则。
 
-## 环境要求
+## 加密与身份
 
-- Windows 10/11，Node.js 24，OpenSSH Client 和 Codex Desktop。
-- Android 8.0 或更高版本；构建需要 JDK 17、Android SDK Platform 36 和对应的 Build Tools。Gradle Wrapper 会下载项目声明的 Gradle/Android Gradle Plugin 依赖。
-- 一台具有公网 TCP 443 的 Linux 中继服务器，以及指向它的域名。
-- Caddy 或等价的 WebSocket 反向代理。
-- Windows、Bridge 和 Desktop Attach 使用同一个已登录的 Windows 用户。
+- 用户名不区分大小写；密码使用独立 salt 的 scrypt 摘要。
+- 访问令牌 15 分钟、刷新令牌 30 天；数据库只保存令牌哈希，设备、Host 和刷新令牌可独立撤销。
+- 账户拥有 Ed25519 签名身份和 X25519 加密身份；每台设备和 Host 另有独立密钥。
+- 手机与 Host 通过双方签名的临时 X25519 通道通信；外层信封作为 AEAD associated data，严格 counter 拒绝重放和乱序注入。
+- Windows Host 私钥、Host token 和内容密钥使用当前 Windows 用户的 DPAPI 加密落盘；通道握手 ID 会持久化以阻止 Relay 在有效期内跨重启重放。
+- Host 事件与快照使用持久 outbox；确认丢失时重发完全相同的密文，Relay 只对完全相同的重复信封返回幂等成功。
+- Relay 最多保留每台 Host 最近 24 小时或 20,000 条密文事件和最新密文任务快照；完整历史和所有写操作仍要求 Host 在线。
+- FCM 只包含 `hostId/eventId/type`，通知打开后再从 Relay 拉取并解密内容。
 
-手机不需要 ChatGPT 账号。真正的模型请求由 Windows 上的 Codex 发起，因此 Windows Codex 仍需使用 ChatGPT 登录、OpenAI API Key 或兼容的模型提供商配置。
+这是“管理员托管的端到端加密”，不是绝对零知识。首次管理员初始化时，浏览器生成离线恢复私钥；Relay 只保存恢复公钥和密封数据。持有恢复私钥及口令的管理员可以显式恢复设备，并最终获得读取该用户数据的能力。每次恢复都会写入审计记录。
+
+## 组件与技术
+
+| 组件 | 技术 |
+|---|---|
+| Android | Kotlin、Jetpack Compose Material 3、OkHttp、kotlinx.serialization、CameraX/ML Kit、Firebase Messaging、libsodium |
+| Windows Host | Node.js 24、TypeScript、`ws`、Node 内置 SQLite、libsodium、PowerShell、Task Scheduler、Inno Setup |
+| Desktop Attach | Codex 插件、Windows named pipe、随机本地令牌、Codex Desktop 任务工具 |
+| Relay | Node.js 24、TypeScript、`ws`、Node 内置 SQLite WAL、firebase-admin、libsodium |
+| 管理后台 | React、TypeScript、Vite、Lucide；HttpOnly/Secure/SameSite=Strict Cookie 与 CSRF |
+
+Android 要求 Android 8.0 或更高版本，`minSdk 26`、`compileSdk/targetSdk 36`。Windows Host 是每 Windows 用户安装；同一电脑的不同 Windows 用户会显示为不同 Host。
 
 ## 快速开始
 
-### Bridge
+### 1. Relay
+
+```bash
+cd relay
+npm ci
+npm test
+npm run build
+```
+
+生产配置和 systemd/Caddy 步骤见 [Relay 部署说明](relay/deploy/README.md)。Relay 必须放在独立 HTTPS 子域名后，loopback 端口不得开放公网。首次启动后执行：
+
+```bash
+node dist/cli.js bootstrap
+```
+
+在 15 分钟内打开一次性链接，创建管理员账号，并把浏览器下载的加密恢复文件离线保存。恢复文件和口令不得上传到 Relay 或提交 Git。
+
+### 2. Windows Host
+
+推荐使用每用户 Inno Setup 安装器。首次安装填写 Relay HTTPS 地址和项目白名单，再用已登录 Android 扫描五分钟 Host 二维码。Codex Desktop 必须由同一 Windows 用户自行登录。
+
+源码开发：
 
 ```powershell
 cd bridge
-Copy-Item .\bridge.env.example.ps1 .\bridge.env.ps1
-# 编辑 bridge.env.ps1，设置自己的项目根目录和公开 WSS 地址。
 npm ci
 npm test
+npm run relay-enroll -- https://relay.example.com
 npm start
 ```
 
-Bridge 固定监听 `127.0.0.1:8787`。不要将其改为 `0.0.0.0`，也不要直接开放 Windows 防火墙端口。
+安装器构建、Ed25519 发布签名和覆盖升级说明见 [Windows Host 安装说明](installer/windows/README.md)。安装器不修改系统代理、Windows 防火墙或其他代理服务。
 
-生成配对二维码：
-
-```powershell
-npm run pair
-```
-
-列出和撤销设备：
-
-```powershell
-npm run devices
-npm run revoke -- <deviceId>
-```
-
-### OCI + Caddy 参考中继
-
-仓库脚本提供的是 OCI/Linux + Caddy + systemd 的参考部署，需要远端管理员权限、可用的 Caddy 配置和公网 TCP 443。其他 Linux 或反向代理也可以使用，但必须实现同样的边界：WSS 在中继终止、只转发一条高熵路径到中继 loopback 端口，再由 Windows 主动建立的 SSH remote forward 接回 `127.0.0.1:8787`。不要让 Bridge 直接监听公网。
-
-先通过可信渠道核验服务器的 ED25519 主机指纹，再执行：
-
-```powershell
-cd bridge
-.\scripts\new-oci-tunnel-key.ps1
-.\scripts\deploy-oci-relay.ps1 `
-  -Domain "relay.example.com" `
-  -HostName "203.0.113.10" `
-  -AdminUser "cloud-user" `
-  -AdminKey "C:\secure\relay-admin.key" `
-  -HostKeySha256 "SHA256:<verified-fingerprint>"
-```
-
-`203.0.113.10` 是文档示例地址。不要把真实域名、IP、私钥路径、主机指纹或生成后的 WSS 路径提交到 Git。
-
-### Desktop Attach 插件
-
-插件源码位于 [`desktop-attach-plugin`](desktop-attach-plugin)。它通过随机 Windows named pipe 与 Bridge 通信，不监听 TCP。安装后需新建 Codex Desktop 任务才能加载新版本。
-
-当前仓库按源码方式分发该实验性插件，尚未提供一键公共 Marketplace 安装。开发安装时，请在 Codex Desktop 中打开本仓库，让 Codex 使用内置 `plugin-creator` 把 `desktop-attach-plugin` 安装到本机 personal marketplace；不要手工编辑 `marketplace.json`。安装后可用 `codex plugin list` 核对，再新建一个任务加载插件。相关命令以 [Codex 官方插件命令文档](https://developers.openai.com/codex/developer-commands#plugins) 为准。
-
-插件依赖 Codex Desktop 提供的内部 `CODEX_APP_TOOLS_PIPE_PATH`。该接口不是公开兼容契约；能力缺失或协议变化时，插件会失败关闭写入，不会切换到第二 writer。
-
-### Android
+### 3. Android
 
 ```powershell
 cd android
-.\gradlew.bat --no-daemon :app:assembleDebug
+.\gradlew.bat --no-daemon --no-configuration-cache :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest
 ```
 
-Release 构建使用本机独立签名材料：
+正式 APK 使用仓库外 keystore 构建。手机只登录 Relay 账号；模型请求仍由 Windows 上已登录的 Codex 发起。
 
-```powershell
-.\scripts\build-release.ps1
-```
+## v1 迁移
 
-相机只用于本地识别配对二维码。未配置 Firebase 时，前台 WSS 功能仍可使用，只有后台 FCM 提醒不可用。
+1. 备份旧 Bridge 数据和 Relay/Caddy 配置。
+2. 部署新的 Relay 子域名和 `127.0.0.1:8790` 服务，不改已有代理站点。
+3. 每台 Windows 安装 Host v2 并扫码绑定，验证任务列表、Desktop Attach 和实时事件。
+4. 安装 Android v2 并登录 Relay；v2 不读取旧直连凭据。
+5. 全部 Host 验证后，再停用旧 SSH Tunnel、撤销旧 Bridge 设备令牌并移除旧 Caddy 路由。
 
-## 安全设计
+不要删除本地 Bridge DB 或 Codex 历史。v1 与 v2 的手机凭据不兼容，这是一次明确切换。
 
-- Bridge 仅绑定 localhost；公网只能经过 TLS 中继和 SSH 隧道。
-- 配对 secret 五分钟过期且只能使用一次。
-- 设备令牌随机生成，服务端只保存 SHA-256 哈希。
-- Android 使用 Keystore AES-GCM 保存 endpoint、deviceId 和设备令牌。
-- 所有任务工作目录必须位于配置的真实路径白名单内。
-- Desktop 与 Bridge 任务具有持久 owner，禁止两个 app-server 同时写同一任务。
-- FCM 只允许发送 `hostId/sessionId/eventId/type`，不发送代码、提示词或输出。
-- 手机审批不提供“永久允许”。
+## 安全边界
 
-请阅读 [SECURITY.md](SECURITY.md) 后再公开部署。
+- Relay 与 Bridge 只监听 loopback；Host 只主动出站连接。
+- 所有数据库查询必须带 `account_id`，Host 归单一用户独占。
+- 所有 `cwd` 必须是白名单内已存在的绝对真实路径。
+- 手机审批不提供永久允许；Desktop owner 与 writer lock 不可绕过。
+- Host 更新必须同时通过固定 Ed25519 公钥、签名声明、文件大小和 SHA-256 校验。
+- 任何完整 Relay 凭据、令牌、私钥、恢复文件、Firebase 配置、签名材料、任务正文和运维交接都不得提交。
 
-## 永远不要提交
-
-- 完整 WSS 地址或高熵路径；
-- Bridge 设备令牌、配对二维码或 SQLite 数据库；
-- SSH 私钥、`known_hosts`、真实服务器 IP 和管理员账号；
-- Firebase 服务账号及 `google-services.json`；
-- Android release keystore、密码文件和 `keystore.properties`；
-- Codex 会话正文、日志、崩溃转储或本机运维交接文档。
+公开部署前请阅读 [SECURITY.md](SECURITY.md)。
 
 ## 项目结构
 
 ```text
 android/                 Android 原生客户端
-bridge/                  Windows Bridge、协议和部署脚本
+bridge/                  Windows Bridge 与 Relay Connector
 desktop-attach-plugin/   Codex Desktop Attach 实验性插件
+installer/windows/       每用户 Host 安装器与签名更新
+protocol/                跨端密码固定向量
+relay/                   多用户 Relay、管理后台和部署脚本
 ```
-
-Android、Bridge 和 Desktop Attach 分别维护组件版本，版本号不要求同步。
 
 ## License
 

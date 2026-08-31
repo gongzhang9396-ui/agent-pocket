@@ -11,7 +11,7 @@ npm run desktop-probe
 npm start
 ```
 
-`desktop-probe` 是 Desktop Attach 的只读诊断命令。它读取 `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`，通过随机 Windows named pipe 和随机令牌连接已运行的插件，并仅调用 `attach/probe` 与 `thread/list`。输出只包含能力名称和结果项数量，不打印任务正文或本地令牌。Bridge 服务已把手机 `thread/list` 设为 Desktop Attach 优先、插件失败自动回退；`thread/read` 仍使用独立 app-server，以保留完整对话正文。
+`desktop-probe` 是 Desktop Attach 的只读诊断命令。它读取 `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`，通过随机 Windows named pipe 和随机令牌连接已运行的插件，并仅调用 `attach/probe` 与 `thread/list`。输出只包含能力名称和结果项数量，不打印任务正文或本地令牌。Desktop-owned 任务的 `thread/list`、`thread/read` 和续写全部走 Codex Desktop 原生工具；Bridge-owned 任务才会交给独立 app-server，二者不会互相回退。
 
 隧道部署后，`pair` 会自动读取 `%LOCALAPPDATA%\AgentPocket\tunnel\tunnel.json` 中保存的 WSS endpoint；也可以显式传入 endpoint 覆盖它。
 

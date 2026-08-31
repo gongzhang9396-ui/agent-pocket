@@ -89,8 +89,14 @@ internal class BridgeRpcClient(
     override fun onMessage(webSocket: WebSocket, text: String) {
         val message = runCatching { json.parseToJsonElement(text) as? JsonObject }.getOrNull() ?: return
         val method = (message["method"] as? JsonPrimitive)?.contentOrNull
-        if (method == "bridge/event") {
-            (message["params"] as? JsonObject)?.let { event -> runCatching { onEvent(event) } }
+        if (method != null) {
+            val params = (message["params"] as? JsonObject) ?: JsonObject(emptyMap())
+            runCatching {
+                onEvent(buildJsonObject {
+                    put("method", method)
+                    put("params", params)
+                })
+            }
             return
         }
         val id = (message["id"] as? JsonPrimitive)?.longOrNull ?: return
@@ -101,7 +107,8 @@ internal class BridgeRpcClient(
             deferred.completeExceptionally(
                 BridgeRpcException(
                     (error["message"] as? JsonPrimitive)?.contentOrNull ?: "Bridge 请求失败",
-                    (data?.get("name") as? JsonPrimitive)?.contentOrNull,
+                    (error["code"] as? JsonPrimitive)?.contentOrNull
+                        ?: (data?.get("name") as? JsonPrimitive)?.contentOrNull,
                 ),
             )
         } else {

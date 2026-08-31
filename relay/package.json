@@ -1,0 +1,39 @@
+{
+  "name": "agent-pocket-relay",
+  "version": "0.2.1",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts serve",
+    "build": "tsc -p tsconfig.json && tsc -p admin/tsconfig.json --noEmit && vite build --config admin/vite.config.ts",
+    "start": "node dist/cli.js serve",
+    "bootstrap": "tsx src/cli.ts bootstrap",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "firebase-admin": "14.3.0",
+    "libsodium-wrappers-sumo": "0.8.4",
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.1.16",
+    "@types/react-dom": "^19.1.9",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12"
+  },
+  "overrides": {
+    "glob": "10.5.0",
+    "uuid": "11.1.1"
+  }
+}

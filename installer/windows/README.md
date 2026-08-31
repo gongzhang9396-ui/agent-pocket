@@ -1,0 +1,86 @@
+# Windows Host 安装器
+
+Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent Pocket Host`，不需要管理员权限。每个 Windows SID 使用独立的 Host 和更新计划任务，因此同一电脑的不同 Windows 用户可分别绑定到自己的 Relay 账户。
+
+安装器包含：
+
+- 固定版本的 Node.js 24 x64 运行时；
+- Bridge、Relay Connector 和 Desktop Attach 插件；
+- 本地稳定 Marketplace；
+- 登录启动任务和每日签名更新任务；
+- 安装时生成的 `update-policy.json` 公钥策略。
+
+它不会修改系统代理、Windows 防火墙、休眠策略或旧 Tunnel，也不会自动登录 Codex。
+
+## 首次安装
+
+首次安装向导要求：
+
+1. Relay 的完整 `https://` 地址；
+2. 一个或多个项目白名单根目录；
+3. 当前 Windows 用户已安装并登录 Codex Desktop。
+
+配置写入 `%LOCALAPPDATA%\AgentPocket\host-config.json`。Relay Host 身份、Bridge SQLite 和 Codex 历史也保存在该状态目录，卸载默认保留它们。
+
+安装完成后，从开始菜单运行“绑定这台 Windows 电脑”，用已登录的 Android v2 扫描五分钟二维码并确认 Host 名称。绑定成功后 Host 任务会重启以加载新身份。
+
+覆盖升级检测到现有 `host-config.json` 后会跳过 Relay/白名单页面，不重写配置、不删除 Host 身份，也不重复注册 Desktop Attach 插件。首次安装禁止静默模式，避免用示例配置误装。
+
+## 构建签名安装包
+
+需要 Inno Setup 6 和仓库外 Ed25519 私钥。私钥可通过明确文件提供：
+
+```powershell
+.\build-installer.ps1 `
+  -AppVersion 0.2.0 `
+  -SigningKeyFile C:\secure\agent-pocket-host-update-ed25519-private.pem
+```
+
+或只在当前进程环境提供 PEM：
+
+```powershell
+$env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY = Get-Content -Raw C:\secure\agent-pocket-host-update-ed25519-private.pem
+try { .\build-installer.ps1 -AppVersion 0.2.0 }
+finally { Remove-Item Env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY }
+```
+
+构建脚本：
+
+1. 下载固定 Node.js 版本并核对官方 SHA-256 清单；
+2. 只按显式文件白名单复制 Bridge、Desktop Attach 和运行脚本，未跟踪或额外文件不会进入 payload；
+3. 用 lockfile 安装 Bridge 生产依赖；
+4. 从私钥派生 Ed25519 SPKI 公钥并生成安装包内策略；
+5. 编译 `AgentPocketHost-<version>-windows-x64.exe`；
+6. 对规范更新声明签名并输出同名 `.sha256` 与 `.sig`；
+7. 把公开的 `update-policy.json` 复制到输出目录。
+
+私钥文件、PEM 环境值和任何真实 Relay 配置都不会写入 payload。没有签名私钥时构建会直接失败。
+
+发布到同一个 GitHub Release 的三个 Host 资产必须精确命名：
+
+```text
+AgentPocketHost-<version>-windows-x64.exe
+AgentPocketHost-<version>-windows-x64.exe.sha256
+AgentPocketHost-<version>-windows-x64.exe.sig
+```
+
+签名内容是以下 UTF-8 JSON 规范字符串：
+
+```json
+["agent-pocket-host-update-v1","<version>","<filename>","<sha256-lowercase>",<size>]
+```
+
+## 自动更新
+
+每日任务下载 GitHub 最新 Release 元数据，要求：
+
+- API、证明文件、安装包和最终重定向均使用 HTTPS；
+- 版本严格高于安装包内的当前版本；
+- 文件名、声明大小、SHA-256 和固定 Ed25519 公钥全部匹配；
+- 下载与响应大小不超过策略上限。
+
+校验失败会删除 `.part`，不会出现安装提示。校验成功后由用户确认；脚本写入五分钟维护锁，等待 Bridge 心跳确认维护模式，并再次确认运行状态新鲜且 `activeTaskCount == 0`。只有满足这些条件才会停止 Host 并执行静默覆盖安装。
+
+活动任务、状态未知、状态陈旧、Bridge 未确认维护或 Host 无法停止时都不会强制升级。失败路径会删除维护锁并恢复 Host 计划任务。中断命令在维护阶段仍可用。
+
+当前没有 Authenticode 证书，Windows 可能显示 SmartScreen 提示。发布页必须同时提供源码版本、SHA-256 和 Ed25519 签名；不要暗示已经获得系统级代码签名信誉。

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -34,19 +34,60 @@ class FakeCodex extends EventEmitter {
 class FakeDesktopAttach {
   calls: any[] = [];
   fail = false;
+  failProjects = false;
+  failCreate = false;
+  createError?: Error;
   failSend = false;
+  sendError?: Error;
+  failRead = false;
+  projects: any[] = [];
+  createCalls: any[] = [];
+  readCalls: any[] = [];
   sent: any[] = [];
   waitCalls: any[] = [];
   waitResults: any[] = [];
   activeWaits = 0;
   maxActiveWaits = 0;
   threadIds = ["desktop-thread"];
+  threadCwd = "";
   async listThreadsNormalized(limit: number, search?: string) {
     this.calls.push({ limit, search });
     if (this.fail) throw new Error("plugin unavailable");
     return { data: this.threadIds.map((id) => ({ id, source: "desktop" })), source: "desktop", readOnly: false };
   }
+  async listProjectsNormalized() {
+    if (this.failProjects) throw new Error("desktop project list failed");
+    return { data: this.projects, source: "desktop" };
+  }
+  async createThread(cwd: string, text: string, model?: string, effort?: string, workspaceMode = "local") {
+    this.createCalls.push({ cwd, text, model, effort, workspaceMode });
+    if (this.createError) throw this.createError;
+    if (this.failCreate) throw new Error("desktop create failed");
+    return {
+      source: "desktop",
+      hostId: "local",
+      thread: { id: "desktop-created", name: "Created", cwd, source: "desktop" },
+    };
+  }
+  async readThreadNormalized(threadId: string, turnLimit = 10, cursor?: string) {
+    this.readCalls.push(cursor ? { threadId, turnLimit, cursor } : { threadId, turnLimit });
+    if (this.failRead) throw new Error("desktop read failed with private details");
+    if (!this.threadIds.includes(threadId)) throw new Error("Desktop task was not found");
+    return {
+      source: "desktop",
+      thread: {
+        id: threadId,
+        kind: "codex",
+        name: "Desktop task",
+        cwd: this.threadCwd,
+        status: { type: "idle" },
+        turns: [{ id: "desktop-turn", status: "completed", items: [] }],
+        source: "desktop",
+      },
+    };
+  }
   async sendMessage(threadId: string, text: string) {
+    if (this.sendError) throw this.sendError;
     if (this.failSend) throw new Error("desktop send failed");
     this.sent.push({ threadId, text });
     return { accepted: true };
@@ -67,13 +108,17 @@ class FakeDesktopAttach {
 }
 
 async function settleWatcher() {
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  await new Promise((resolve) => setTimeout(resolve, 400));
 }
 
 function deferred<T>() {
   let resolvePromise!: (value: T) => void;
   const promise = new Promise<T>((resolve) => { resolvePromise = resolve; });
   return { promise, resolve: resolvePromise };
+}
+
+function readJson(path: string) {
+  return JSON.parse(readFileSync(path, "utf8"));
 }
 
 function rpc(socket: WebSocket, id: number, method: string, params: any = {}) {
@@ -104,10 +149,14 @@ test("pair, authenticate, hello, replay, and call bridge methods", async () => {
   const store = new BridgeStore(join(base, "bridge.db"));
   const pairing = store.createPairing();
   const codex = new FakeCodex();
+  const desktop = new FakeDesktopAttach();
+  desktop.projects = [
+    { id: "desktop-demo", name: "demo", cwd: join(root, "demo"), source: "desktop" },
+  ];
   const server = new BridgeServer({
     bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base,
     codexCommand: "fake", minCodexVersion: "1", projectRoots: [root], hostName: "test-host",
-  }, store, codex as any, { send: async () => {} } as any);
+  }, store, codex as any, { send: async () => {} } as any, desktop as any);
   await server.start();
   const address = server.wss!.address() as any;
   const url = `ws://127.0.0.1:${address.port}`;
@@ -145,6 +194,151 @@ test("rejects unauthenticated and pre-hello calls", async () => {
   store.close();
 });
 
+test("writes a fail-closed runtime status across app-server and Desktop activity", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-runtime-"));
+  const statusPath = join(base, "host-runtime.json");
+  const maintenancePath = join(base, "host-maintenance.json");
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const desktop = new FakeDesktopAttach();
+  const waiting = deferred<any>();
+  desktop.waitResults.push(waiting.promise);
+  const server = new BridgeServer({
+    bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base,
+    codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h",
+    runtimeStatusPath: statusPath, maintenancePath,
+  }, store, codex as any, { send: async () => {} } as any, desktop as any);
+
+  await server.start();
+  assert.deepEqual(
+    (({ running, activeTaskCount, maintenance }) => ({ running, activeTaskCount, maintenance }))(readJson(statusPath)),
+    { running: true, activeTaskCount: 0, maintenance: false },
+  );
+
+  server.onCodexNotification({ method: "turn/started", params: { threadId: "app-thread", turn: { id: "app-turn" } } });
+  assert.equal(readJson(statusPath).activeTaskCount, 1);
+  server.onCodexNotification({ method: "turn/completed", params: { threadId: "app-thread", turn: { id: "app-turn" } } });
+  assert.equal(readJson(statusPath).activeTaskCount, 0);
+
+  server.startDesktopWatcher("desktop-thread");
+  assert.equal(readJson(statusPath).activeTaskCount, 1);
+  waiting.resolve({ cursor: "done:1", changed: true, threadStatus: "idle", turnStatus: "completed", timedOut: false });
+  await server.desktopWatchers.get("desktop-thread")?.task;
+  assert.equal(readJson(statusPath).activeTaskCount, 0);
+
+  await server.stop();
+  const stopped = readJson(statusPath);
+  assert.equal(stopped.running, false);
+  assert.equal(stopped.activeTaskCount, 0);
+  assert.equal(stopped.pid, process.pid);
+  assert.ok(!Number.isNaN(Date.parse(stopped.updatedAt)));
+  store.close();
+});
+
+test("maintenance lock blocks new writes until it expires while interrupt remains available", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-maintenance-"));
+  const maintenancePath = join(base, "host-maintenance.json");
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  codex.markTurn("bridge-thread", "turn-1");
+  store.setThreadOwner("bridge-thread", "bridge");
+  const server = new BridgeServer({
+    bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base,
+    codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h",
+    runtimeStatusPath: join(base, "host-runtime.json"), maintenancePath,
+  }, store, codex as any, { send: async () => {} } as any);
+
+  writeFileSync(maintenancePath, JSON.stringify({ version: 1, requestId: "update-1", expiresAt: Date.now() + 60_000 }));
+  await assert.rejects(
+    server.dispatch({} as any, "turn/start", { threadId: "bridge-thread", text: "blocked" }),
+    (error: any) => error?.nameCode === "HOST_MAINTENANCE",
+  );
+  await server.dispatch({} as any, "turn/interrupt", { threadId: "bridge-thread", turnId: "turn-1" });
+  assert.ok(codex.calls.some((call) => call.method === "turn/interrupt"));
+
+  writeFileSync(maintenancePath, JSON.stringify({ version: 1, requestId: "update-2", expiresAt: Date.now() - 1 }));
+  const result = await server.dispatch({} as any, "turn/start", { threadId: "bridge-thread", text: "allowed" });
+  assert.equal(result.turn.id, "turn-1");
+  store.close();
+});
+
+test("an in-flight mutation remains visible after maintenance is requested", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-maintenance-race-"));
+  const maintenancePath = join(base, "host-maintenance.json");
+  const runtimeStatusPath = join(base, "host-runtime.json");
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const gate = deferred<any>();
+  const originalRequest = codex.request.bind(codex);
+  codex.request = async (method: string, params: any) => {
+    if (method === "turn/start") return gate.promise;
+    return originalRequest(method, params);
+  };
+  store.setThreadOwner("bridge-thread", "bridge");
+  const server = new BridgeServer({
+    bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base,
+    codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h",
+    runtimeStatusPath, maintenancePath,
+  }, store, codex as any, { send: async () => {} } as any);
+
+  const mutation = server.dispatch({} as any, "turn/start", { threadId: "bridge-thread", text: "delayed" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(server.inFlightMutations, 1);
+
+  writeFileSync(maintenancePath, JSON.stringify({ version: 1, requestId: "update-race", expiresAt: Date.now() + 60_000 }));
+  server.writeRuntimeStatus();
+  const during = readJson(runtimeStatusPath);
+  assert.equal(during.maintenance, true);
+  assert.equal(during.maintenanceRequestId, "update-race");
+  assert.equal(during.activeTaskCount, 1);
+  await assert.rejects(
+    server.dispatch({} as any, "turn/start", { threadId: "bridge-thread", text: "blocked" }),
+    (error: any) => error?.nameCode === "HOST_MAINTENANCE",
+  );
+
+  gate.resolve({ turn: { id: "turn-delayed" } });
+  await mutation;
+  assert.equal(server.inFlightMutations, 0);
+  assert.equal(readJson(runtimeStatusPath).activeTaskCount, 1);
+  codex.clearTurn("bridge-thread");
+  server.writeRuntimeStatus();
+  assert.equal(readJson(runtimeStatusPath).activeTaskCount, 0);
+  store.close();
+});
+
+test("project list uses saved Desktop projects and filters paths outside the whitelist", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-project-list-"));
+  const allowedRoot = join(base, "allowed");
+  const allowedProject = join(allowedRoot, "demo");
+  const outsideProject = join(base, "outside");
+  mkdirSync(allowedProject, { recursive: true });
+  mkdirSync(outsideProject, { recursive: true });
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const desktop = new FakeDesktopAttach();
+  desktop.projects = [
+    { id: "allowed", name: "Allowed", cwd: allowedProject, source: "desktop" },
+    { id: "outside", name: "Outside", cwd: outsideProject, source: "desktop" },
+  ];
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [allowedRoot], hostName: "h" },
+    store,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+    desktop as any,
+  );
+
+  const result = await server.dispatch({} as any, "project/list", {});
+  assert.deepEqual(result.data.map((project: any) => project.id), ["allowed"]);
+  assert.equal(result.excluded, 1);
+  assert.equal(result.warning, undefined);
+
+  desktop.projects = [{ id: "outside", name: "Outside", cwd: outsideProject, source: "desktop" }];
+  const empty = await server.dispatch({} as any, "project/list", {});
+  assert.deepEqual(empty.data, []);
+  assert.match(empty.warning, /白名单/);
+  store.close();
+});
+
 test("validates cursors and keeps approval and question response types separate", async () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-input-"));
   const store = new BridgeStore(join(base, "bridge.db"));
@@ -179,7 +373,7 @@ test("caps cumulative command output per item", () => {
   store.close();
 });
 
-test("prefers Desktop Attach inbox and falls back to app-server", async () => {
+test("uses Desktop Attach inbox and preserves attach failures", async () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-routing-"));
   const store = new BridgeStore(join(base, "bridge.db"));
   const codex = new FakeCodex();
@@ -198,9 +392,11 @@ test("prefers Desktop Attach inbox and falls back to app-server", async () => {
   assert.equal(codex.calls.length, 0);
 
   desktop.fail = true;
-  const fallback = await server.dispatch({} as any, "thread/list", { limit: 20 });
-  assert.deepEqual(fallback, { data: [] });
-  assert.equal(codex.calls.at(-1)?.method, "thread/list");
+  await assert.rejects(
+    server.dispatch({} as any, "thread/list", { limit: 20 }),
+    (error: any) => error?.nameCode === "INTERNAL" && !/plugin unavailable/.test(error.message),
+  );
+  assert.equal(codex.calls.length, 0);
   store.close();
 });
 
@@ -209,6 +405,7 @@ test("routes confirmed Desktop task writes through Desktop Attach without app-se
   const store = new BridgeStore(join(base, "bridge.db"));
   const codex = new FakeCodex();
   const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
   const server = new BridgeServer(
     { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
     store,
@@ -218,14 +415,14 @@ test("routes confirmed Desktop task writes through Desktop Attach without app-se
   );
   desktop.waitResults.push(
     { cursor: "baseline:1", changed: false, threadStatus: "idle", timedOut: true },
-    { cursor: "done:2", changed: true, threadStatus: "idle", turnId: "desktop-turn", turnStatus: "completed", wakeReason: "turnCompleted", timedOut: false },
+    { cursor: "done:2", changed: true, threadStatus: "idle", turnId: "desktop-turn", turnStatus: "completed", wakeReason: "turnCompleted", timedOut: false, assistantText: "first reply" },
     { cursor: "baseline:3", changed: false, threadStatus: "idle", timedOut: true },
-    { cursor: "done:4", changed: true, threadStatus: "idle", turnId: "desktop-turn-2", turnStatus: "completed", wakeReason: "turnCompleted", timedOut: false },
+    { cursor: "done:4", changed: true, threadStatus: "idle", turnId: "desktop-turn-2", turnStatus: "completed", wakeReason: "turnCompleted", timedOut: false, assistantText: "second reply" },
   );
 
   await server.dispatch({} as any, "thread/list", { limit: 20 });
-  const started = await server.dispatch({} as any, "turn/start", { threadId: "desktop-thread", text: "first" });
-  const steered = await server.dispatch({} as any, "turn/steer", { threadId: "desktop-thread", expectedTurnId: "desktop-turn", text: "second" });
+  const started = await server.dispatch({} as any, "turn/start", { threadId: "desktop-thread", text: "first", clientMessageId: "mobile-first" });
+  const steered = await server.dispatch({} as any, "turn/steer", { threadId: "desktop-thread", expectedTurnId: "desktop-turn", text: "second", clientMessageId: "mobile-second" });
   assert.equal(started.source, "desktop");
   assert.equal(steered.source, "desktop");
   assert.equal(started.liveSync, true);
@@ -238,16 +435,120 @@ test("routes confirmed Desktop task writes through Desktop Attach without app-se
   await settleWatcher();
   const syncEvents = store.eventsAfter(0).filter((event) => event.type === "sync.required");
   assert.equal(syncEvents.length, 2);
-  assert.equal(syncEvents[0].threadId, "desktop-thread");
-  assert.equal((syncEvents[0].payload as any).reason, "desktop-wait");
+  assert.ok(syncEvents.every((event) => event.threadId === "desktop-thread"));
+  assert.ok(syncEvents.every((event) => (event.payload as any).reason === "desktop-wait"));
   assert.equal(server.desktopWatchers.size, 0);
+  const desktopMessageEvents = store.eventsAfter(0).filter((event) =>
+    event.type === "message.delta" && (event.payload as any).source === "desktop",
+  );
+  assert.deepEqual(
+    desktopMessageEvents.filter((event) => (event.payload as any).role === "user").map((event) => (event.payload as any).itemId),
+    ["mobile-first", "mobile-second"],
+  );
+  assert.ok(desktopMessageEvents.some((event) => (event.payload as any).role === "assistant"));
+  const refreshed = await server.dispatch({} as any, "thread/read", { threadId: "desktop-thread" });
+  const refreshedItems = refreshed.thread.turns.flatMap((turn: any) => turn.items || []);
+  assert.ok(refreshedItems.some((item: any) => item.id === "mobile-first" && item.type === "userMessage"));
+  assert.ok(refreshedItems.some((item: any) => item.id === "mobile-second" && item.type === "userMessage"));
+  assert.ok(refreshedItems.some((item: any) => item.type === "agentMessage" && ["first reply", "second reply"].includes(item.text)));
 
+  desktop.sendError = new Error(
+    "function_call_output requires call_id on HTTP requests; continuation via previous_response_id is only supported on Responses WebSocket v2",
+  );
+  await assert.rejects(
+    server.dispatch({} as any, "turn/start", { threadId: "desktop-thread", text: "continue over http" }),
+    (error: any) => error?.nameCode === "VERSION_UNSUPPORTED" &&
+      /HTTP Responses/.test(error.message) &&
+      /新建和续写/.test(error.message) &&
+      !/function_call_output|previous_response_id/.test(error.message),
+  );
+  desktop.sendError = undefined;
   desktop.failSend = true;
   await assert.rejects(
     server.dispatch({} as any, "turn/start", { threadId: "desktop-thread", text: "must not fall back" }),
-    (error: any) => error?.nameCode === "THREAD_BUSY_EXTERNAL",
+    (error: any) => error?.nameCode === "INTERNAL" && !/desktop send failed/.test(error.message),
   );
   assert.equal(codex.calls.length, 0);
+  store.close();
+});
+
+test("creates new tasks through Codex Desktop without app-server fallback", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-create-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const desktop = new FakeDesktopAttach();
+  desktop.waitResults.push({
+    cursor: "created:1",
+    changed: true,
+    threadStatus: "idle",
+    turnId: "desktop-turn",
+    turnStatus: "completed",
+    wakeReason: "turnCompleted",
+    timedOut: false,
+  });
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+    desktop as any,
+  );
+
+  const created = await server.dispatch({} as any, "thread/start", {
+    target: "desktop",
+    workspaceMode: "local",
+    cwd: base,
+    text: "create on Desktop",
+    model: "gpt-test",
+    effort: "high",
+  });
+  assert.equal(created.source, "desktop");
+  assert.equal(created.thread.id, "desktop-created");
+  assert.equal(created.thread.source, "desktop");
+  assert.equal(store.threadOwner("desktop-created"), "desktop");
+  assert.deepEqual(desktop.createCalls, [{
+    cwd: base,
+    text: "create on Desktop",
+    model: "gpt-test",
+    effort: "high",
+    workspaceMode: "local",
+  }]);
+  assert.equal(codex.calls.filter((call) => ["thread/start", "turn/start"].includes(call.method)).length, 0);
+  await settleWatcher();
+
+  desktop.createError = new Error(
+    "Codex Desktop created the task but failed to initialize it: function_call_output requires call_id on HTTP requests; continuation via previous_response_id is only supported on Responses WebSocket v2",
+  );
+  await assert.rejects(
+    server.dispatch({} as any, "thread/start", {
+      target: "desktop",
+      workspaceMode: "local",
+      cwd: base,
+      text: "explain the Desktop regression",
+      model: "gpt-test",
+      effort: "medium",
+    }),
+    (error: any) => error?.nameCode === "VERSION_UNSUPPORTED" &&
+      /HTTP Responses/.test(error.message) &&
+      /WebSocket v2/.test(error.message) &&
+      /新建和续写/.test(error.message) &&
+      !/function_call_output|previous_response_id/.test(error.message),
+  );
+  desktop.createError = undefined;
+
+  desktop.failCreate = true;
+  await assert.rejects(
+    server.dispatch({} as any, "thread/start", {
+      target: "desktop",
+      workspaceMode: "local",
+      cwd: base,
+      text: "must not fall back",
+      model: "gpt-test",
+      effort: "medium",
+    }),
+    (error: any) => error?.nameCode === "INTERNAL" && !/desktop create failed/.test(error.message),
+  );
+  assert.equal(codex.calls.filter((call) => ["thread/start", "turn/start"].includes(call.method)).length, 0);
   store.close();
 });
 
@@ -255,6 +556,7 @@ test("Desktop watcher falls back to one targeted sync event when wait fails", as
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-wait-fallback-"));
   const store = new BridgeStore(join(base, "bridge.db"));
   const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
   desktop.waitResults.push(
     { cursor: "baseline:1", changed: false, threadStatus: "idle", timedOut: true },
     new Error("wait schema changed and included secret text"),
@@ -283,6 +585,7 @@ test("keeps only one Desktop watcher while the same task receives another prompt
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-wait-singleton-"));
   const store = new BridgeStore(join(base, "bridge.db"));
   const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
   const inProgress = deferred<any>();
   desktop.waitResults.push(
     { cursor: "baseline:1", changed: false, threadStatus: "idle", timedOut: true },
@@ -327,7 +630,7 @@ test("a persisted Bridge owner cannot be reclassified by the Desktop inbox", asy
     desktop as any,
   );
 
-  await firstServer.dispatch({} as any, "thread/start", { cwd: base, text: "create", model: "gpt-test", effort: "medium" });
+  await firstServer.dispatch({} as any, "thread/start", { target: "bridge", cwd: base, text: "create", model: "gpt-test", effort: "medium" });
   assert.equal(firstStore.threadOwner("thread-1"), "bridge");
   const inbox = await firstServer.dispatch({} as any, "thread/list", { limit: 20 });
   assert.equal(inbox.data[0].source, "bridge");
@@ -353,7 +656,7 @@ test("a persisted Bridge owner cannot be reclassified by the Desktop inbox", asy
   reopenedStore.close();
 });
 
-test("unknown owners never fall through to app-server writes when Desktop Attach is offline", async () => {
+test("unknown owners never fall through to app-server writes and report not found", async () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-owner-unknown-"));
   const store = new BridgeStore(join(base, "bridge.db"));
   const codex = new FakeCodex();
@@ -367,25 +670,26 @@ test("unknown owners never fall through to app-server writes when Desktop Attach
 
   await assert.rejects(
     server.dispatch({} as any, "turn/start", { threadId: "unknown-thread", text: "blocked" }),
-    (error: any) => error?.nameCode === "THREAD_BUSY_EXTERNAL",
+    (error: any) => error?.nameCode === "NOT_FOUND",
   );
   await assert.rejects(
     server.dispatch({} as any, "turn/steer", { threadId: "unknown-thread", expectedTurnId: "turn-1", text: "blocked" }),
-    (error: any) => error?.nameCode === "THREAD_BUSY_EXTERNAL",
+    (error: any) => error?.nameCode === "NOT_FOUND",
   );
   await assert.rejects(
     server.dispatch({} as any, "turn/interrupt", { threadId: "unknown-thread", turnId: "turn-1" }),
-    (error: any) => error?.nameCode === "THREAD_BUSY_EXTERNAL",
+    (error: any) => error?.nameCode === "NOT_FOUND",
   );
   assert.equal(codex.calls.filter((call) => ["turn/start", "turn/steer", "turn/interrupt"].includes(call.method)).length, 0);
   store.close();
 });
 
-test("annotates Desktop task reads and rejects unconfirmed writes", async () => {
+test("annotates Desktop task reads and rejects unknown writes without a busy error", async () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-owner-"));
   const store = new BridgeStore(join(base, "bridge.db"));
   const codex = new FakeCodex();
   const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
   const server = new BridgeServer(
     { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
     store,
@@ -397,11 +701,74 @@ test("annotates Desktop task reads and rejects unconfirmed writes", async () => 
   const read = await server.dispatch({} as any, "thread/read", { threadId: "desktop-thread" });
   assert.equal(read.thread.source, "desktop");
   assert.equal(read.thread.capabilities.interrupt, false);
+  assert.equal(read.thread.turns.length, 1);
+  assert.deepEqual(desktop.readCalls, [{ threadId: "desktop-thread", turnLimit: 10 }]);
+  await server.dispatch({} as any, "thread/read", { threadId: "desktop-thread", cursor: "older:1" });
+  assert.deepEqual(desktop.readCalls.at(-1), { threadId: "desktop-thread", turnLimit: 10, cursor: "older:1" });
+  await assert.rejects(
+    server.dispatch({} as any, "thread/read", { threadId: "desktop-thread", cursor: "" }),
+    (error: any) => error?.nameCode === "INVALID_REQUEST",
+  );
+  assert.equal(codex.calls.filter((call) => call.method === "thread/read").length, 0);
 
   await assert.rejects(
     server.dispatch({} as any, "turn/start", { threadId: "unknown-thread", text: "blocked" }),
-    (error: any) => error?.nameCode === "THREAD_BUSY_EXTERNAL",
+    (error: any) => error?.nameCode === "NOT_FOUND",
   );
   assert.equal(codex.calls.filter((call) => call.method === "turn/start").length, 0);
+  store.close();
+});
+
+test("reads persisted Bridge tasks only through the independent app-server", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-bridge-read-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
+  store.setThreadOwner("bridge-thread", "bridge");
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+    desktop as any,
+  );
+
+  const read = await server.dispatch({} as any, "thread/read", { threadId: "bridge-thread" });
+  assert.equal(read.thread.id, "bridge-thread");
+  assert.deepEqual(desktop.readCalls, []);
+  assert.equal(codex.calls.filter((call) => call.method === "thread/read").length, 1);
+  store.close();
+});
+
+test("Desktop task reads and writes stay inside the configured project roots", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-root-"));
+  const allowed = join(base, "allowed");
+  const outside = join(base, "outside");
+  mkdirSync(allowed, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const desktop = new FakeDesktopAttach();
+  desktop.threadIds = ["outside-thread"];
+  desktop.threadCwd = outside;
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [allowed], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+    desktop as any,
+  );
+
+  await assert.rejects(
+    server.dispatch({} as any, "thread/read", { threadId: "outside-thread" }),
+    (error: any) => error?.nameCode === "PATH_DENIED",
+  );
+  await assert.rejects(
+    server.dispatch({} as any, "turn/start", { threadId: "outside-thread", text: "blocked" }),
+    (error: any) => error?.nameCode === "PATH_DENIED",
+  );
+  assert.equal(desktop.sent.length, 0);
+  assert.equal(codex.calls.length, 0);
   store.close();
 });

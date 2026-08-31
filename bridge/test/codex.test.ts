@@ -42,6 +42,17 @@ test("stale active status without an in-progress turn may be resumed", async () 
   assert.deepEqual(await codex.assertThreadControllable("thread-idle"), { thread });
 });
 
+test("active status with no turns may be resumed", async () => {
+  const thread = {
+    id: "thread-empty-active",
+    status: { type: "active", activeFlags: [] },
+    turns: [],
+  };
+  const { codex } = fakeServer(thread);
+
+  assert.deepEqual(await codex.assertThreadControllable("thread-empty-active"), { thread });
+});
+
 test("a bridge-owned in-progress turn remains controllable", async () => {
   const thread = {
     id: "thread-owned",
@@ -58,4 +69,9 @@ test("writer-lock arbitration still maps to external busy", () => {
   const mapped = mapCodexBusy(new Error("writer lock is held by another app-server"));
   assert.ok(mapped instanceof RpcError);
   assert.equal(mapped.nameCode, ErrorName.THREAD_BUSY_EXTERNAL);
+});
+
+test("ordinary Desktop Attach failures are not rewritten as busy", () => {
+  const error = new Error("Could not attach to Codex Desktop: pipe closed");
+  assert.equal(mapCodexBusy(error), error);
 });

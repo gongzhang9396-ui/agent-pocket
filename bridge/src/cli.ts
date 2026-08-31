@@ -1,20 +1,31 @@
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "./config.ts";
 import { CodexAppServer } from "./codex.ts";
 import { DesktopAttachClient } from "./desktop-attach.ts";
 import { FcmNotifier } from "./fcm.ts";
+import { checkForHostUpdate } from "./host-updater.ts";
 import { BridgeServer } from "./server.ts";
 import { BridgeStore } from "./store.ts";
+import { RelayConnector, beginHostEnrollment, waitForHostEnrollment } from "./relay-connector.ts";
+import { loadHostIdentity } from "./relay-crypto.ts";
 
 function usage() {
-  console.log("Agent Pocket Bridge\n\n  serve\n  pair [wss-url]\n  devices\n  revoke <device-id>\n  desktop-probe");
+  console.log("Agent Pocket Bridge\n\n  serve\n  relay-enroll [https-url]\n  relay-status\n  host-update-check [--policy <file>] [--output <directory>]\n  pair [wss-url]\n  devices\n  revoke <device-id>\n  desktop-probe");
 }
 
-async function writePairingPng(uri: string, pairingId: string) {
+function optionValue(argv: string[], name: string) {
+  const index = argv.indexOf(name);
+  if (index < 0) return undefined;
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} 缺少参数`);
+  return value;
+}
+
+export async function writePairingPng(uri: string, pairingId: string) {
   try {
     const module = await import("qrcode");
     const qr = module.default ?? module;
@@ -40,7 +51,7 @@ async function writePairingPng(uri: string, pairingId: string) {
   }
 }
 
-async function printPairingQr(uri: string) {
+export async function printPairingQr(uri: string) {
   try {
     const module = await import("qrcode-terminal");
     const qr = module.default ?? module;
@@ -88,7 +99,6 @@ function savedTunnelUrl() {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const config = loadConfig();
   const command = argv[0];
   if (!command || ["-h", "--help", "help"].includes(command)) return usage();
 
@@ -106,7 +116,48 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
 
+  if (command === "host-update-check") {
+    const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+    const installRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const policyPath = optionValue(argv, "--policy") || process.env.AGENT_POCKET_UPDATE_POLICY || join(installRoot, "update-policy.json");
+    const outputDir = optionValue(argv, "--output") || process.env.AGENT_POCKET_UPDATE_DIR || join(localAppData, "AgentPocket", "updates");
+    const result = await checkForHostUpdate({ policyPath, outputDir });
+    console.log(JSON.stringify(result));
+    return;
+  }
+
+  // Pairing and device administration only need the local state database.
+  // Keep the strict project-root requirement on the long-running Bridge.
+  const config = loadConfig(process.env, { requireProjectRoots: command === "serve" });
   const store = new BridgeStore(config.dbPath);
+
+  if (command === "relay-enroll") {
+    const relayUrl = argv[1] || config.relayUrl;
+    if (!relayUrl) throw new Error("缺少 Relay 地址；请执行 relay-enroll https://你的Relay域名");
+    const started = await beginHostEnrollment(relayUrl, config.hostName, config.relayIdentityPath);
+    const pngFile = await writePairingPng(started.enrollment.pairUri, started.enrollment.id);
+    console.log(`Relay：${relayUrl}\n有效期：5 分钟\nHost：${config.hostName}`);
+    if (pngFile) console.log(`\n已生成二维码图片并尝试打开：${pngFile}`);
+    console.log("\n请用已登录 Agent Pocket v2 的手机扫码确认这台电脑：");
+    await printPairingQr(started.enrollment.pairUri);
+    await waitForHostEnrollment(relayUrl, config.relayIdentityPath, started.identity, started.enrollment);
+    console.log("\nHost 已绑定。重新启动 Agent Pocket Bridge 后将自动连接 Relay。");
+    store.close();
+    return;
+  }
+  if (command === "relay-status") {
+    const identity = loadHostIdentity(config.relayIdentityPath);
+    console.log(JSON.stringify(identity ? {
+      enrolled: Boolean(identity.hostToken && identity.hostId && identity.accountId),
+      relayUrl: identity.relayUrl,
+      hostName: identity.hostName,
+      hostId: identity.hostId,
+      accountId: identity.accountId,
+      lastBridgeSeq: identity.lastBridgeSeq,
+    } : { enrolled: false }, null, 2));
+    store.close();
+    return;
+  }
 
   if (command === "pair") {
     const endpoint = normalizePublicUrl(argv[1] || config.publicUrl || savedTunnelUrl());
@@ -152,12 +203,23 @@ export async function main(argv = process.argv.slice(2)) {
     new DesktopAttachClient(),
   );
   await bridge.start();
+  const relayIdentity = loadHostIdentity(config.relayIdentityPath);
+  const relayUrl = config.relayUrl || relayIdentity?.relayUrl;
+  let relayConnector: RelayConnector | undefined;
+  if (relayUrl && relayIdentity?.hostToken) {
+    relayConnector = new RelayConnector(relayUrl, config.relayIdentityPath, relayIdentity, bridge, store);
+    relayConnector.on("status", (status) => writeSync(1, `Agent Pocket Relay：${status.connected ? "已连接" : `已断开（${status.error || "正在重连"}）`}\n`));
+    relayConnector.start();
+  } else if (relayUrl) {
+    writeSync(1, "Agent Pocket Relay：尚未绑定，请执行 relay-enroll\n");
+  }
   writeSync(1, `Agent Pocket Bridge：http://${config.bindHost}:${config.port}（Codex ${status.version}${status.readOnly ? "，只读" : ""}）\n`);
 
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    await relayConnector?.stop();
     await bridge.stop();
     codex.stop();
     store.close();

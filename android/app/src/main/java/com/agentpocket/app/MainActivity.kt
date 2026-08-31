@@ -20,13 +20,17 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         acceptLaunchIntent(intent)
-        val repo = (application as PocketApplication).repository
+        val pocketApplication = application as PocketApplication
+        val repo = pocketApplication.repository
         if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         setContent {
             val request by launchRequest
             PocketApp(
                 repo = repo,
+                updater = pocketApplication.updater,
                 initialThreadId = request?.threadId,
+                initialHostId = request?.hostId,
+                initialEventId = request?.eventId,
                 launchRequestKey = request?.sequence ?: 0L,
             )
         }
@@ -44,9 +48,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun acceptLaunchIntent(intent: Intent) {
-        val threadId = intent.getStringExtra("threadId")?.takeIf { it.isNotBlank() } ?: return
-        launchRequest.value = LaunchRequest(threadId, ++launchSequence)
+        val hostId = intent.getStringExtra("hostId")?.takeIf { it.isNotBlank() }
+        val threadId = intent.getStringExtra("threadId")?.takeIf { it.isNotBlank() }
+        val eventId = intent.getStringExtra("eventId")?.takeIf { it.isNotBlank() }
+        if (hostId == null && threadId == null && eventId == null) return
+        launchRequest.value = LaunchRequest(hostId, threadId, eventId, ++launchSequence)
     }
 }
 
-private data class LaunchRequest(val threadId: String, val sequence: Long)
+private data class LaunchRequest(
+    val hostId: String?,
+    val threadId: String?,
+    val eventId: String?,
+    val sequence: Long,
+)

@@ -1,0 +1,20 @@
+{
+  "name": "agent-pocket-host",
+  "interface": {
+    "displayName": "Agent Pocket Host"
+  },
+  "plugins": [
+    {
+      "name": "agent-pocket-desktop-attach",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-pocket-desktop-attach"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

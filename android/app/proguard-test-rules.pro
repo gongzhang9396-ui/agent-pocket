@@ -1,0 +1,7 @@
+-dontshrink
+-keep class androidx.test.** { *; }
+-keep class androidx.tracing.** { *; }
+-keep class org.junit.** { *; }
+-keep class com.agentpocket.app.data.RelayCryptoVectorTest { *; }
+-keep class com.agentpocket.app.data.ReleaseCryptoVectorVerifier { *; }
+-keep class com.agentpocket.app.data.ReleaseNativeCryptoInstrumentation { *; }

@@ -1,0 +1,6 @@
+# Append only this site block to the existing Caddyfile after replacing the
+# example domain. Keep the existing global `protocols h1 h2` option so Caddy
+# never claims UDP 443 from the existing proxy service.
+relay.example.com {
+    reverse_proxy 127.0.0.1:8790
+}

@@ -5,42 +5,74 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
-internal data class BridgeCredentials(val endpoint: String, val deviceId: String, val token: String)
+@Serializable
+internal data class RelayCredentials(
+    val endpoint: String,
+    val accountId: String,
+    val username: String,
+    val deviceId: String,
+    val deviceName: String,
+    val deviceStatus: String,
+    val accessToken: String,
+    val refreshToken: String,
+    val accessExpiresAt: Long,
+    val refreshExpiresAt: Long,
+    val deviceSigningPublicKey: String,
+    val deviceSigningPrivateKey: String,
+    val deviceEncryptionPublicKey: String,
+    val deviceEncryptionPrivateKey: String,
+    val accountSigningPublicKey: String,
+    val accountEncryptionPublicKey: String,
+    val accountSigningPrivateKey: String? = null,
+    val accountEncryptionPrivateKey: String? = null,
+    val contentKey: String? = null,
+) {
+    val approved: Boolean get() = deviceStatus == "approved" && !contentKey.isNullOrBlank()
+}
 
 internal class SecurePrefs(context: Context) {
-    private val prefs = context.getSharedPreferences("bridge", Context.MODE_PRIVATE)
-    private val alias = "agent-pocket-device-token"
+    private val prefs = context.getSharedPreferences("relay_v2", Context.MODE_PRIVATE)
+    private val alias = "agent-pocket-relay-v2"
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-    fun save(credentials: BridgeCredentials) {
+    fun save(credentials: RelayCredentials) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
-        val plaintext = listOf(credentials.endpoint, credentials.deviceId, credentials.token).joinToString("\u0000")
+        val plaintext = json.encodeToString(credentials).toByteArray()
         prefs.edit()
-            .putString("credentials", Base64.encodeToString(cipher.doFinal(plaintext.toByteArray()), Base64.NO_WRAP))
+            .putString("credentials", Base64.encodeToString(cipher.doFinal(plaintext), Base64.NO_WRAP))
             .putString("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-            .remove("endpoint")
-            .remove("deviceId")
-            .remove("token")
             .apply()
     }
 
-    fun load(): BridgeCredentials? = runCatching {
-        prefs.getString("credentials", null)?.let { encoded ->
-            val values = decrypt(encoded).split('\u0000', limit = 3)
-            if (values.size != 3 || values.any(String::isBlank)) error("Invalid encrypted Bridge credentials")
-            return BridgeCredentials(values[0], values[1], values[2])
-        }
-
-        val endpoint = prefs.getString("endpoint", null) ?: return null
-        val deviceId = prefs.getString("deviceId", null) ?: return null
-        val token = decrypt(prefs.getString("token", null) ?: return null)
-        BridgeCredentials(endpoint, deviceId, token).also(::save)
+    fun load(): RelayCredentials? = runCatching {
+        val encoded = prefs.getString("credentials", null) ?: return null
+        json.decodeFromString<RelayCredentials>(decrypt(encoded))
     }.getOrElse { clear(); null }
+
+    fun lastSeq(hostId: String): Long = prefs.getLong("lastSeq:$hostId", 0)
+
+    fun setLastSeq(hostId: String, value: Long) {
+        prefs.edit().putLong("lastSeq:$hostId", value).apply()
+    }
+
+    fun installationId(): String {
+        prefs.getString("installationId", null)?.let { return it }
+        return UUID.randomUUID().toString().also { prefs.edit().putString("installationId", it).apply() }
+    }
+
+    fun clear() {
+        prefs.edit().clear().apply()
+    }
 
     private fun decrypt(encoded: String): String {
         val encrypted = Base64.decode(encoded, Base64.NO_WRAP)
@@ -48,14 +80,6 @@ internal class SecurePrefs(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
         return cipher.doFinal(encrypted).toString(Charsets.UTF_8)
-    }
-
-    var lastSeq: Long
-        get() = prefs.getLong("lastSeq", 0)
-        set(value) { prefs.edit().putLong("lastSeq", value).apply() }
-
-    fun clear() {
-        prefs.edit().clear().apply()
     }
 
     private fun key(): SecretKey {

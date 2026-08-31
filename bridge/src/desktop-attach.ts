@@ -1,7 +1,7 @@
 import net from "node:net";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 const IPC_PROTOCOL_VERSION = 1;
 const MAX_IPC_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -25,6 +25,40 @@ export type DesktopWaitSummary = {
   turnStatus?: string;
   wakeReason?: string;
   timedOut: boolean;
+  assistantText?: string;
+  assistantTextTruncated?: boolean;
+};
+
+export type DesktopCreateResult = {
+  source: "desktop";
+  hostId?: string;
+  thread: {
+    id: string;
+    name?: string;
+    cwd?: string;
+    source?: "desktop";
+    status?: unknown;
+    capabilities?: unknown;
+  };
+};
+
+export type DesktopProject = {
+  id: string;
+  name: string;
+  cwd: string;
+  source: "desktop";
+};
+
+export type DesktopThreadRead = {
+  source: "desktop";
+  thread: Record<string, unknown> & {
+    id: string;
+    cwd: string;
+    source: "desktop";
+    turns: unknown[];
+    capabilities: { send: true; interrupt: false; approval: false; question: false };
+  };
+  [key: string]: unknown;
 };
 
 function desktopContentJson(response: any, context: string) {
@@ -67,6 +101,57 @@ export function normalizeDesktopThreadList(response: any, search?: string) {
     }];
   });
   return { data, source: "desktop", readOnly: false };
+}
+
+export function normalizeDesktopProjectList(response: any) {
+  const payload = desktopContentJson(response, "项目列表");
+  const rows = Array.isArray(payload?.projects) ? payload.projects : [];
+  const seen = new Set<string>();
+  const data: DesktopProject[] = rows.flatMap((project: any) => {
+    if (!project || typeof project !== "object" || project.projectKind !== "local") return [];
+    const id = typeof project.projectId === "string" ? project.projectId.trim() : "";
+    const cwd = typeof project.path === "string" ? project.path.trim() : "";
+    if (!id || !cwd || !isAbsolute(cwd) || seen.has(id)) return [];
+    seen.add(id);
+    const label = typeof project.label === "string" ? project.label.trim() : "";
+    return [{ id, name: label || basename(cwd) || "未命名项目", cwd, source: "desktop" as const }];
+  });
+  return { data, source: "desktop" as const };
+}
+
+export function normalizeDesktopThreadRead(response: any, expectedThreadId?: string): DesktopThreadRead {
+  const payload = desktopContentJson(response, "任务详情");
+  const rawThread = payload?.thread;
+  if (!rawThread || typeof rawThread !== "object" || Array.isArray(rawThread)) {
+    throw new Error("Desktop Attach 任务详情缺少 thread");
+  }
+  const id = typeof rawThread.id === "string" ? rawThread.id.trim() : "";
+  const cwd = typeof rawThread.cwd === "string" ? rawThread.cwd.trim() : "";
+  if (!id || (expectedThreadId && id !== expectedThreadId)) {
+    throw new Error("Desktop Attach 任务详情 ID 不匹配");
+  }
+  if (rawThread.kind !== "codex") throw new Error("Desktop Attach 目标不是 Codex 任务");
+  if (!cwd || !isAbsolute(cwd)) throw new Error("Desktop Attach 任务详情缺少绝对 cwd");
+  const turns = Array.isArray(payload?.turns)
+    ? payload.turns
+    : Array.isArray(rawThread.turns)
+      ? rawThread.turns
+      : [];
+  const title = typeof rawThread.title === "string" ? rawThread.title.trim() : "";
+  const preview = typeof rawThread.preview === "string" ? rawThread.preview : "";
+  return {
+    ...payload,
+    source: "desktop",
+    thread: {
+      ...rawThread,
+      id,
+      cwd,
+      name: title || preview.split(/\r?\n/, 1)[0]?.slice(0, 80) || "未命名任务",
+      turns,
+      source: "desktop",
+      capabilities: { send: true, interrupt: false, approval: false, question: false },
+    },
+  };
 }
 
 export function defaultDesktopAttachRegistration(env = process.env) {
@@ -135,8 +220,29 @@ export class DesktopAttachClient {
     return normalizeDesktopThreadList(await this.listThreads(limit), search);
   }
 
-  readThread(threadId: string, turnLimit = 10) {
-    return this.request("thread/read", { threadId, turnLimit });
+  listProjects() {
+    return this.request("project/list", {});
+  }
+
+  async listProjectsNormalized() {
+    return normalizeDesktopProjectList(await this.listProjects());
+  }
+
+  readThread(threadId: string, turnLimit = 10, cursor?: string) {
+    const params: Record<string, unknown> = { threadId, turnLimit };
+    if (cursor) params.cursor = cursor;
+    return this.request("thread/read", params);
+  }
+
+  async readThreadNormalized(threadId: string, turnLimit = 10, cursor?: string) {
+    return normalizeDesktopThreadRead(await this.readThread(threadId, turnLimit, cursor), threadId);
+  }
+
+  createThread(cwd: string, text: string, model?: string, effort?: string, workspaceMode = "local"): Promise<DesktopCreateResult> {
+    const params: Record<string, unknown> = { cwd, text, workspaceMode };
+    if (model) params.model = model;
+    if (effort) params.effort = effort;
+    return this.request("thread/create", params, { write: true });
   }
 
   sendMessage(threadId: string, text: string) {

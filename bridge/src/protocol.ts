@@ -15,6 +15,7 @@ export const ErrorName = {
   EVENT_GAP: "EVENT_GAP",
   INVALID_REQUEST: "INVALID_REQUEST",
   NOT_FOUND: "NOT_FOUND",
+  HOST_MAINTENANCE: "HOST_MAINTENANCE",
 } as const;
 
 const errorNumber: Record<string, number> = {
@@ -26,6 +27,7 @@ const errorNumber: Record<string, number> = {
   EVENT_GAP: -32006,
   INVALID_REQUEST: -32602,
   NOT_FOUND: -32007,
+  HOST_MAINTENANCE: -32008,
 };
 
 export class RpcError extends Error {

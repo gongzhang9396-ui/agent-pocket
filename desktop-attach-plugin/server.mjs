@@ -1,46 +1,62 @@
 import net from "node:net";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_RESULT_CHARS = 512 * 1024;
 const MAX_IPC_MESSAGE_BYTES = 2 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 1024 * 1024;
-const DESKTOP_THREAD_CONFIRM_TTL_MS = 15 * 60 * 1000;
 const MAX_WAIT_CURSOR_CHARS = 2048;
+const MAX_THREAD_CURSOR_CHARS = 4096;
 const MAX_WAIT_TIMEOUT_MS = 8_000;
+const NEW_THREAD_VERIFY_TIMEOUT_MS = 8_000;
+const MAX_DESKTOP_ITEM_CHARS = 20_000;
 const MAX_BRIDGE_CONNECTIONS = 4;
 const MAX_BRIDGE_QUEUED_REQUESTS = 8;
 const MAX_NATIVE_PENDING_REQUESTS = 16;
 const PIPE_ENV = "CODEX_APP_TOOLS_PIPE_PATH";
+const BRIDGE_HOST_PIPE_ENV = "AGENT_POCKET_DESKTOP_HOST_PIPE";
+const DEFAULT_BRIDGE_HOST_PIPE = "\\\\.\\pipe\\agent-pocket-desktop-attach-host";
+const BRIDGE_HOST_START_TIMEOUT_MS = 5_000;
+const BRIDGE_HOST_RPC_TIMEOUT_MS = 2_000;
 const IPC_PROTOCOL_VERSION = 1;
-const BRIDGE_CAPABILITIES = ["attach/probe", "thread/list", "thread/read", "thread/send", "thread/wait"];
+const BRIDGE_HOST_MODE = process.argv.includes("--bridge-host");
+const SERVER_PATH = fileURLToPath(import.meta.url);
+const BRIDGE_CAPABILITIES = ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/wait"];
+const DESKTOP_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 let host;
 let bridgeIpcServer;
 let bridgeRegistration;
-let desktopHostThreadId;
+let bridgeIpcStarting;
+let bridgeHostStarting;
+let externalBridgeHostReady = false;
+let desktopHostThreadId = firstString(process.env.CODEX_THREAD_ID, process.env.CODEX_SESSION_ID);
 let bridgeConnectionCount = 0;
 let stdinBuffer = "";
-const confirmedDesktopThreads = new Map();
+let shuttingDown = false;
 
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  stdinBuffer += chunk;
-  while (true) {
-    const newline = stdinBuffer.indexOf("\n");
-    if (newline < 0) break;
-    const line = stdinBuffer.slice(0, newline).replace(/\r$/, "");
-    stdinBuffer = stdinBuffer.slice(newline + 1);
-    if (!line.trim()) continue;
-    void handleLine(line);
-  }
-});
+if (!BRIDGE_HOST_MODE) {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    stdinBuffer += chunk;
+    while (true) {
+      const newline = stdinBuffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = stdinBuffer.slice(0, newline).replace(/\r$/, "");
+      stdinBuffer = stdinBuffer.slice(newline + 1);
+      if (!line.trim()) continue;
+      void handleLine(line);
+    }
+  });
+  process.stdin.once("end", shutdown);
+}
 
-process.stdin.once("end", shutdown);
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
@@ -68,9 +84,9 @@ async function handleLine(line) {
           serverInfo: {
             name: "agent-pocket-desktop-attach",
             title: "Agent Pocket Desktop Attach",
-            version: "0.1.0",
+            version: "0.1.4",
           },
-          instructions: "Local Agent Pocket adapter. Its user-facing MCP tools are read-only; authenticated local Bridge IPC may append a prompt to a recently confirmed Desktop task.",
+          instructions: "Local Agent Pocket adapter. Its user-facing MCP tools are read-only; authenticated local Bridge IPC may list projects and create, read, or continue Codex Desktop tasks.",
         });
       case "ping":
         return writeResult(message.id, {});
@@ -118,7 +134,8 @@ const toolDefinitions = [
       required: ["threadId"],
       properties: {
         threadId: { type: "string", minLength: 1, maxLength: 128 },
-        turnLimit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+        turnLimit: { type: "integer", minimum: 1, maximum: 10, default: 10 },
+        cursor: { type: "string", minLength: 1, maxLength: MAX_THREAD_CURSOR_CHARS },
       },
       additionalProperties: false,
     },
@@ -129,7 +146,10 @@ async function callTool(message) {
   const name = message.params?.name;
   const args = message.params?.arguments || {};
   const context = requestContext(message);
-  if (context.threadId && !desktopHostThreadId) desktopHostThreadId = context.threadId;
+  if (context.threadId) {
+    if (!desktopHostThreadId) desktopHostThreadId = context.threadId;
+    await ensureBridgeHost();
+  }
 
   if (name === "desktop_attach_probe") {
     return textResult(await probeDesktop(context));
@@ -145,8 +165,9 @@ async function callTool(message) {
     if (typeof args.threadId !== "string" || !args.threadId.trim() || args.threadId.length > 128) {
       throw new Error("threadId is required");
     }
-    const turnLimit = boundedInteger(args.turnLimit, 10, 1, 50);
-    const result = await readDesktopTask(args.threadId.trim(), turnLimit, context);
+    const turnLimit = boundedInteger(args.turnLimit, 10, 1, 10);
+    const cursor = optionalTrimmedString(args.cursor, "cursor", MAX_THREAD_CURSOR_CHARS);
+    const result = await readDesktopTask(args.threadId.trim(), turnLimit, cursor, context);
     return textResult({ ok: true, result });
   }
 
@@ -173,6 +194,7 @@ async function probeDesktop(context) {
     "read_thread",
     "send_message_to_thread",
     "wait_threads",
+    "list_projects",
     "create_thread",
     "navigate_to_codex_page",
     "automation_update",
@@ -186,43 +208,105 @@ async function probeDesktop(context) {
     mode: "desktop-attach",
     desktopPipeAvailable,
     callerContextAvailable: Boolean(context.threadId),
-    ipcAvailable: Boolean(bridgeRegistration),
-    bridgeWritable: bridgeRegistration?.readOnly === false,
+    ipcAvailable: Boolean(bridgeRegistration || externalBridgeHostReady),
+    bridgeWritable: bridgeRegistration?.readOnly === false || externalBridgeHostReady,
     available,
   };
 }
 
 async function listDesktopTasks(limit, context) {
-  const contentItems = await callDesktopTool("list_threads", { limit }, context);
-  rememberDesktopThreads(contentItems);
-  return contentItems;
+  return callDesktopTool("list_threads", { limit }, context);
 }
 
-function readDesktopTask(threadId, turnLimit, context) {
+function listDesktopProjects(context) {
+  return callDesktopTool("list_projects", {}, context);
+}
+
+function readDesktopTask(threadId, turnLimit, cursor, context) {
+  const args = { threadId, turnLimit, includeOutputs: false, maxOutputCharsPerItem: MAX_DESKTOP_ITEM_CHARS };
+  if (cursor) args.cursor = cursor;
   return callDesktopTool(
     "read_thread",
-    { threadId, turnLimit, includeOutputs: false, maxOutputCharsPerItem: 32 * 1024 },
+    args,
     context,
   );
 }
 
 function sendDesktopMessage(threadId, text, context) {
-  if (!isConfirmedDesktopThread(threadId)) {
-    throw new Error("threadId was not recently confirmed by Desktop thread/list; refresh the task list first");
-  }
   return callDesktopTool("send_message_to_thread", { threadId, prompt: text }, context);
 }
 
-async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
-  if (!isConfirmedDesktopThread(threadId)) {
-    throw new Error("threadId was not recently confirmed by Desktop thread/list; refresh the task list first");
+async function createDesktopThread(cwd, text, model, effort, workspaceMode, context) {
+  if (workspaceMode !== "local") {
+    throw new Error("workspaceMode must be local for Codex Desktop task creation");
   }
+  const requestedPath = canonicalDesktopPath(cwd, "cwd");
+  const projectItems = await callDesktopTool("list_projects", {}, subcallContext(context, "projects"));
+  const projectPayload = desktopToolJson(projectItems, "list_projects");
+  const projects = Array.isArray(projectPayload?.projects) ? projectPayload.projects : [];
+  const project = projects.find((item) => {
+    if (item?.projectKind !== "local" || typeof item.projectId !== "string" || !item.projectId.trim()) return false;
+    try {
+      return canonicalDesktopPath(item.path, "Desktop project path").key === requestedPath.key;
+    } catch {
+      return false;
+    }
+  });
+  if (!project) {
+    throw new Error("cwd is not saved as a local Codex Desktop project");
+  }
+
+  const args = {
+    prompt: text,
+    target: {
+      type: "project",
+      projectId: project.projectId.trim(),
+      environment: { type: "local" },
+    },
+  };
+  if (model) args.model = model;
+  if (effort) args.thinking = effort;
+  const createdItems = await callDesktopTool("create_thread", args, subcallContext(context, "create"));
+  const created = desktopToolJson(createdItems, "create_thread");
+  const threadId = firstString(created?.threadId);
+  if (!threadId && firstString(created?.clientThreadId)) {
+    throw new Error("Codex Desktop is still preparing the new task; retry after it appears in Desktop");
+  }
+  if (!threadId) throw new Error("Codex Desktop create_thread returned no threadId");
+
+  const verification = await waitDesktopThread(
+    threadId,
+    undefined,
+    NEW_THREAD_VERIFY_TIMEOUT_MS,
+    subcallContext(context, "create-verify"),
+  );
+  if (verification.threadStatus === "systemError" || verification.turnStatus === "failed") {
+    const detail = verification.turnError ? `: ${verification.turnError}` : "";
+    throw new Error(`Codex Desktop created the task but failed to initialize it${detail}`);
+  }
+
+  return {
+    source: "desktop",
+    hostId: firstString(created?.hostId),
+    thread: {
+      id: threadId,
+      name: text.trim().split(/\r?\n/, 1)[0]?.slice(0, 80) || "新任务",
+      cwd: requestedPath.actual,
+      source: "desktop",
+      status: { type: "active", desktopState: "running" },
+      capabilities: { send: true, interrupt: false, approval: false, question: false },
+    },
+  };
+}
+
+async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
+  const waitContext = await desktopWaitContext(threadId, context);
   const target = { threadId };
   if (afterCursor) target.afterCursor = afterCursor;
   const contentItems = await callDesktopTool("wait_threads", {
     targets: [target],
     timeoutMs,
-  }, context);
+  }, waitContext);
   const payload = desktopToolJson(contentItems, "wait_threads");
   const poll = Array.isArray(payload?.polls)
     ? payload.polls.find((item) => item?.threadId === threadId) || payload.polls[0]
@@ -230,6 +314,12 @@ async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
   const wake = payload?.wake && typeof payload.wake === "object" ? payload.wake : null;
   const threadStatus = firstString(poll?.thread?.status?.type, poll?.thread?.status);
   const turnStatus = firstString(poll?.latestTurn?.status?.type, poll?.latestTurn?.status);
+  const latestAssistantMessage = poll?.latestAssistantMessage && typeof poll.latestAssistantMessage === "object"
+    ? poll.latestAssistantMessage
+    : poll?.latestTurn?.latestAssistantMessage;
+  const fullAssistantText = typeof latestAssistantMessage?.text === "string"
+    ? latestAssistantMessage.text
+    : undefined;
   return {
     cursor: firstString(poll?.cursor),
     changed: poll?.changed === true,
@@ -238,6 +328,33 @@ async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
     turnStatus,
     wakeReason: firstString(wake?.reason),
     timedOut: payload?.timedOut === true,
+    assistantText: fullAssistantText?.slice(0, MAX_DESKTOP_ITEM_CHARS),
+    assistantTextTruncated: fullAssistantText !== undefined && fullAssistantText.length > MAX_DESKTOP_ITEM_CHARS,
+    turnError: firstString(poll?.latestTurn?.error?.message, poll?.latestTurn?.error),
+  };
+}
+
+async function desktopWaitContext(threadId, context) {
+  if (context.threadId !== threadId) return context;
+  const contentItems = await callDesktopTool(
+    "list_threads",
+    { limit: 50 },
+    subcallContext(context, "wait-caller-list"),
+  );
+  const payload = desktopToolJson(contentItems, "list_threads");
+  const candidates = [
+    ...(Array.isArray(payload?.pinnedThreads) ? payload.pinnedThreads : []),
+    ...(Array.isArray(payload?.threads) ? payload.threads : []),
+  ].filter((item) => item?.kind === "codex" && typeof item.id === "string" && item.id.trim() && item.id.trim() !== threadId);
+  const candidate = candidates.find((item) => {
+    const status = firstString(item?.status?.type, item?.status);
+    return status !== "active" && status !== "running";
+  }) || candidates[0];
+  if (!candidate) throw new Error("Desktop wait requires another Codex task as its caller context");
+  return {
+    ...context,
+    threadId: candidate.id.trim(),
+    callId: `desktop-attach-wait-caller-${randomUUID()}`,
   };
 }
 
@@ -251,38 +368,6 @@ function desktopToolJson(contentItems, context) {
   } catch {
     throw new Error(`Desktop ${context} returned an incompatible summary`);
   }
-}
-
-function rememberDesktopThreads(contentItems) {
-  const text = Array.isArray(contentItems)
-    ? contentItems.find((item) => item?.type === "inputText" && typeof item.text === "string")?.text
-    : null;
-  if (!text) return;
-  let payload;
-  try { payload = JSON.parse(text); } catch { return; }
-  const now = Date.now();
-  const rows = [
-    ...(Array.isArray(payload?.pinnedThreads) ? payload.pinnedThreads : []),
-    ...(Array.isArray(payload?.threads) ? payload.threads : []),
-  ];
-  for (const thread of rows) {
-    if (thread?.kind === "codex" && typeof thread.id === "string" && thread.id.trim()) {
-      confirmedDesktopThreads.set(thread.id.trim(), now);
-    }
-  }
-  for (const [threadId, confirmedAt] of confirmedDesktopThreads) {
-    if (now - confirmedAt > DESKTOP_THREAD_CONFIRM_TTL_MS) confirmedDesktopThreads.delete(threadId);
-  }
-}
-
-function isConfirmedDesktopThread(threadId) {
-  const confirmedAt = confirmedDesktopThreads.get(threadId);
-  if (!confirmedAt) return false;
-  if (Date.now() - confirmedAt > DESKTOP_THREAD_CONFIRM_TTL_MS) {
-    confirmedDesktopThreads.delete(threadId);
-    return false;
-  }
-  return true;
 }
 
 async function callDesktopTool(name, args, context) {
@@ -306,9 +391,31 @@ async function callDesktopTool(name, args, context) {
       .filter((item) => item.type === "inputText")
       .map((item) => item.text)
       .join("\n");
-    throw new Error(details || `Desktop tool failed: ${name}`);
+    throw new Error(desktopToolFailure(name, details));
   }
   return response.contentItems || [];
+}
+
+function desktopToolFailure(name, details) {
+  const text = typeof details === "string" ? details : "";
+  if (/writer|lock|already active|another (?:application|app)|另一应用|正在运行|正在使用/i.test(text)) {
+    return "Desktop task is already active in another writer";
+  }
+  if (/not found|does not exist|不存在|找不到/i.test(text)) {
+    return "Desktop task was not found";
+  }
+  if (/permission|forbidden|not allowed|无权|拒绝访问/i.test(text)) {
+    return "Desktop task cannot be accessed from this host";
+  }
+  if (/function_call_output requires call_id|previous_response_id.{0,80}WebSocket v2/i.test(text)) {
+    return "function_call_output requires call_id on HTTP requests; continuation via previous_response_id is only supported on Responses WebSocket v2";
+  }
+  const compact = text
+    .replace(/<codex_delegation>[\s\S]*<\/codex_delegation>/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+  return compact ? `Desktop tool failed: ${name}: ${compact}` : `Desktop tool failed: ${name}`;
 }
 
 function requestContext(message) {
@@ -355,6 +462,32 @@ function boundedInteger(value, fallback, min, max) {
   return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
+function optionalTrimmedString(value, name, maxLength) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !value.trim() || value.length > maxLength) {
+    throw new Error(`${name} must be a non-empty string up to ${maxLength} characters`);
+  }
+  return value.trim();
+}
+
+function subcallContext(context, label) {
+  return { ...context, callId: `desktop-attach-${label}-${randomUUID()}` };
+}
+
+function canonicalDesktopPath(value, name) {
+  if (typeof value !== "string" || !value.trim() || value.length > 32_768 || !isAbsolute(value)) {
+    throw new Error(`${name} must be an absolute path`);
+  }
+  let actual;
+  try {
+    actual = realpathSync.native(resolve(value));
+  } catch {
+    throw new Error(`${name} does not exist or cannot be accessed`);
+  }
+  const normalized = normalize(actual).replace(/[\\/]+$/, "");
+  return { actual, key: process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized };
+}
+
 function textResult(value) {
   let text = JSON.stringify(value);
   if (text.length > MAX_RESULT_CHARS) {
@@ -371,48 +504,226 @@ function writeError(id, code, message) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
 }
 
-function shutdown() {
+function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   stopBridgeIpc();
   host?.close();
-  process.exit(0);
+  process.exit(exitCode);
+}
+
+function ensureBridgeHost() {
+  if (BRIDGE_HOST_MODE || !process.env[PIPE_ENV]?.trim() || !desktopHostThreadId) return Promise.resolve();
+  if (!bridgeHostStarting) {
+    bridgeHostStarting = establishBridgeHost().finally(() => { bridgeHostStarting = undefined; });
+  }
+  return bridgeHostStarting;
+}
+
+async function establishBridgeHost() {
+  externalBridgeHostReady = false;
+  const existing = readExternalBridgeRegistration();
+  if (existing && await probeExternalBridge(existing)) {
+    externalBridgeHostReady = true;
+    return;
+  }
+
+  let spawnError;
+  const child = spawn(process.execPath, [SERVER_PATH, "--bridge-host"], {
+    cwd: dirname(SERVER_PATH),
+    detached: true,
+    windowsHide: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      CODEX_THREAD_ID: desktopHostThreadId,
+      CODEX_SESSION_ID: "",
+      [BRIDGE_HOST_PIPE_ENV]: bridgeHostPipeName(),
+    },
+  });
+  child.once("error", (error) => { spawnError = error; });
+  child.unref();
+
+  const deadline = Date.now() + BRIDGE_HOST_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const registration = readExternalBridgeRegistration();
+    if (registration && await probeExternalBridge(registration)) {
+      externalBridgeHostReady = true;
+      return;
+    }
+    await delay(50);
+  }
+  const detail = spawnError instanceof Error ? `: ${spawnError.message}` : "";
+  throw new Error(`Desktop Attach bridge host did not become ready${detail}`);
+}
+
+function bridgeRegistrationFile() {
+  const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  return join(localAppData, "AgentPocket", "desktop-attach.json");
+}
+
+function bridgeHostPipeName() {
+  const pipeName = process.env[BRIDGE_HOST_PIPE_ENV]?.trim() || DEFAULT_BRIDGE_HOST_PIPE;
+  if (!pipeName.startsWith("\\\\.\\pipe\\agent-pocket-desktop-attach-")) {
+    throw new Error(`${BRIDGE_HOST_PIPE_ENV} must use the Agent Pocket named-pipe prefix`);
+  }
+  return pipeName;
+}
+
+function readExternalBridgeRegistration() {
+  let registration;
+  try {
+    registration = JSON.parse(readFileSync(bridgeRegistrationFile(), "utf8"));
+  } catch {
+    return null;
+  }
+  if (
+    registration?.protocolVersion !== IPC_PROTOCOL_VERSION
+    || registration?.hostMode !== true
+    || registration?.pipeName !== bridgeHostPipeName()
+    || typeof registration?.token !== "string"
+    || !/^[A-Za-z0-9_-]{40,128}$/.test(registration.token)
+    || !Number.isSafeInteger(registration?.pid)
+    || registration.pid <= 0
+    || registration?.readOnly !== false
+    || !Array.isArray(registration?.capabilities)
+    || !registration.capabilities.includes("attach/probe")
+  ) {
+    return null;
+  }
+  return registration;
+}
+
+async function probeExternalBridge(registration) {
+  try {
+    const probe = await requestExternalBridge(registration, "attach/probe", {});
+    return probe?.ok === true && probe?.ipcAvailable === true && probe?.bridgeWritable === true;
+  } catch {
+    return false;
+  }
+}
+
+function requestExternalBridge(registration, method, params) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const socket = net.createConnection(registration.pipeName);
+    let buffer = "";
+    let authenticated = false;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) rejectPromise(error instanceof Error ? error : new Error(String(error)));
+      else resolvePromise(value);
+    };
+    const send = (id, requestMethod, requestParams) => {
+      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method: requestMethod, params: requestParams })}\n`);
+    };
+    const timer = setTimeout(
+      () => finish(new Error("Desktop Attach bridge host probe timed out")),
+      BRIDGE_HOST_RPC_TIMEOUT_MS,
+    );
+
+    socket.setEncoding("utf8");
+    socket.once("connect", () => send(1, "attach/hello", { token: registration.token }));
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (Buffer.byteLength(buffer, "utf8") > MAX_IPC_MESSAGE_BYTES) {
+        finish(new Error("Desktop Attach bridge host response exceeded 2 MiB"));
+        return;
+      }
+      while (true) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline).replace(/\r$/, "");
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        let message;
+        try { message = JSON.parse(line); } catch {
+          finish(new Error("Desktop Attach bridge host returned invalid JSON"));
+          return;
+        }
+        if (message.id === 1) {
+          if (message.error || message.result?.protocolVersion !== IPC_PROTOCOL_VERSION) {
+            finish(new Error(message.error?.message || "Desktop Attach bridge host handshake failed"));
+            return;
+          }
+          authenticated = true;
+          send(2, method, params);
+        } else if (message.id === 2 && authenticated) {
+          if (message.error) finish(new Error(message.error.message || "Desktop Attach bridge host probe failed"));
+          else finish(undefined, message.result);
+          return;
+        }
+      }
+    });
+    socket.once("error", (error) => finish(new Error(`Could not connect to Desktop Attach bridge host: ${error.message}`)));
+    socket.once("close", () => {
+      if (!settled) finish(new Error("Desktop Attach bridge host closed the connection"));
+    });
+  });
+}
+
+function delay(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function ensureBridgeIpc() {
+  if (!BRIDGE_HOST_MODE || !process.env[PIPE_ENV]?.trim() || !desktopHostThreadId || bridgeRegistration) return Promise.resolve();
+  if (!bridgeIpcStarting) {
+    bridgeIpcStarting = startBridgeIpc().finally(() => { bridgeIpcStarting = undefined; });
+  }
+  return bridgeIpcStarting;
 }
 
 function startBridgeIpc() {
-  const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
-  const stateDir = join(localAppData, "AgentPocket");
-  const registrationFile = join(stateDir, "desktop-attach.json");
+  const registrationFile = bridgeRegistrationFile();
+  const stateDir = dirname(registrationFile);
   const instanceId = randomUUID();
-  const pipeName = `\\\\.\\pipe\\agent-pocket-desktop-attach-${instanceId}`;
+  const pipeName = bridgeHostPipeName();
   const token = randomBytes(32).toString("base64url");
   const server = net.createServer((socket) => handleBridgeConnection(socket, token));
+  bridgeIpcServer = server;
 
-  server.on("error", () => {
-    if (bridgeIpcServer === server) {
-      bridgeIpcServer = undefined;
-      bridgeRegistration = undefined;
-    }
-  });
-  server.listen(pipeName, () => {
-    try {
-      mkdirSync(stateDir, { recursive: true });
-      const registration = {
-        protocolVersion: IPC_PROTOCOL_VERSION,
-        instanceId,
-        pipeName,
-        token,
-        pid: process.pid,
-        startedAt: new Date().toISOString(),
-        readOnly: false,
-        capabilities: BRIDGE_CAPABILITIES,
-      };
-      const tempFile = `${registrationFile}.${instanceId}.tmp`;
-      writeFileSync(tempFile, JSON.stringify(registration), { encoding: "utf8", mode: 0o600 });
-      renameSync(tempFile, registrationFile);
-      bridgeIpcServer = server;
-      bridgeRegistration = { ...registration, registrationFile };
-    } catch {
-      server.close();
-    }
+  return new Promise((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const fail = (error) => {
+      if (bridgeIpcServer === server) {
+        bridgeIpcServer = undefined;
+        bridgeRegistration = undefined;
+      }
+      if (!settled) {
+        settled = true;
+        rejectPromise(error);
+      }
+    };
+    server.on("error", fail);
+    server.listen(pipeName, () => {
+      try {
+        mkdirSync(stateDir, { recursive: true });
+        const registration = {
+          protocolVersion: IPC_PROTOCOL_VERSION,
+          instanceId,
+          pipeName,
+          token,
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+          hostMode: BRIDGE_HOST_MODE,
+          readOnly: false,
+          capabilities: BRIDGE_CAPABILITIES,
+        };
+        const tempFile = `${registrationFile}.${instanceId}.tmp`;
+        writeFileSync(tempFile, JSON.stringify(registration), { encoding: "utf8", mode: 0o600 });
+        renameSync(tempFile, registrationFile);
+        bridgeRegistration = { ...registration, registrationFile };
+        settled = true;
+        resolvePromise();
+      } catch (error) {
+        server.close();
+        fail(error);
+      }
+    });
   });
 }
 
@@ -504,6 +815,11 @@ async function handleBridgeMessage(socket, line, token, isAuthenticated, markAut
     if (message.method === "attach/probe") {
       return writeBridgeResult(socket, message.id, await probeDesktop(context));
     }
+    if (message.method === "project/list") {
+      return writeBridgeResult(socket, message.id, {
+        contentItems: await listDesktopProjects(context),
+      });
+    }
     if (message.method === "thread/list") {
       const limit = boundedInteger(message.params?.limit, 10, 1, 50);
       return writeBridgeResult(socket, message.id, {
@@ -515,13 +831,35 @@ async function handleBridgeMessage(socket, line, token, isAuthenticated, markAut
       if (typeof threadId !== "string" || !threadId.trim() || threadId.length > 128) {
         throw new Error("threadId is required");
       }
-      if (!isConfirmedDesktopThread(threadId.trim())) {
-        throw new Error("threadId was not recently confirmed by Desktop thread/list; refresh the task list first");
-      }
-      const turnLimit = boundedInteger(message.params?.turnLimit, 10, 1, 50);
+      const turnLimit = boundedInteger(message.params?.turnLimit, 10, 1, 10);
+      const cursor = optionalTrimmedString(message.params?.cursor, "cursor", MAX_THREAD_CURSOR_CHARS);
       return writeBridgeResult(socket, message.id, {
-        contentItems: await readDesktopTask(threadId.trim(), turnLimit, context),
+        contentItems: await readDesktopTask(threadId.trim(), turnLimit, cursor, context),
       });
+    }
+    if (message.method === "thread/create") {
+      const cwd = message.params?.cwd;
+      const text = message.params?.text;
+      const workspaceMode = optionalTrimmedString(message.params?.workspaceMode, "workspaceMode", 32) || "local";
+      const model = optionalTrimmedString(message.params?.model, "model", 200);
+      const effort = optionalTrimmedString(message.params?.effort, "effort", 32);
+      if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 32_768) {
+        throw new Error("cwd is required and must be an absolute path");
+      }
+      if (typeof text !== "string" || !text.trim() || text.length > MAX_PROMPT_CHARS) {
+        throw new Error("text is required and must not exceed 1 MiB");
+      }
+      if (effort && !DESKTOP_REASONING_EFFORTS.has(effort)) {
+        throw new Error("effort is not supported by Codex Desktop");
+      }
+      return writeBridgeResult(socket, message.id, await createDesktopThread(
+        cwd.trim(),
+        text,
+        model,
+        effort,
+        workspaceMode,
+        context,
+      ));
     }
     if (message.method === "thread/send") {
       const threadId = message.params?.threadId;
@@ -565,7 +903,6 @@ function backgroundContext(message) {
       desktopHostThreadId,
       process.env.CODEX_THREAD_ID,
       process.env.CODEX_SESSION_ID,
-      `desktop-attach-background-${process.pid}`,
     ),
     turnId: `desktop-attach-ipc-turn-${String(message.id)}`,
     callId: `desktop-attach-ipc-call-${randomUUID()}`,
@@ -596,9 +933,11 @@ function writeBridgeError(socket, id, code, message) {
 }
 
 class NativePipeClient {
-  constructor(pipePath) {
+  constructor(pipePath, disconnectHandler) {
     this.pipePath = pipePath;
+    this.disconnectHandler = disconnectHandler;
     this.socket = null;
+    this.connectingSocket = null;
     this.connecting = null;
     this.pendingData = Buffer.alloc(0);
     this.pending = new Map();
@@ -635,20 +974,36 @@ class NativePipeClient {
 
     this.connecting = new Promise((resolve, reject) => {
       const socket = net.createConnection(pipePath);
+      this.connectingSocket = socket;
+      let settled = false;
       const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        socket.off("connect", connected);
+        socket.off("close", closedBeforeConnect);
+        if (this.connectingSocket === socket) this.connectingSocket = null;
         socket.destroy();
-        reject(new Error(`Could not attach to Codex Desktop: ${error.message}`));
+        const wrapped = new Error(`Could not attach to Codex Desktop: ${error.message}`);
+        this.disconnectHandler?.(wrapped);
+        reject(wrapped);
       };
-      socket.once("error", fail);
-      socket.once("connect", () => {
+      const closedBeforeConnect = () => fail(new Error("task channel closed before connecting"));
+      const connected = () => {
+        if (settled) return;
+        settled = true;
         socket.off("error", fail);
+        socket.off("close", closedBeforeConnect);
+        if (this.connectingSocket === socket) this.connectingSocket = null;
         this.socket = socket;
         this.connecting = null;
         socket.on("data", (chunk) => this.onData(socket, chunk));
         socket.on("error", (error) => this.onDisconnect(socket, error));
         socket.on("close", () => this.onDisconnect(socket, new Error("Codex Desktop task channel closed")));
         resolve();
-      });
+      };
+      socket.once("error", fail);
+      socket.once("close", closedBeforeConnect);
+      socket.once("connect", connected);
     }).catch((error) => {
       this.connecting = null;
       throw error;
@@ -689,11 +1044,19 @@ class NativePipeClient {
     this.pendingData = Buffer.alloc(0);
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
+    this.disconnectHandler?.(error);
   }
 
   close() {
-    this.socket?.destroy();
+    const error = new Error("Codex Desktop task channel closed");
+    const socket = this.socket;
     this.socket = null;
+    this.pendingData = Buffer.alloc(0);
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    socket?.destroy();
+    this.connectingSocket?.destroy();
+    this.connectingSocket = null;
   }
 }
 
@@ -706,5 +1069,16 @@ function encodeFrame(message) {
   return frame;
 }
 
-host = new NativePipeClient(() => process.env[PIPE_ENV]?.trim() || "");
-if (process.env[PIPE_ENV]?.trim()) startBridgeIpc();
+host = new NativePipeClient(
+  () => process.env[PIPE_ENV]?.trim() || "",
+  () => {
+    if (BRIDGE_HOST_MODE && !shuttingDown) shutdown(1);
+  },
+);
+if (BRIDGE_HOST_MODE) {
+  void (async () => {
+    if (!process.env[PIPE_ENV]?.trim() || !desktopHostThreadId) throw new Error("Desktop host context is unavailable");
+    await host.request("tools/list", { threadStartKind: "all" });
+    await ensureBridgeIpc();
+  })().catch(() => shutdown(1));
+}

@@ -13,10 +13,14 @@
     "devices": "node --experimental-strip-types src/cli.ts devices",
     "revoke": "node --experimental-strip-types src/cli.ts revoke",
     "desktop-probe": "node --experimental-strip-types src/cli.ts desktop-probe",
+    "host-update-check": "node --experimental-strip-types src/cli.ts host-update-check",
+    "relay-enroll": "node --experimental-strip-types src/cli.ts relay-enroll",
+    "relay-status": "node --experimental-strip-types src/cli.ts relay-status",
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "dependencies": {
     "firebase-admin": "14.3.0",
+    "libsodium-wrappers-sumo": "^0.8.2",
     "ws": "8.21.3"
   },
   "optionalDependencies": {

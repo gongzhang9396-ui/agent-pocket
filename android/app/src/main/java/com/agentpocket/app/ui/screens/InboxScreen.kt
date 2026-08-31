@@ -1,5 +1,6 @@
 package com.agentpocket.app.ui.screens
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -22,6 +24,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +42,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
+import com.agentpocket.app.data.model.ConnectionState
+import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadSummary
 import com.agentpocket.app.ui.components.ConnectionPill
@@ -56,6 +61,8 @@ fun InboxScreen(
     onOpenSettings: () -> Unit,
 ) {
     val host by repo.host.collectAsState()
+    val hosts by repo.hosts.collectAsState()
+    val selectedHostId by repo.selectedHostId.collectAsState()
     val threads by repo.threads.collectAsState()
     val desktopCount = threads.count { it.status == ThreadStatus.DesktopOwned }
     val externalCount = threads.count { it.status == ThreadStatus.ExternalBusy }
@@ -96,6 +103,32 @@ fun InboxScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            item(key = "host-filter", contentType = "filter") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = selectedHostId == null,
+                        onClick = { repo.selectHost(null) },
+                        label = { Text("全部电脑") },
+                    )
+                    hosts.forEach { item ->
+                        FilterChip(
+                            selected = selectedHostId == item.id,
+                            onClick = { repo.selectHost(item.id) },
+                            label = {
+                                Text(
+                                    if (item.connectionState == ConnectionState.Connected) item.name else "${item.name} · 离线",
+                                    maxLines = 1,
+                                )
+                            },
+                        )
+                    }
+                }
+            }
             if (desktopCount > 0) {
                 item(key = "desktop-attached", contentType = "banner") {
                     DesktopAttachedBanner(desktopCount)
@@ -106,8 +139,22 @@ fun InboxScreen(
                     ExternalBusyBanner(externalCount)
                 }
             }
-            items(threads, key = { it.id }, contentType = { "thread" }) { thread ->
-                ThreadCard(thread = thread, onClick = { onOpenThread(thread.id) })
+            if (threads.isEmpty()) {
+                item(key = "empty", contentType = "empty") {
+                    Text(
+                        if (hosts.isEmpty()) "还没有绑定 Windows 电脑" else "这台电脑暂时没有可显示的任务",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 32.dp),
+                    )
+                }
+            }
+            items(threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
+                ThreadCard(
+                    thread = thread,
+                    showHost = selectedHostId == null,
+                    onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
+                )
             }
         }
     }
@@ -161,7 +208,7 @@ private fun ExternalBusyBanner(count: Int) {
 }
 
 @Composable
-private fun ThreadCard(thread: ThreadSummary, onClick: () -> Unit) {
+private fun ThreadCard(thread: ThreadSummary, showHost: Boolean, onClick: () -> Unit) {
     Card(onClick = onClick, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -188,6 +235,25 @@ private fun ThreadCard(thread: ThreadSummary, onClick: () -> Unit) {
                 }
             }
             Spacer(Modifier.height(2.dp))
+            if (showHost) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.DesktopWindows,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.width(14.dp),
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        thread.hostName,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Spacer(Modifier.height(2.dp))
+            }
             Text(
                 thread.cwd,
                 style = MaterialTheme.typography.labelSmall,

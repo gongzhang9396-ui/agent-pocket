@@ -10,6 +10,8 @@ data class Host(
     val connectionState: ConnectionState,
     val lastSeen: String,
     val relayName: String,
+    val signingPublicKey: String = "",
+    val encryptionPublicKey: String = "",
 )
 
 data class Device(
@@ -17,7 +19,21 @@ data class Device(
     val name: String,
     val pairedAt: String,
     val notificationEnabled: Boolean,
+    val status: String = "approved",
+    val encryptionPublicKey: String = "",
 )
+
+data class ThreadRef(val hostId: String, val threadId: String) {
+    fun encoded(): String = "$hostId\u001f$threadId"
+
+    companion object {
+        fun parse(value: String): ThreadRef {
+            val index = value.indexOf('\u001f')
+            require(index > 0 && index < value.lastIndex) { "任务引用缺少 Host 上下文" }
+            return ThreadRef(value.substring(0, index), value.substring(index + 1))
+        }
+    }
+}
 
 data class Project(
     val id: String,
@@ -52,6 +68,8 @@ data class ThreadSummary(
     val updatedAt: String,
     val lastMessage: String,
     val unreadCount: Int,
+    val hostId: String = "",
+    val hostName: String = "",
 )
 
 enum class Role { User, Assistant, System }

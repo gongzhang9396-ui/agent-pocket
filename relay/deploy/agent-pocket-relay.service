@@ -1,0 +1,26 @@
+[Unit]
+Description=Agent Pocket Relay v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-pocket-relay
+Group=agent-pocket-relay
+WorkingDirectory=/opt/agent-pocket-relay/current
+EnvironmentFile=/etc/agent-pocket-relay/relay.env
+ExecStart=/usr/bin/node dist/cli.js serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-pocket-relay
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

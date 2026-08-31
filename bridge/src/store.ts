@@ -170,6 +170,15 @@ export class BridgeStore {
     }));
   }
 
+  eventsForThread(threadId: string, type: string) {
+    return this.db.prepare(`SELECT * FROM events
+      WHERE thread_id=? AND type=? ORDER BY seq ASC`).all(threadId, type).map((row: any) => ({
+      seq: Number(row.seq), eventId: row.event_id, type: row.type,
+      threadId: row.thread_id ?? undefined, turnId: row.turn_id ?? undefined,
+      at: row.at, payload: JSON.parse(row.payload_json),
+    }));
+  }
+
   latestSeq() {
     return Number((this.db.prepare("SELECT MAX(seq) seq FROM events").get() as any)?.seq || 0);
   }

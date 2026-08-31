@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
-import { assertAllowedCwd, listProjects, type BridgeConfig } from "./config.ts";
+import { assertAllowedCwd, type BridgeConfig } from "./config.ts";
 import { CodexAppServer, mapCodexBusy } from "./codex.ts";
 import { DesktopAttachClient, type DesktopWaitSummary } from "./desktop-attach.ts";
 import { FcmNotifier } from "./fcm.ts";
@@ -25,6 +28,14 @@ type DesktopWatcher = {
   task?: Promise<void>;
 };
 
+const MAINTENANCE_BLOCKED_METHODS = new Set([
+  "thread/start",
+  "turn/start",
+  "turn/steer",
+  "approval/respond",
+  "question/respond",
+]);
+
 function stringParam(value: unknown, name: string, max: number, required = true) {
   if (value === undefined || value === null) {
     if (!required) return undefined;
@@ -42,6 +53,28 @@ function intParam(value: unknown, name: string, fallback: number, max: number) {
     throw new RpcError(ErrorName.INVALID_REQUEST, `${name} 必须是 0 到 ${max} 的整数`);
   }
   return value;
+}
+
+function desktopOperationError(action: string, error: unknown) {
+  const mapped = mapCodexBusy(error);
+  if (mapped instanceof RpcError) return mapped;
+  const message = error instanceof Error ? error.message : String(error);
+  if (/当前不支持|握手未声明能力|协议版本不兼容|版本过旧/i.test(message)) {
+    return new RpcError(ErrorName.VERSION_UNSUPPORTED, "Desktop Attach 版本过旧；请在 Codex Desktop 新建一个任务以加载最新版插件");
+  }
+  if (/插件未运行|无法连接 Desktop Attach|连接已关闭|ENOENT|caller thread id/i.test(message)) {
+    return new RpcError(ErrorName.NOT_FOUND, "Desktop Attach 尚未就绪；请在 Codex Desktop 新建任务并调用 desktop_attach_probe");
+  }
+  if (/task was not found|任务不存在|找不到任务/i.test(message)) {
+    return new RpcError(ErrorName.NOT_FOUND, "Codex Desktop 中找不到这个任务");
+  }
+  if (/failed to initialize|function_call_output requires call_id|previous_response_id.*WebSocket v2/i.test(message)) {
+    return new RpcError(
+      ErrorName.VERSION_UNSUPPORTED,
+      "当前 Codex 走 HTTP Responses，Desktop 插件新建和续写都需要 Responses WebSocket v2，因此任务没有真正跑起来。已有任务请先在电脑上的 Codex Desktop 继续；要从手机操作，请改用支持 WebSocket v2 的官方 ChatGPT 通道，或更新 Desktop/模型代理后再试",
+    );
+  }
+  return new RpcError("INTERNAL", `${action}失败；请在 Codex Desktop 确认任务状态后重试`);
 }
 
 function questionAnswers(value: unknown) {
@@ -69,8 +102,10 @@ export class BridgeServer {
   wss?: WebSocketServer;
   sessions = new Set<Session>();
   commandOutputBytes = new Map<string, number>();
-  desktopThreads = new Set<string>();
   desktopWatchers = new Map<string, DesktopWatcher>();
+  relayEventListeners = new Set<(event: BridgeEvent & { seq: number }) => void>();
+  runtimeStatusTimer?: NodeJS.Timeout;
+  inFlightMutations = 0;
 
   constructor(config: BridgeConfig, store: BridgeStore, codex: CodexAppServer, fcm: FcmNotifier, desktop?: DesktopAttachClient) {
     this.config = config;
@@ -98,6 +133,9 @@ export class BridgeServer {
       this.wss!.once("listening", resolve);
       this.wss!.once("error", reject);
     });
+    this.writeRuntimeStatus();
+    this.runtimeStatusTimer = setInterval(() => this.writeRuntimeStatus(), 5_000);
+    this.runtimeStatusTimer.unref();
   }
 
   send(session: Session, message: unknown) {
@@ -143,6 +181,21 @@ export class BridgeServer {
   }
 
   async dispatch(session: Session, method: string, params: any) {
+    if (!MAINTENANCE_BLOCKED_METHODS.has(method)) return this.dispatchUnchecked(session, method, params);
+    if (this.maintenanceRequested()) {
+      throw new RpcError(ErrorName.HOST_MAINTENANCE, "Host 正在准备更新，暂不接受新的任务操作");
+    }
+    this.inFlightMutations += 1;
+    this.writeRuntimeStatus();
+    try {
+      return await this.dispatchUnchecked(session, method, params);
+    } finally {
+      this.inFlightMutations = Math.max(0, this.inFlightMutations - 1);
+      this.writeRuntimeStatus();
+    }
+  }
+
+  async dispatchUnchecked(session: Session, method: string, params: any) {
     switch (method) {
       case "pair/claim": {
         const claimed = this.store.claimPairing({
@@ -175,7 +228,34 @@ export class BridgeServer {
         this.store.registerPush(session.device.id, token);
         return { ok: true };
       }
-      case "project/list": return { data: listProjects(this.config.projectRoots) };
+      case "project/list": {
+        if (!this.desktop) throw new RpcError(ErrorName.NOT_FOUND, "Desktop Attach 插件未连接，无法读取 Codex Desktop 项目");
+        let result: any;
+        try {
+          result = await this.desktop.listProjectsNormalized();
+        } catch (error) {
+          throw desktopOperationError("无法读取 Codex Desktop 项目", error);
+        }
+        const projects = [] as any[];
+        let excluded = 0;
+        for (const project of Array.isArray(result?.data) ? result.data : []) {
+          try {
+            projects.push({ ...project, cwd: assertAllowedCwd(project.cwd, this.config.projectRoots) });
+          } catch (error) {
+            if (error instanceof RpcError && error.nameCode === ErrorName.PATH_DENIED) {
+              excluded += 1;
+              continue;
+            }
+            throw error;
+          }
+        }
+        const warning = projects.length === 0
+          ? excluded > 0
+            ? "Codex Desktop 的已保存项目都不在 Bridge 项目白名单内"
+            : "Codex Desktop 尚未保存可用的本地项目"
+          : undefined;
+        return { ...result, data: projects, excluded, warning };
+      }
       case "model/list": return this.codex.request("model/list", {
         cursor: stringParam(params.cursor, "cursor", 2048, false), limit: intParam(params.limit, "limit", 100, 200) || 100, includeHidden: false,
       });
@@ -183,14 +263,14 @@ export class BridgeServer {
         const cursor = stringParam(params.cursor, "cursor", 2048, false);
         const search = stringParam(params.search, "search", 500, false);
         const limit = intParam(params.limit, "limit", 50, 200) || 50;
-        if (this.desktop && !cursor) {
+        if (this.desktop) {
+          if (cursor) throw new RpcError(ErrorName.INVALID_REQUEST, "Codex Desktop 任务列表暂不支持 cursor 分页");
           try {
             const result = await this.desktop.listThreadsNormalized(Math.min(limit, 50), search);
             this.rememberDesktopThreads(result);
             return this.applyStoredThreadOwners(result);
-          } catch {
-            // The plugin is experimental. Keep the existing read path available
-            // when it is not running or its internal Desktop schema changes.
+          } catch (error) {
+            throw desktopOperationError("无法读取 Codex Desktop 任务列表", error);
           }
         }
         return this.codex.request("thread/list", {
@@ -209,32 +289,95 @@ export class BridgeServer {
     }
   }
 
+  async dispatchRelay(deviceId: string, method: string, params: any) {
+    if (method === "pair/claim" || method === "push/register") {
+      throw new RpcError(ErrorName.AUTH_FAILED, "该方法只能通过本地 Bridge 连接调用");
+    }
+    if (method === "bridge/hello") {
+      if (params.protocolVersion !== PROTOCOL_VERSION) {
+        throw new RpcError(ErrorName.VERSION_UNSUPPORTED, `Bridge 协议版本应为 ${PROTOCOL_VERSION}`);
+      }
+      const claimedDeviceId = stringParam(params.deviceId, "deviceId", 64, false);
+      if (claimedDeviceId && claimedDeviceId !== deviceId) throw new RpcError(ErrorName.AUTH_FAILED, "deviceId 与 Relay 身份不匹配");
+      return {
+        protocolVersion: PROTOCOL_VERSION,
+        hostId: this.store.hostId(),
+        hostName: this.config.hostName,
+        deviceId,
+        codexVersion: this.codex.version,
+        readOnly: this.codex.readOnly,
+        error: this.codex.compatibilityError,
+        latestSeq: this.store.latestSeq(),
+      };
+    }
+    const virtual = { device: { id: deviceId }, hello: true } as Session;
+    return this.dispatch(virtual, method, params || {});
+  }
+
+  subscribeRelayEvents(listener: (event: BridgeEvent & { seq: number }) => void) {
+    this.relayEventListeners.add(listener);
+    return () => this.relayEventListeners.delete(listener);
+  }
+
   async startThread(params: any) {
-    this.codex.assertWritable();
+    const target = stringParam(params.target, "target", 32, false)?.trim() || "bridge";
+    if (target !== "desktop" && target !== "bridge") {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "target 仅支持 desktop 或 bridge");
+    }
     const cwd = assertAllowedCwd(params.cwd, this.config.projectRoots);
     const text = stringParam(params.text, "text", 1024 * 1024)!;
-    const model = stringParam(params.model, "model", 200, false);
-    const effort = stringParam(params.effort, "effort", 32, false);
+    const model = stringParam(params.model, "model", 200, false)?.trim() || undefined;
+    const effort = stringParam(params.effort, "effort", 32, false)?.trim() || undefined;
+    const clientMessageId = stringParam(params.clientMessageId, "clientMessageId", 128, false)?.trim() || undefined;
+    if (target === "desktop") {
+      const workspaceMode = stringParam(params.workspaceMode, "workspaceMode", 32, false)?.trim() || "local";
+      if (workspaceMode !== "local") {
+        throw new RpcError(ErrorName.INVALID_REQUEST, "Desktop 新任务的 workspaceMode 仅支持 local");
+      }
+      if (!this.desktop) throw new RpcError(ErrorName.NOT_FOUND, "Desktop Attach 插件未连接，无法在 Desktop 新建任务");
+      try {
+        const created = await this.desktop.createThread(cwd, text, model, effort, workspaceMode);
+        const threadId = typeof created?.thread?.id === "string" ? created.thread.id.trim() : "";
+        if (!threadId) throw new Error("Desktop Attach 返回的新任务缺少 thread.id");
+        const owner = this.store.claimThreadOwner(threadId, "desktop");
+        if (owner !== "desktop") throw new Error("新任务 ID 已被其他 writer 占用");
+        this.publishDesktopMessage(threadId, clientMessageId, "user", text, { complete: true });
+        this.startDesktopWatcher(threadId);
+        return {
+          ...created,
+          source: "desktop",
+          thread: {
+            ...created.thread,
+            id: threadId,
+            cwd,
+            source: "desktop",
+            capabilities: { send: true, interrupt: false, approval: false, question: false },
+          },
+        };
+      } catch (error) {
+        throw desktopOperationError("无法通过 Codex Desktop 新建任务", error);
+      }
+    }
+
+    this.codex.assertWritable();
     const started = await this.codex.request("thread/start", {
       cwd, model, approvalPolicy: "on-request",
     });
     const threadId = started.thread.id;
     this.store.setThreadOwner(threadId, "bridge");
-    this.desktopThreads.delete(threadId);
     const turn = await this.codex.request("turn/start", {
       threadId, input: [{ type: "text", text }], model, effort,
     });
     this.codex.markTurn(threadId, turn.turn.id);
+    this.writeRuntimeStatus();
     return { thread: started.thread, turn: turn.turn };
   }
 
   async startTurn(params: any) {
     const threadId = stringParam(params.threadId, "threadId", 100)!;
     const text = stringParam(params.text, "text", 1024 * 1024)!;
-    if (await this.isDesktopThread(threadId)) return this.sendToDesktop(threadId, text);
-    if (this.store.threadOwner(threadId) !== "bridge") {
-      throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "任务未由 Codex Desktop 列表确认，已拒绝使用独立 app-server 写入");
-    }
+    const clientMessageId = stringParam(params.clientMessageId, "clientMessageId", 128, false)?.trim() || undefined;
+    if (this.store.threadOwner(threadId) !== "bridge") return this.sendToDesktop(threadId, text, clientMessageId);
     this.codex.assertWritable();
     await this.codex.assertThreadControllable(threadId);
     await this.codex.request("thread/resume", { threadId });
@@ -243,6 +386,7 @@ export class BridgeServer {
       model: stringParam(params.model, "model", 200, false), effort: stringParam(params.effort, "effort", 32, false),
     });
     this.codex.markTurn(threadId, result.turn.id);
+    this.writeRuntimeStatus();
     return result;
   }
 
@@ -250,10 +394,8 @@ export class BridgeServer {
     const threadId = stringParam(params.threadId, "threadId", 100)!;
     const expected = stringParam(params.expectedTurnId, "expectedTurnId", 100)!;
     const text = stringParam(params.text, "text", 1024 * 1024)!;
-    if (await this.isDesktopThread(threadId)) return this.sendToDesktop(threadId, text);
-    if (this.store.threadOwner(threadId) !== "bridge") {
-      throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "任务 owner 未确认为 Bridge，不能使用独立 app-server steer");
-    }
+    const clientMessageId = stringParam(params.clientMessageId, "clientMessageId", 128, false)?.trim() || undefined;
+    if (this.store.threadOwner(threadId) !== "bridge") return this.sendToDesktop(threadId, text, clientMessageId);
     this.codex.assertWritable();
     if (this.codex.activeTurns.get(threadId) !== expected) {
       throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "当前活动 turn 不属于 Bridge，不能 steer");
@@ -266,11 +408,9 @@ export class BridgeServer {
   async interruptTurn(params: any) {
     const threadId = stringParam(params.threadId, "threadId", 100)!;
     const turnId = stringParam(params.turnId, "turnId", 100)!;
-    if (await this.isDesktopThread(threadId)) {
-      throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "Desktop 任务暂不支持从手机中断，请在 Codex Desktop 处理");
-    }
     if (this.store.threadOwner(threadId) !== "bridge") {
-      throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "任务 owner 未确认为 Bridge，不能使用独立 app-server 中断");
+      await this.readDesktopThread(threadId, 1);
+      throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "Desktop 任务暂不支持从手机中断，请在 Codex Desktop 处理");
     }
     this.codex.assertWritable();
     if (this.codex.activeTurns.get(threadId) !== turnId) {
@@ -278,15 +418,14 @@ export class BridgeServer {
     }
     const result = await this.codex.request("turn/interrupt", { threadId, turnId });
     this.codex.clearTurn(threadId, turnId);
+    this.writeRuntimeStatus();
     return result;
   }
 
   rememberDesktopThreads(result: any) {
     for (const thread of Array.isArray(result?.data) ? result.data : []) {
       if (typeof thread?.id !== "string" || !thread.id) continue;
-      const owner = this.store.claimThreadOwner(thread.id, "desktop");
-      if (owner === "desktop") this.desktopThreads.add(thread.id);
-      else this.desktopThreads.delete(thread.id);
+      this.store.claimThreadOwner(thread.id, "desktop");
     }
   }
 
@@ -305,56 +444,117 @@ export class BridgeServer {
     };
   }
 
-  async isDesktopThread(threadId: string) {
-    const storedOwner = this.store.threadOwner(threadId);
-    if (storedOwner === "bridge") return false;
-    if (storedOwner === "desktop") return true;
-    if (this.desktopThreads.has(threadId)) return true;
-    if (!this.desktop) return false;
-    try {
-      const result = await this.desktop.listThreadsNormalized(50);
-      this.rememberDesktopThreads(result);
-      return this.desktopThreads.has(threadId);
-    } catch {
-      return false;
-    }
-  }
-
   async readThread(params: any) {
     const threadId = stringParam(params.threadId, "threadId", 100)!;
-    const result = await this.codex.request("thread/read", { threadId, includeTurns: true });
-    if (!(await this.isDesktopThread(threadId)) || !result?.thread || typeof result.thread !== "object") return result;
+    if (this.store.threadOwner(threadId) === "bridge") {
+      return this.codex.request("thread/read", { threadId, includeTurns: true });
+    }
+    const cursor = stringParam(params.cursor, "cursor", 4096, false);
+    if (cursor !== undefined && !cursor.trim()) {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "cursor 格式或长度无效");
+    }
+    return this.readDesktopThread(threadId, 10, cursor);
+  }
+
+  async readDesktopThread(threadId: string, turnLimit = 10, cursor?: string) {
+    if (!this.desktop) throw new RpcError(ErrorName.NOT_FOUND, "Desktop Attach 插件未连接");
+    let result: any;
+    try {
+      result = await this.desktop.readThreadNormalized(threadId, turnLimit, cursor);
+    } catch (error) {
+      throw desktopOperationError("无法通过 Codex Desktop 读取任务", error);
+    }
+    if (!result?.thread || typeof result.thread !== "object") {
+      throw new RpcError("INTERNAL", "Codex Desktop 返回的任务详情不完整");
+    }
+    const cwd = assertAllowedCwd(result.thread.cwd, this.config.projectRoots);
+    const owner = this.store.claimThreadOwner(threadId, "desktop");
+    if (owner !== "desktop") {
+      throw new RpcError(ErrorName.NOT_FOUND, "该任务由 Bridge app-server 管理，不能通过 Desktop Attach 接管");
+    }
+    const turns = Array.isArray(result.thread.turns) ? result.thread.turns : [];
+    const existingItemIds = new Set(turns.flatMap((turn: any) =>
+      Array.isArray(turn?.items) ? turn.items.map((item: any) => item?.id).filter((id: unknown) => typeof id === "string") : [],
+    ));
+    const overlayItems = cursor
+      ? []
+      : this.desktopOverlayItems(threadId).filter((item: any) => !existingItemIds.has(item.id));
+    const overlayTurn = overlayItems.length > 0
+      ? { id: `agent-pocket-overlay-${threadId}`, status: "completed", items: overlayItems }
+      : undefined;
+    const mergedTurns = !overlayTurn
+      ? turns
+      : result?.page?.order === "newest_first"
+        ? [overlayTurn, ...turns]
+        : [...turns, overlayTurn];
     return {
       ...result,
       thread: {
         ...result.thread,
+        cwd,
+        turns: mergedTurns,
         source: "desktop",
         capabilities: { send: true, interrupt: false, approval: false, question: false },
       },
     };
   }
 
-  async sendToDesktop(threadId: string, text: string) {
-    if (!this.desktop) throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, "Desktop Attach 插件未连接");
+  desktopOverlayItems(threadId: string) {
+    const latest = new Map<string, { seq: number; item: any }>();
+    for (const event of this.store.eventsForThread(threadId, "message.delta")) {
+      const payload = event.payload as any;
+      if (payload?.source !== "desktop" || payload?.replace !== true) continue;
+      const itemId = typeof payload.itemId === "string" ? payload.itemId : "";
+      const role = payload.role === "user" ? "user" : payload.role === "assistant" ? "assistant" : undefined;
+      const text = typeof payload.delta === "string" ? payload.delta : undefined;
+      if (!itemId || !role || text === undefined) continue;
+      latest.set(itemId, {
+        seq: event.seq || 0,
+        item: role === "user"
+          ? { id: itemId, type: "userMessage", content: [{ type: "text", text }] }
+          : { id: itemId, type: "agentMessage", text },
+      });
+    }
+    return [...latest.values()].sort((left, right) => left.seq - right.seq).map((entry) => entry.item);
+  }
+
+  publishDesktopMessage(
+    threadId: string,
+    itemId: string | undefined,
+    role: "user" | "assistant",
+    text: string,
+    options: { turnId?: string; complete: boolean; truncated?: boolean },
+  ) {
+    const limited = truncateUtf8(text, MAX_COMMAND_BYTES);
+    const resolvedItemId = itemId || `desktop-${role}-${options.turnId || randomUUID()}`;
+    this.publish(newEvent("message.delta", {
+      threadId,
+      turnId: options.turnId,
+      itemId: resolvedItemId,
+      role,
+      delta: limited.value,
+      complete: options.complete,
+      replace: true,
+      source: "desktop",
+      truncated: options.truncated === true || limited.truncated,
+    }));
+    return resolvedItemId;
+  }
+
+  async sendToDesktop(threadId: string, text: string, clientMessageId?: string) {
+    if (!this.desktop) throw new RpcError(ErrorName.NOT_FOUND, "Desktop Attach 插件未连接");
+    await this.readDesktopThread(threadId, 1);
     try {
-      let liveSync = this.desktopWatchers.has(threadId);
-      let baselineCursor: string | undefined;
-      if (!liveSync) {
-        try {
-          const baseline = await this.desktop.waitThread(threadId, undefined, 0);
-          baselineCursor = baseline.cursor;
-          liveSync = true;
-        } catch {
-          // Older or temporarily incompatible plugins retain the Android
-          // short-poll fallback. Sending through Desktop remains available.
-        }
+      let cursor = this.desktopWatchers.get(threadId)?.cursor;
+      if (!this.desktopWatchers.has(threadId)) {
+        try { cursor = (await this.desktop.waitThread(threadId, undefined, 0)).cursor; } catch {}
       }
       await this.desktop.sendMessage(threadId, text);
-      if (liveSync) this.startDesktopWatcher(threadId, baselineCursor);
-      return { ok: true, accepted: true, source: "desktop", threadId, liveSync };
+      const messageId = this.publishDesktopMessage(threadId, clientMessageId, "user", text, { complete: true });
+      this.startDesktopWatcher(threadId, cursor);
+      return { ok: true, accepted: true, source: "desktop", threadId, messageId, liveSync: true };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new RpcError(ErrorName.THREAD_BUSY_EXTERNAL, `无法通过 Codex Desktop 续写：${message}`);
+      throw desktopOperationError("无法通过 Codex Desktop 续写", error);
     }
   }
 
@@ -366,8 +566,10 @@ export class BridgeServer {
     }
     const watcher: DesktopWatcher = { cursor, generation: 1, stopped: false };
     this.desktopWatchers.set(threadId, watcher);
+    this.writeRuntimeStatus();
     watcher.task = this.runDesktopWatcher(threadId, watcher).finally(() => {
       if (this.desktopWatchers.get(threadId) === watcher) this.desktopWatchers.delete(threadId);
+      this.writeRuntimeStatus();
     });
   }
 
@@ -380,6 +582,20 @@ export class BridgeServer {
         if (watcher.stopped) return;
         if (result.cursor) watcher.cursor = result.cursor;
         if (result.changed) {
+          const terminal = this.desktopWaitIsTerminal(result);
+          if (typeof result.assistantText === "string" && result.assistantText) {
+            this.publishDesktopMessage(
+              threadId,
+              `desktop-agent-${result.turnId || result.cursor || "current"}`,
+              "assistant",
+              result.assistantText,
+              {
+                turnId: result.turnId,
+                complete: terminal,
+                truncated: result.assistantTextTruncated,
+              },
+            );
+          }
           const eventKey = this.desktopWaitEventKey(result);
           if (eventKey !== watcher.lastPublishedKey) {
             watcher.lastPublishedKey = eventKey;
@@ -392,7 +608,7 @@ export class BridgeServer {
               wakeReason: result.wakeReason,
             }));
           }
-          if (generationAtWait === watcher.generation && this.desktopWaitIsTerminal(result)) return;
+          if (generationAtWait === watcher.generation && terminal) return;
         } else {
           await new Promise((resolve) => setTimeout(resolve, 250));
         }
@@ -495,9 +711,11 @@ export class BridgeServer {
       }
       case "turn/started":
         if (p.threadId && p.turn?.id) this.codex.markTurn(p.threadId, p.turn.id);
+        this.writeRuntimeStatus();
         this.publish(newEvent("turn.status", { ...p, turnId: p.turn?.id, status: "started" })); break;
       case "turn/completed":
         if (p.threadId) this.codex.clearTurn(p.threadId, p.turn?.id);
+        this.writeRuntimeStatus();
         this.publish(newEvent("turn.status", { ...p, turnId: p.turn?.id, status: "completed" })); break;
       case "thread/status/changed":
         this.publish(newEvent("turn.status", { ...p })); break;
@@ -506,6 +724,9 @@ export class BridgeServer {
 
   publish(event: BridgeEvent) {
     const saved = this.store.appendEvent(event);
+    for (const listener of this.relayEventListeners) {
+      try { listener(saved); } catch (error) { console.error("Relay event listener:", error); }
+    }
     for (const session of this.sessions) {
       if (session.device && !this.store.isDeviceActive(session.device.id)) {
         session.socket.close(4003, "device revoked");
@@ -522,6 +743,10 @@ export class BridgeServer {
   }
 
   async stop() {
+    if (this.runtimeStatusTimer) {
+      clearInterval(this.runtimeStatusTimer);
+      this.runtimeStatusTimer = undefined;
+    }
     const watcherTasks = [...this.desktopWatchers.values()].flatMap((watcher) => watcher.task ? [watcher.task] : []);
     for (const watcher of this.desktopWatchers.values()) watcher.stopped = true;
     this.desktopWatchers.clear();
@@ -539,6 +764,56 @@ export class BridgeServer {
         const timer = setTimeout(finish, 12_000);
         void Promise.allSettled(watcherTasks).then(finish);
       });
+    }
+    this.writeRuntimeStatus(false);
+  }
+
+  runtimeStatus(running = true) {
+    const maintenance = this.maintenanceRequest();
+    return {
+      version: 1,
+      pid: process.pid,
+      running,
+      activeTaskCount: new Set([
+        ...this.codex.activeTurns.keys(),
+        ...this.desktopWatchers.keys(),
+      ]).size + this.inFlightMutations,
+      maintenance: Boolean(maintenance),
+      maintenanceRequestId: maintenance?.requestId,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  maintenanceRequested() {
+    return Boolean(this.maintenanceRequest());
+  }
+
+  maintenanceRequest() {
+    const path = this.config.maintenancePath;
+    if (!path || !existsSync(path)) return undefined;
+    try {
+      const value = JSON.parse(readFileSync(path, "utf8")) as { version?: unknown; requestId?: unknown; expiresAt?: unknown };
+      if (value.version !== 1 || typeof value.requestId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(value.requestId)
+        || typeof value.expiresAt !== "number" || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now()) {
+        return undefined;
+      }
+      return { requestId: value.requestId, expiresAt: value.expiresAt };
+    } catch {
+      return undefined;
+    }
+  }
+
+  writeRuntimeStatus(running = true) {
+    const path = this.config.runtimeStatusPath;
+    if (!path) return;
+    const temporary = `${path}.${process.pid}.tmp`;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(temporary, `${JSON.stringify(this.runtimeStatus(running))}\n`, { encoding: "utf8", mode: 0o600 });
+      renameSync(temporary, path);
+    } catch (error) {
+      rmSync(temporary, { force: true });
+      console.error("Host runtime status:", error);
     }
   }
 }

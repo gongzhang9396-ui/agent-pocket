@@ -44,6 +44,8 @@ object MockPocketRepository : PocketRepository {
         ),
     )
     override val host: StateFlow<Host> = _host.asStateFlow()
+    override val hosts: StateFlow<List<Host>> = MutableStateFlow(listOf(_host.value)).asStateFlow()
+    override val selectedHostId: StateFlow<String?> = MutableStateFlow<String?>(_host.value.id).asStateFlow()
 
     private val _device = MutableStateFlow(
         Device(
@@ -54,9 +56,11 @@ object MockPocketRepository : PocketRepository {
         ),
     )
     override val device: StateFlow<Device> = _device.asStateFlow()
+    override val accountDevices: StateFlow<List<Device>> = MutableStateFlow(listOf(_device.value)).asStateFlow()
 
     private val _isPaired = MutableStateFlow(true)
     override val isPaired: StateFlow<Boolean> = _isPaired.asStateFlow()
+    override val authStatus: StateFlow<String> = MutableStateFlow("已登录").asStateFlow()
 
     override val actionError: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
     override val creatingTask: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
@@ -66,6 +70,8 @@ object MockPocketRepository : PocketRepository {
         Project("proj-bridge", "codex-bridge", "C:\\workspace\\codex-bridge"),
         Project("proj-notes", "notes-api", "C:\\workspace\\notes-api"),
     )).asStateFlow()
+    override val projectsLoading: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
+    override val projectsError: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
 
     override val models: StateFlow<List<ModelOption>> = MutableStateFlow(listOf(
         ModelOption(
@@ -391,6 +397,8 @@ object MockPocketRepository : PocketRepository {
     override fun threadDiff(threadId: String): StateFlow<List<DiffFile>> =
         MutableStateFlow(diffs[threadId] ?: themeFlickerDiff()).asStateFlow()
 
+    override fun openNotification(hostId: String, eventId: String, onResolved: (String?) -> Unit) = onResolved(null)
+
     private fun themeFlickerDiff(): List<DiffFile> = listOf(
         DiffFile(
             path = "app/src/main/java/com/agentpocket/app/ui/theme/Theme.kt",
@@ -545,6 +553,9 @@ object MockPocketRepository : PocketRepository {
 
     private var createdCount = 0
 
+    override fun refreshProjects() = Unit
+    override fun selectHost(hostId: String?) = Unit
+
     override fun createTask(
         projectId: String,
         modelId: String,
@@ -683,6 +694,11 @@ object MockPocketRepository : PocketRepository {
     }
 
     override fun pairFromQr(payload: String) = pairManually("wss://agent.example.com/high-entropy-path", payload)
+    override fun login(relayUrl: String, username: String, password: String) = pairManually(relayUrl, password)
+    override fun claimInvite(inviteUrl: String, relayUrl: String, username: String, displayName: String, password: String) = pairManually(relayUrl, inviteUrl)
+    override fun approveHostFromQr(payload: String, name: String?) = Unit
+    override fun approveDevice(deviceId: String) = Unit
+    override fun revokeAccountDevice(deviceId: String) = Unit
 
     override fun resetPairing() {
         _isPaired.value = false

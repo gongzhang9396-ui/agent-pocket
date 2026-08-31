@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "metadata": {
+    "accountId": "00000000-0000-4000-8000-000000000001",
+    "hostId": "00000000-0000-4000-8000-000000000002",
+    "deviceId": "00000000-0000-4000-8000-000000000003",
+    "channelId": "00000000-0000-4000-8000-000000000004",
+    "counter": 7,
+    "kind": "event.append",
+    "eventId": "evt-fixed-1",
+    "eventType": "completed"
+  },
+  "aad": "WyIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLDcsImV2ZW50LmFwcGVuZCIsImV2dC1maXhlZC0xIiwiY29tcGxldGVkIl0",
+  "aead": {
+    "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3",
+    "message": "eyJ0eXBlIjoidHVybi5zdGF0dXMiLCJzdGF0dXMiOiJjb21wbGV0ZWQifQ",
+    "ciphertext": "Zns5sgtSNrEayiXPJmlypVwhpE_9vyTGlQAoXHwb0CBSLk0yrYZSazaGSJxqqZFyJq-cS8dT4QdmdpY"
+  },
+  "x25519": {
+    "privateA": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+    "publicA": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+    "privateB": "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+    "publicB": "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns",
+    "shared": "qE3Hw8jwWLGy3EzR6bXcCnmH-ItqlWTN4zkfxCEVnnc",
+    "transcript": "YWdlbnQtcG9ja2V0LXJlbGF5LXYyADAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMQAwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIAMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzADAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNA",
+    "direction": "device-to-host",
+    "derivedKey": "2V0moI8vHUwhmBpEP9jpTz6v38eTDt5jUhAyLQmfIWE"
+  },
+  "ed25519": {
+    "seed": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A",
+    "publicKey": "rcFAEfgtHFbZVqpPnXPYhYNhpgYEhSXg0Ixjjcdd2Mc",
+    "handshake": {
+      "version": 2,
+      "accountId": "00000000-0000-4000-8000-000000000001",
+      "hostId": "00000000-0000-4000-8000-000000000002",
+      "deviceId": "00000000-0000-4000-8000-000000000003",
+      "channelId": "00000000-0000-4000-8000-000000000004",
+      "issuedAt": 1700000000000,
+      "ephemeralPublicKey": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+      "secretstreamHeader": "oaKjpKWmp6ipqqusra6vsLGys7S1tre4"
+    },
+    "handshakeBytes": "W1siYWNjb3VudElkIiwiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIl0sWyJjaGFubmVsSWQiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiXSxbImRldmljZUlkIiwiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAzIl0sWyJlcGhlbWVyYWxQdWJsaWNLZXkiLCJCNk44dkJRZ2s4aTNWZHdiRU9oc3RDWTNTdEZxcUZQdEM5X0Fzcmh0SEh3Il0sWyJob3N0SWQiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiXSxbImlzc3VlZEF0IiwxNzAwMDAwMDAwMDAwXSxbInNlY3JldHN0cmVhbUhlYWRlciIsIm9hS2pwS1dtcDZpcHFxdXNyYTZ2c0xHeXM3UzF0cmU0Il0sWyJ2ZXJzaW9uIiwyXV0",
+    "signature": "ciSGzGpwWyJpbPbWWBIu2usNX3b66JoUvTScWE6lAyWdLPcpCKnLbIGE9i3JT2p728h-lUUL-Fb3r3itmp2xAg"
+  },
+  "sealedBox": {
+    "publicKey": "kjdZZ00a9DxSLojIyhEb6L0CmMwXB0KKjN49XVtODFo",
+    "privateKey": "P678W9-e3uDVqcXBRBPsFEYWKwx-pC0lvjTmXaeZKuI",
+    "message": "c2VhbGVkIGFjY291bnQga2V5IHBhY2thZ2U",
+    "ciphertext": "8Xcf6O4t5HGIejWlQHrKAi-aXUX-BQTa7G46Uzxm3CHcxmJMvicLzCKnZSrudt2zA_ffSVtTGMYCIplJ7MxBbisg86eBbTQcW-I"
+  },
+  "secretstream": {
+    "key": "gYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6A",
+    "header": "PlQ7KEtfFz1GloCdYn9WMF5zQ9hSNF47",
+    "aad": "WyIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLDcsImV2ZW50LmFwcGVuZCIsImV2dC1maXhlZC0xIiwiY29tcGxldGVkIl0",
+    "message": "Zml4ZWQgc2VjcmV0c3RyZWFtIHBheWxvYWQ",
+    "ciphertext": "snDgJvRq5-Ye26gBzVNrbM0bgpvXEOafzSK0pVy50c8Ze9MHPwWecmrvgQ",
+    "tag": "message"
+  }
+}
