@@ -16,6 +16,7 @@ const desktopProjectPath = join(stateRoot, "Projects", "example");
 mkdirSync(desktopProjectPath, { recursive: true });
 const desktopSockets = new Set();
 let desktopSendCount = 0;
+const desktopSendCallerThreadIds = [];
 let desktopWaitCount = 0;
 const desktopWaitCallerThreadIds = [];
 let desktopReadCount = 0;
@@ -44,7 +45,7 @@ const desktop = net.createServer((socket) => {
           contentItems: [{
             type: "inputText",
             text: JSON.stringify({
-              pinnedThreads: [],
+              pinnedThreads: [{ id: "cold-thread", kind: "codex", title: "Cold", summary: "", cwd: desktopProjectPath, status: "notLoaded" }],
               threads: [{ id: "example-thread", kind: "codex", title: "Example", summary: "", cwd: desktopProjectPath, status: "idle" }],
             }),
           }],
@@ -113,6 +114,7 @@ const desktop = net.createServer((socket) => {
           }],
         };
       } else if (message.method === "tools/call" && message.params?.tool === "send_message_to_thread") {
+        desktopSendCallerThreadIds.push(message.params.threadId);
         desktopSendCount += 1;
         result = message.params.arguments?.prompt === "http websocket regression"
           ? {
@@ -177,6 +179,7 @@ const child = spawn(process.execPath, [join(pluginRoot, "server.mjs")], {
     LOCALAPPDATA: stateRoot,
     CODEX_APP_TOOLS_PIPE_PATH: desktopPipe,
     AGENT_POCKET_DESKTOP_HOST_PIPE: bridgeHostPipe,
+    AGENT_POCKET_CODEX_QUEUE_DISABLED: "1",
     CODEX_THREAD_ID: "",
     CODEX_SESSION_ID: "",
   },
@@ -290,6 +293,9 @@ try {
   }), /function_call_output requires call_id/);
   const sent = await bridgeRequest("thread/send", { threadId: "example-thread", text: "example prompt" });
   assert.equal(sent.contentItems.length, 1);
+  const selfSent = await bridgeRequest("thread/send", { threadId: "caller-thread", text: "self prompt" });
+  assert.equal(selfSent.contentItems.length, 1);
+  assert.equal(desktopSendCallerThreadIds.at(-1), "example-thread");
   const changed = await bridgeRequest("thread/wait", { threadId: "example-thread", afterCursor: baseline.cursor, timeoutMs: 8_000 });
   assert.deepEqual(changed, {
     cursor: "completed:2",
@@ -316,7 +322,7 @@ try {
   await assert.rejects(bridgeRequest("thread/create", { cwd: join(stateRoot, "missing"), text: "blocked", workspaceMode: "local" }), /does not exist/);
   assert.equal(desktopCreateCount, 3);
   assert.equal(desktopReadCount, 2);
-  assert.equal(desktopSendCount, 2);
+  assert.equal(desktopSendCount, 3);
   assert.equal(desktopWaitCount, 5);
   bridge.destroy();
   bridge = undefined;
@@ -330,6 +336,7 @@ try {
     desktopSendCount,
     desktopWaitCount,
     assistantPayloadForwarded: true,
+    selfSendUsedAlternateCaller: true,
     selfWaitUsedAlternateCaller: true,
   }));
 } finally {

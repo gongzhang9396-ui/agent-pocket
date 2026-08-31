@@ -17,6 +17,9 @@ const MAX_THREAD_CURSOR_CHARS = 4096;
 const MAX_WAIT_TIMEOUT_MS = 8_000;
 const NEW_THREAD_VERIFY_TIMEOUT_MS = 8_000;
 const MAX_DESKTOP_ITEM_CHARS = 20_000;
+const MAX_CODEX_QUEUE_MESSAGE_CHARS = 24_000;
+const CODEX_QUEUE_TIMEOUT_MS = 15_000;
+const MAX_CODEX_QUEUE_OUTPUT_BYTES = 64 * 1024;
 const MAX_BRIDGE_CONNECTIONS = 4;
 const MAX_BRIDGE_QUEUED_REQUESTS = 8;
 const MAX_NATIVE_PENDING_REQUESTS = 16;
@@ -233,8 +236,56 @@ function readDesktopTask(threadId, turnLimit, cursor, context) {
   );
 }
 
-function sendDesktopMessage(threadId, text, context) {
-  return callDesktopTool("send_message_to_thread", { threadId, prompt: text }, context);
+async function sendDesktopMessage(threadId, text, context) {
+  if (process.env.AGENT_POCKET_CODEX_QUEUE_DISABLED !== "1") {
+    await queueCodexMessage(threadId, text);
+    return [{ type: "inputText", text: JSON.stringify({ queued: true }) }];
+  }
+  const sendContext = await desktopCallerContext(threadId, context, "send");
+  return callDesktopTool("send_message_to_thread", { threadId, prompt: text }, sendContext);
+}
+
+function queueCodexMessage(threadId, text) {
+  if (text.length > MAX_CODEX_QUEUE_MESSAGE_CHARS) {
+    return Promise.reject(new Error(`Desktop message must not exceed ${MAX_CODEX_QUEUE_MESSAGE_CHARS} characters`));
+  }
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn("codex", ["queue", "--thread", threadId, "--message", text], {
+      cwd: dirname(SERVER_PATH),
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      error ? rejectPromise(error) : resolvePromise();
+    };
+    const append = (chunk) => {
+      output += chunk;
+      if (Buffer.byteLength(output, "utf8") > MAX_CODEX_QUEUE_OUTPUT_BYTES) {
+        child.kill();
+        finish(new Error("Codex queue output exceeded 64 KiB"));
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", append);
+    child.stderr.on("data", append);
+    child.once("error", (error) => finish(new Error(`Could not start codex queue: ${error.message}`)));
+    child.once("close", (code) => {
+      if (code === 0) return finish();
+      const detail = output.replace(/\s+/g, " ").trim().slice(0, 240);
+      finish(new Error(detail ? `Codex queue failed: ${detail}` : `Codex queue failed with exit code ${code}`));
+    });
+    timer = setTimeout(() => {
+      child.kill();
+      finish(new Error("Codex queue timed out"));
+    }, CODEX_QUEUE_TIMEOUT_MS);
+  });
 }
 
 async function createDesktopThread(cwd, text, model, effort, workspaceMode, context) {
@@ -301,7 +352,7 @@ async function createDesktopThread(cwd, text, model, effort, workspaceMode, cont
 }
 
 async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
-  const waitContext = await desktopWaitContext(threadId, context);
+  const waitContext = await desktopCallerContext(threadId, context, "wait");
   const target = { threadId };
   if (afterCursor) target.afterCursor = afterCursor;
   const contentItems = await callDesktopTool("wait_threads", {
@@ -346,7 +397,7 @@ async function waitDesktopThread(threadId, afterCursor, timeoutMs, context) {
   };
 }
 
-async function desktopWaitContext(threadId, context) {
+async function desktopCallerContext(threadId, context, operation) {
   if (context.threadId !== threadId) return context;
   const contentItems = await callDesktopTool(
     "list_threads",
@@ -358,15 +409,16 @@ async function desktopWaitContext(threadId, context) {
     ...(Array.isArray(payload?.pinnedThreads) ? payload.pinnedThreads : []),
     ...(Array.isArray(payload?.threads) ? payload.threads : []),
   ].filter((item) => item?.kind === "codex" && typeof item.id === "string" && item.id.trim() && item.id.trim() !== threadId);
-  const candidate = candidates.find((item) => {
+  const candidate = candidates.find((item) => firstString(item?.status?.type, item?.status) === "idle")
+    || candidates.find((item) => {
     const status = firstString(item?.status?.type, item?.status);
     return status !== "active" && status !== "running";
   }) || candidates[0];
-  if (!candidate) throw new Error("Desktop wait requires another Codex task as its caller context");
+  if (!candidate) throw new Error(`Desktop ${operation} requires another Codex task as its caller context`);
   return {
     ...context,
     threadId: candidate.id.trim(),
-    callId: `desktop-attach-wait-caller-${randomUUID()}`,
+    callId: `desktop-attach-${operation}-caller-${randomUUID()}`,
   };
 }
 
