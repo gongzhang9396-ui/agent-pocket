@@ -4,6 +4,15 @@ Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码�
 
 当前 v2 是邀请制、多用户、多主机架构，适合个人、家庭或小团队自托管。项目仍处于实验阶段：Desktop Attach 依赖 Codex Desktop 的内部本地能力，Desktop 更新后可能需要适配。
 
+## 直接安装
+
+在 [GitHub Releases](https://github.com/gongzhang9396-ui/agent-pocket/releases/latest) 下载同一版本的两个文件：
+
+- `Agent-Pocket-<版本>-release.apk`：安装到 Android 手机；
+- `AgentPocketHost-<版本>-windows-x64.exe`：安装到每台需要远程控制的 Windows 电脑。
+
+Relay 管理员先在后台创建用户邀请。用户通过邀请在 Android 登录后，在 Windows 安装器中填写 Relay 地址和项目白名单，再从开始菜单打开“绑定这台 Windows 电脑”，用 Android 扫描二维码即可。安装器不要求管理员权限；当前未购买 Authenticode 证书，Windows 首次安装可能显示 SmartScreen 提示，请同时核对 Release 中的 SHA-256 文件。
+
 ## 能力
 
 - 一个 Relay 账号可绑定多台 Windows Host 和多部 Android 手机。
