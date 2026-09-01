@@ -80,6 +80,7 @@ fun NewTaskScreen(
     var projectMenuExpanded by remember { mutableStateOf(false) }
     var modelId by rememberSaveable { mutableStateOf("") }
     var reasoningId by rememberSaveable { mutableStateOf("") }
+    var target by rememberSaveable { mutableStateOf(repo.lastTaskTarget()) }
     var prompt by rememberSaveable { mutableStateOf("") }
     var promptFocused by remember { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
@@ -110,7 +111,7 @@ fun NewTaskScreen(
     val submit = {
         if (canCreate) {
             focusManager.clearFocus()
-            repo.createTask(projectId, modelId, reasoning?.id.orEmpty(), prompt, onCreated)
+            repo.createTask(projectId, modelId, reasoning?.id.orEmpty(), prompt, target, onCreated)
         }
     }
 
@@ -227,6 +228,32 @@ fun NewTaskScreen(
                     }
                 }
             }
+
+            Spacer(Modifier.height(16.dp))
+            SectionLabel("运行方式")
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = target == "bridge",
+                    onClick = { target = "bridge" },
+                    label = { Text("Bridge · 手机完整控制") },
+                )
+                FilterChip(
+                    selected = target == "desktop",
+                    onClick = { target = "desktop" },
+                    label = { Text("Codex Desktop") },
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (target == "bridge") {
+                    "由这台电脑的 codex app-server 执行，兼容第三方模型通道；支持从手机审批、回答提问和中断。任务不出现在 Codex Desktop 任务列表中。"
+                } else {
+                    "创建真实 Codex Desktop 任务，可在电脑上继续操作。注意：第三方 HTTP 模型通道（如 cc-switch 中转）暂不支持新建，需要官方 WebSocket v2 通道。"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             Spacer(Modifier.height(16.dp))
             SectionLabel("项目")

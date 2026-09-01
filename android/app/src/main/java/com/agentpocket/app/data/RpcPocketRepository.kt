@@ -396,7 +396,10 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         scope.launch { fetchThread(ref) }
     }
 
-    override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, onCreated: (String) -> Unit) {
+    override fun lastTaskTarget(): String = settings.getString("newTaskTarget", "bridge") ?: "bridge"
+
+    override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, onCreated: (String) -> Unit) {
+        val resolvedTarget = if (target == "desktop") "desktop" else "bridge"
         val hostId = _selectedHostId.value
         val project = _projects.value.firstOrNull { it.id == projectId }
         if (hostId == null || project == null || !_hosts.value.any { it.id == hostId && it.connectionState == ConnectionState.Connected }) {
@@ -404,6 +407,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             return
         }
         if (_creatingTask.value) return
+        settings.edit().putString("newTaskTarget", resolvedTarget).apply()
         _creatingTask.value = true
         scope.launch {
             runCatching {
@@ -415,7 +419,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                         "text" to prompt,
                         "model" to modelId,
                         "effort" to reasoningId,
-                        "target" to "desktop",
+                        "target" to resolvedTarget,
                         "workspaceMode" to "local",
                         "clientMessageId" to "mobile-${System.currentTimeMillis()}",
                     ),
@@ -424,7 +428,14 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 val thread = result.obj("thread") ?: return@onSuccess
                 val rawId = thread.string("id") ?: return@onSuccess
                 val ref = ThreadRef(hostId, rawId)
-                val summary = summaryFromJson(hostId, thread)
+                val summary = summaryFromJson(hostId, thread).let { base ->
+                    // Bridge threads carry no preview yet; fall back to the prompt.
+                    if (base.title != "未命名任务") base
+                    else base.copy(
+                        title = prompt.lineSequence().firstOrNull()?.take(40).orEmpty().ifBlank { base.title },
+                        lastMessage = prompt.take(120),
+                    )
+                }
                 threadLists[hostId] = listOf(summary) + threadLists[hostId].orEmpty().filterNot { it.id == rawId }
                 updateVisibleThreads()
                 onCreated(ref.encoded())

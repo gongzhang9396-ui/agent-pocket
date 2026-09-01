@@ -560,12 +560,14 @@ object MockPocketRepository : PocketRepository {
     override fun refreshAll() = Unit
     override fun refreshThread(threadId: String) = Unit
     override fun selectHost(hostId: String?) = Unit
+    override fun lastTaskTarget(): String = "bridge"
 
     override fun createTask(
         projectId: String,
         modelId: String,
         reasoningId: String,
         prompt: String,
+        target: String,
         onCreated: (String) -> Unit,
     ) {
         createdCount += 1

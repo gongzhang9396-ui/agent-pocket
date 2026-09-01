@@ -55,7 +55,18 @@ interface PocketRepository {
     fun refreshThread(threadId: String)
 
     fun selectHost(hostId: String?)
-    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, onCreated: (String) -> Unit)
+
+    /** Last used new-task execution target ("bridge" or "desktop"); initial default is "bridge". */
+    fun lastTaskTarget(): String
+
+    /**
+     * Creates a new task on the selected host. [target] chooses the writer:
+     * "desktop" creates a real Codex Desktop task (requires the official
+     * Responses WebSocket v2 channel); "bridge" runs it on the host's own
+     * codex app-server, which works on any HTTP model channel and enables
+     * approvals/questions/interrupt from the phone.
+     */
+    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, onCreated: (String) -> Unit)
 
     /** Appends a user steer message to a running turn. */
     fun sendSteer(threadId: String, text: String)
