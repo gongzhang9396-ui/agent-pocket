@@ -41,6 +41,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -81,6 +82,10 @@ internal fun isPendingSessionRejected(error: Throwable): Boolean =
 internal fun shouldMarkSendFailed(currentStatus: MessageStatus?): Boolean =
     currentStatus != MessageStatus.Done
 
+internal fun resolveThreadRef(value: String, fallbackHostId: String?): ThreadRef? =
+    runCatching { ThreadRef.parse(value) }.getOrNull()
+        ?: fallbackHostId?.takeIf { it.isNotBlank() }?.let { ThreadRef(it, value) }
+
 private data class ChannelState(
     val crypto: PhoneChannel,
     val ready: CompletableDeferred<Unit> = CompletableDeferred(),
@@ -109,6 +114,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val deltaJobs = mutableMapOf<Pair<String, String>, Job>()
     private val notificationRefs = mutableMapOf<String, String>()
     private val hostEventMutexes = mutableMapOf<String, Mutex>()
+    private val refreshMutex = Mutex()
     private val hostSyncJobs = mutableMapOf<String, Job>()
     private val hostSyncRerun = mutableSetOf<String>()
     private val threadRefreshJobs = mutableMapOf<String, Job>()
@@ -496,7 +502,10 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     }
 
     override fun sendSteer(threadId: String, text: String) {
-        val ref = ThreadRef.parse(threadId)
+        val ref = resolveThreadRef(threadId, _selectedHostId.value) ?: run {
+            _actionError.value = "发送失败：任务缺少电脑上下文，请从任务列表重新打开"
+            return
+        }
         val key = ref.encoded()
         val messageId = "user-${System.currentTimeMillis()}"
         upsert(ref, TimelineItem.Message(messageId, Role.User, text, MessageStatus.Streaming))
@@ -599,8 +608,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private fun reconnect() {
         if (pausedForLimit || secure.load()?.approved != true) return
+        if (connectionJob?.isActive == true) return
         val generation = connectionGeneration.incrementAndGet()
-        connectionJob?.cancel()
         rpc?.close()
         connectionJob = scope.launch { connectLoop(generation) }
     }
@@ -1163,15 +1172,21 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     }
 
     private suspend fun refreshCredentials(credentials: RelayCredentials): RelayCredentials {
-        val result = apiPost(credentials.endpoint, "/api/auth/refresh", obj("refreshToken" to credentials.refreshToken)).requireObject("刷新登录")
-        val updated = credentials.copy(
-            accessToken = result.string("accessToken") ?: error("刷新结果缺少 accessToken"),
-            refreshToken = result.string("refreshToken") ?: error("刷新结果缺少 refreshToken"),
-            accessExpiresAt = result.long("accessExpiresAt") ?: error("刷新结果缺少有效期"),
-            refreshExpiresAt = result.long("refreshExpiresAt") ?: credentials.refreshExpiresAt,
-        )
-        secure.save(updated)
-        return updated
+        return refreshMutex.withLock {
+            withContext(NonCancellable) {
+                val current = secure.load()?.takeIf { it.approved && sameEndpoint(it.endpoint, credentials.endpoint) } ?: credentials
+                if (current.accessExpiresAt >= System.currentTimeMillis() + 30_000) return@withContext current
+                val result = apiPost(current.endpoint, "/api/auth/refresh", obj("refreshToken" to current.refreshToken)).requireObject("刷新登录")
+                val updated = current.copy(
+                    accessToken = result.string("accessToken") ?: error("刷新结果缺少 accessToken"),
+                    refreshToken = result.string("refreshToken") ?: error("刷新结果缺少 refreshToken"),
+                    accessExpiresAt = result.long("accessExpiresAt") ?: error("刷新结果缺少有效期"),
+                    refreshExpiresAt = result.long("refreshExpiresAt") ?: current.refreshExpiresAt,
+                )
+                secure.save(updated)
+                updated
+            }
+        }
     }
 
     private suspend fun registerPushIfReady() {

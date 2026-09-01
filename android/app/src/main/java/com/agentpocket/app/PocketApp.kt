@@ -43,7 +43,7 @@ fun PocketApp(
         val updateState by updater.state.collectAsState()
         val backStack = remember {
             mutableStateListOf<Screen>(
-                if (!paired) Screen.Pairing else initialThreadId?.takeIf { it.isNotBlank() }?.let(Screen::Detail) ?: Screen.Inbox,
+                if (!paired) Screen.Pairing() else initialThreadId?.takeIf { it.isNotBlank() }?.let(Screen::Detail) ?: Screen.Inbox,
             )
         }
         var handledLaunchKey by remember { mutableStateOf(-1L) }
@@ -63,7 +63,7 @@ fun PocketApp(
         LaunchedEffect(paired) {
             if (!paired && backStack.lastOrNull() !is Screen.Pairing) {
                 backStack.clear()
-                backStack.add(Screen.Pairing)
+                backStack.add(Screen.Pairing())
             }
         }
 
@@ -96,10 +96,11 @@ fun PocketApp(
 
         Surface(modifier = Modifier.fillMaxSize()) {
             when (val screen = backStack.last()) {
-                Screen.Pairing -> PairingScreen(
+                is Screen.Pairing -> PairingScreen(
                     repo = repo,
                     onPaired = { popToInbox() },
                     onBack = { pop() },
+                    allowExistingSession = screen.keepSession,
                 )
 
                 Screen.Inbox -> InboxScreen(
@@ -134,7 +135,7 @@ fun PocketApp(
                 Screen.Settings -> SettingsScreen(
                     repo = repo,
                     onBack = { pop() },
-                    onReenterPairing = { push(Screen.Pairing) },
+                    onReenterPairing = { push(Screen.Pairing(keepSession = true)) },
                     updateState = updateState,
                     onCheckForUpdates = updater::checkForUpdates,
                     onDownloadUpdate = updater::downloadUpdate,

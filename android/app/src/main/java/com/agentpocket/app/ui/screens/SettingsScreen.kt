@@ -185,10 +185,17 @@ fun SettingsScreen(
                     SectionLabel("账号")
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
-                        onClick = { repo.resetPairing(); onReenterPairing() },
+                        onClick = onReenterPairing,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("退出这部手机")
+                        Text("重新登录 Relay")
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(
+                        onClick = { repo.resetPairing() },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("退出并清除本机凭据")
                     }
                 }
             }

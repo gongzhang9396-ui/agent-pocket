@@ -2,7 +2,7 @@ package com.agentpocket.app.navigation
 
 /** Navigation graph. pairing -> inbox; inbox -> new task / detail / settings; detail -> diff. */
 sealed interface Screen {
-    data object Pairing : Screen
+    data class Pairing(val keepSession: Boolean = false) : Screen
 
     data object Inbox : Screen
 

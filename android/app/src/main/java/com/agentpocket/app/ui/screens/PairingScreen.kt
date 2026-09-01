@@ -53,6 +53,7 @@ fun PairingScreen(
     repo: PocketRepository,
     onPaired: () -> Unit,
     onBack: (() -> Unit)? = null,
+    allowExistingSession: Boolean = false,
 ) {
     val host by repo.host.collectAsState()
     val paired by repo.isPaired.collectAsState()
@@ -66,7 +67,9 @@ fun PairingScreen(
     var inviteUrl by rememberSaveable { mutableStateOf("") }
     val busy = authStatus.startsWith("正在")
 
-    LaunchedEffect(paired) { if (paired) onPaired() }
+    LaunchedEffect(paired, authStatus) {
+        if (paired && (!allowExistingSession || authStatus == "已登录")) onPaired()
+    }
 
     Scaffold(
         topBar = {
