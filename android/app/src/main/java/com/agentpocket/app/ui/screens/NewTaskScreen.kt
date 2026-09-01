@@ -247,7 +247,7 @@ fun NewTaskScreen(
             Spacer(Modifier.height(4.dp))
             Text(
                 if (target == "bridge") {
-                    "由这台电脑的 codex app-server 执行，兼容第三方模型通道；支持从手机审批、回答提问和中断。任务不出现在 Codex Desktop 任务列表中。"
+                    "由这台电脑的 codex app-server 执行，兼容第三方模型通道；支持从手机审批、回答提问和中断。任务同样出现在 Codex Desktop 列表中，可在电脑上查看，但请不要在电脑端续写它。"
                 } else {
                     "创建真实 Codex Desktop 任务，可在电脑上继续操作。注意：第三方 HTTP 模型通道（如 cc-switch 中转）暂不支持新建，需要官方 WebSocket v2 通道。"
                 },
