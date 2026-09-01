@@ -559,6 +559,7 @@ object MockPocketRepository : PocketRepository {
     override fun refreshProjects() = Unit
     override fun refreshAll() = Unit
     override fun refreshThread(threadId: String) = Unit
+    override fun setActiveThread(threadId: String?) = Unit
     override fun selectHost(hostId: String?) = Unit
     override fun lastTaskTarget(): String = "bridge"
 

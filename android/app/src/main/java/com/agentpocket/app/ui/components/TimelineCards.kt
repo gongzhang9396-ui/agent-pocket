@@ -53,6 +53,7 @@ import com.agentpocket.app.data.model.Role
 import com.agentpocket.app.data.model.StepStatus
 import com.agentpocket.app.data.model.TimelineItem
 import com.agentpocket.app.ui.theme.StatusColors
+import com.mikepenz.markdown.m3.Markdown
 
 /**
  * Renders one timeline item. Items are consumed from a keyed LazyColumn, so a
@@ -147,11 +148,13 @@ private fun MessageRow(message: TimelineItem.Message) {
             }
             Spacer(Modifier.height(4.dp))
             Row {
-                Text(
-                    message.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
+                // Codex 回复以 Markdown 呈现：代码块、列表、标题等。
+                if (message.text.isNotBlank()) {
+                    Markdown(
+                        content = message.text,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                }
                 if (message.status == MessageStatus.Streaming) {
                     StreamingCursor()
                 }

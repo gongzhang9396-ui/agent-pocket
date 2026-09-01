@@ -1,5 +1,6 @@
 package com.agentpocket.app.ui.screens
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,6 +20,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Badge
@@ -38,7 +41,10 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -77,6 +83,7 @@ fun InboxScreen(
     val sections = remember(threads, selectedHostId, projects) {
         threadSections(threads, showHost = selectedHostId == null, projects = projects)
     }
+    var collapsedSections by rememberSaveable { mutableStateOf(arrayListOf<String>()) }
     val desktopCount = threads.count { it.status == ThreadStatus.DesktopOwned }
     val externalCount = threads.count { it.status == ThreadStatus.ExternalBusy }
 
@@ -188,15 +195,26 @@ fun InboxScreen(
                     }
                     // 按 Codex Desktop 的体系分组：一个项目一节，节内与节间都按最新活动排序。
                     sections.forEach { section ->
+                        val collapsed = section.key in collapsedSections
                         item(key = "section:${section.key}", contentType = "section") {
-                            ProjectHeader(section)
-                        }
-                        items(section.threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
-                            ThreadCard(
-                                thread = thread,
-                                showHost = false,
-                                onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
+                            ProjectHeader(
+                                section = section,
+                                collapsed = collapsed,
+                                onToggle = {
+                                    collapsedSections = ArrayList(collapsedSections).apply {
+                                        if (!remove(section.key)) add(section.key)
+                                    }
+                                },
                             )
+                        }
+                        if (!collapsed) {
+                            items(section.threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
+                                ThreadCard(
+                                    thread = thread,
+                                    showHost = false,
+                                    onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
+                                )
+                            }
                         }
                     }
                 }
@@ -206,11 +224,12 @@ fun InboxScreen(
 }
 
 @Composable
-private fun ProjectHeader(section: ThreadSection) {
+private fun ProjectHeader(section: ThreadSection, collapsed: Boolean, onToggle: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 8.dp),
+            .clickable(onClick = onToggle)
+            .padding(top = 8.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -250,6 +269,12 @@ private fun ProjectHeader(section: ThreadSection) {
             "${section.threads.size} 个任务",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Icon(
+            if (collapsed) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowUp,
+            contentDescription = if (collapsed) "展开" else "收起",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(18.dp),
         )
     }
 }

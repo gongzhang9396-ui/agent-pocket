@@ -112,6 +112,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val hostSyncJobs = mutableMapOf<String, Job>()
     private val hostSyncRerun = mutableSetOf<String>()
     private val threadRefreshJobs = mutableMapOf<String, Job>()
+    private val unreadCounts = mutableMapOf<String, Int>()
+    private var activeThreadKey: String? = null
     private var rpc: BridgeRpcClient? = null
     private var connectionJob: Job? = null
     private var pendingApprovalJob: Job? = null
@@ -387,6 +389,26 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         startFullSync()
     }
 
+    override fun setActiveThread(threadId: String?) {
+        activeThreadKey = threadId?.let { runCatching { ThreadRef.parse(it).encoded() }.getOrDefault(it) }
+        activeThreadKey?.let { key -> if (unreadCounts.remove(key) != null) refreshUnread(key) }
+    }
+
+    private fun bumpUnread(ref: ThreadRef) {
+        val key = ref.encoded()
+        if (key == activeThreadKey) return
+        unreadCounts[key] = (unreadCounts[key] ?: 0) + 1
+        refreshUnread(key)
+    }
+
+    private fun refreshUnread(key: String) {
+        val ref = runCatching { ThreadRef.parse(key) }.getOrNull() ?: return
+        threadLists[ref.hostId] = threadLists[ref.hostId].orEmpty().map {
+            if (it.id == ref.threadId) it.copy(unreadCount = unreadCounts[key] ?: 0) else it
+        }
+        updateVisibleThreads()
+    }
+
     override fun refreshThread(threadId: String) {
         val ref = runCatching { ThreadRef.parse(threadId) }.getOrElse { ThreadRef(_selectedHostId.value.orEmpty(), threadId) }
         if (hostInfos[ref.hostId]?.online != true) {
@@ -522,6 +544,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         hostSyncRerun.clear()
         threadRefreshJobs.values.forEach { it.cancel() }
         threadRefreshJobs.clear()
+        unreadCounts.clear()
+        activeThreadKey = null
         _syncing.value = false
         _syncStatus.value = null
         _refreshingThreads.value = emptySet()
@@ -917,7 +941,10 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         if (payload.boolean("replace") == true) {
             deltaJobs.remove(ref.encoded() to itemId)?.cancel()
             deltaBuffers.remove(ref.encoded() to itemId)
-            upsert(ref, TimelineItem.Message(itemId, if (payload.string("role") == "user") Role.User else Role.Assistant, delta, if (payload.boolean("complete") == true) MessageStatus.Done else MessageStatus.Streaming))
+            val role = if (payload.string("role") == "user") Role.User else Role.Assistant
+            val isNew = details[ref.encoded()]?.value?.items?.none { it.id == itemId } ?: true
+            upsert(ref, TimelineItem.Message(itemId, role, delta, if (payload.boolean("complete") == true) MessageStatus.Done else MessageStatus.Streaming))
+            if (isNew && role == Role.Assistant) bumpUnread(ref)
             return
         }
         val key = ref.encoded() to itemId
@@ -933,6 +960,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         if (delta.isEmpty()) return
         val flow = details.getOrPut(ref.encoded()) { MutableStateFlow(emptyDetail(ref)) }
         val existing = flow.value.items.filterIsInstance<TimelineItem.Message>().firstOrNull { it.id == itemId }
+        if (existing == null) bumpUnread(ref)
         upsert(ref, existing?.copy(text = existing.text + delta) ?: TimelineItem.Message(itemId, Role.Assistant, delta, MessageStatus.Streaming))
     }
 
@@ -997,7 +1025,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             status = if (thread.string("source") == "desktop") ThreadStatus.DesktopOwned else statusFromJson(ThreadRef(hostId, id).encoded(), thread.obj("status")),
             updatedAt = formatTime(epoch.takeIf { it > 0 }),
             lastMessage = preview.take(120),
-            unreadCount = 0,
+            unreadCount = unreadCounts[ThreadRef(hostId, id).encoded()] ?: 0,
             hostId = hostId,
             hostName = hostInfos[hostId]?.name ?: "Windows Codex",
             updatedAtEpoch = epoch,

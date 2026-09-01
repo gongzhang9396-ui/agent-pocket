@@ -54,6 +54,13 @@ interface PocketRepository {
     /** Manually re-reads one thread's full history from its host. */
     fun refreshThread(threadId: String)
 
+    /**
+     * Marks the thread the user is currently viewing (null when leaving).
+     * New assistant messages for other threads increment their unread badge;
+     * entering a thread clears it.
+     */
+    fun setActiveThread(threadId: String?)
+
     fun selectHost(hostId: String?)
 
     /** Last used new-task execution target ("bridge" or "desktop"); initial default is "bridge". */
