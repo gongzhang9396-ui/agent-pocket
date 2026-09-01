@@ -4,6 +4,8 @@ Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码�
 
 当前 v2 是邀请制、多用户、多主机架构，适合个人、家庭或小团队自托管。项目仍处于实验阶段：Desktop Attach 依赖 Codex Desktop 的内部本地能力，Desktop 更新后可能需要适配。
 
+完整的部署、绑定、日常使用、恢复、更新和脱敏说明见 [使用说明](docs/USAGE.md)。
+
 ## 直接安装
 
 在 [GitHub Releases](https://github.com/gongzhang9396-ui/agent-pocket/releases/latest) 下载同一版本的两个文件：
