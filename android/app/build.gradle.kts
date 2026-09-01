@@ -115,13 +115,15 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))
     implementation("com.google.firebase:firebase-messaging")
 
-    implementation(platform("androidx.compose:compose-bom:2025.08.01"))
+    implementation(platform("androidx.compose:compose-bom:2025.09.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
-    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.41.0")
+    // Keep this aligned with Kotlin 2.2.20 / Compose 1.9.x. Newer renderer
+    // releases are compiled against Compose 1.10+ and crash at runtime here.
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.37.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")

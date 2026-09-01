@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -224,11 +224,16 @@ fun SessionDetailScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
             state = listState,
         ) {
-            items(
+            itemsIndexed(
                 detail.items,
-                key = { it.id },
-                contentType = {
-                    when (it) {
+                key = { index, item ->
+                    // Desktop history occasionally contains missing or reused IDs.
+                    // Include the position and type so Compose never receives a
+                    // duplicate key and aborts the whole Activity.
+                    "$index:${item::class.simpleName}:${item.id}"
+                },
+                contentType = { _, item ->
+                    when (item) {
                         is TimelineItem.Message -> "message"
                         is TimelineItem.Plan -> "plan"
                         is TimelineItem.Command -> "command"
@@ -236,7 +241,7 @@ fun SessionDetailScreen(
                         is TimelineItem.Approval -> "approval"
                     }
                 },
-            ) { item ->
+            ) { _, item ->
                 TimelineItemContent(
                     item = item,
                     actionsEnabled = !desktopOwned && !readOnly,
@@ -248,7 +253,7 @@ fun SessionDetailScreen(
                     },
                 )
             }
-            item(key = "thread-end-anchor", contentType = "anchor") {
+            item(key = "__agent_pocket_thread_end_anchor__", contentType = "anchor") {
                 Spacer(Modifier.height(1.dp))
             }
         }
