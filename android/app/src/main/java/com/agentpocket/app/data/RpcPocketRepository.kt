@@ -420,7 +420,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     override fun lastTaskTarget(): String = settings.getString("newTaskTarget", "bridge") ?: "bridge"
 
-    override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, onCreated: (String) -> Unit) {
+    override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, onCreated: (String) -> Unit) {
         val resolvedTarget = if (target == "desktop") "desktop" else "bridge"
         val hostId = _selectedHostId.value
         val project = _projects.value.firstOrNull { it.id == projectId }
@@ -442,6 +442,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                         "model" to modelId,
                         "effort" to reasoningId,
                         "target" to resolvedTarget,
+                        "mode" to (if (planMode && resolvedTarget == "bridge") "plan" else null),
                         "workspaceMode" to "local",
                         "clientMessageId" to "mobile-${System.currentTimeMillis()}",
                     ),
@@ -466,6 +467,31 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 fetchThread(ref)
             }.onFailure { _actionError.value = actionError("创建任务", it) }
             _creatingTask.value = false
+        }
+    }
+
+    override fun threadGoal(threadId: String, onResult: (String?) -> Unit) {
+        goalCall(threadId, "goal/get", null, "读取目标", onResult)
+    }
+
+    override fun setThreadGoal(threadId: String, objective: String, onResult: (String?) -> Unit) {
+        goalCall(threadId, "goal/set", objective, "设置目标", onResult)
+    }
+
+    override fun clearThreadGoal(threadId: String, onResult: (String?) -> Unit) {
+        goalCall(threadId, "goal/clear", null, "清除目标", onResult)
+    }
+
+    private fun goalCall(threadId: String, method: String, objective: String?, action: String, onResult: (String?) -> Unit) {
+        val ref = runCatching { ThreadRef.parse(threadId) }.getOrElse { ThreadRef(_selectedHostId.value.orEmpty(), threadId) }
+        scope.launch {
+            runCatching {
+                innerCall(ref.hostId, method, buildJsonObject {
+                    put("threadId", ref.threadId)
+                    objective?.let { put("objective", it) }
+                }).asObject()?.obj("goal")?.string("objective")
+            }.onSuccess(onResult)
+                .onFailure { _actionError.value = actionError(action, it); onResult(null) }
         }
     }
 
@@ -1046,7 +1072,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private fun itemFromJson(item: JsonObject): TimelineItem? = when (item.string("type")) {
         "userMessage" -> TimelineItem.Message(item.string("id").orEmpty(), Role.User, displayUserText(item.array("content").mapNotNull { it.asObject()?.string("text") }.joinToString("\n")), MessageStatus.Done)
         "agentMessage" -> TimelineItem.Message(item.string("id").orEmpty(), Role.Assistant, item.string("text").orEmpty(), MessageStatus.Done)
-        "plan" -> TimelineItem.Message(item.string("id").orEmpty(), Role.System, item.string("text").orEmpty(), MessageStatus.Done)
+        // Plan 文档是完整 markdown，按助手消息渲染而不是居中系统提示。
+        "plan" -> TimelineItem.Message(item.string("id").orEmpty(), Role.Assistant, item.string("text").orEmpty(), MessageStatus.Done)
         "commandExecution" -> {
             val output = item.string("aggregatedOutput").orEmpty()
             TimelineItem.Command(item.string("id").orEmpty(), item.commandText().orEmpty(), item.string("cwd").orEmpty(), when (item.string("status")) { "completed" -> CommandStatus.Succeeded; "failed", "declined" -> CommandStatus.Failed; else -> CommandStatus.Running }, output.takeLast(MAX_COMMAND_OUTPUT_CHARS), output.length > MAX_COMMAND_OUTPUT_CHARS)

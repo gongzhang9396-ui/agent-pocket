@@ -81,6 +81,7 @@ fun NewTaskScreen(
     var modelId by rememberSaveable { mutableStateOf("") }
     var reasoningId by rememberSaveable { mutableStateOf("") }
     var target by rememberSaveable { mutableStateOf(repo.lastTaskTarget()) }
+    var planMode by rememberSaveable { mutableStateOf(false) }
     var prompt by rememberSaveable { mutableStateOf("") }
     var promptFocused by remember { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
@@ -111,7 +112,7 @@ fun NewTaskScreen(
     val submit = {
         if (canCreate) {
             focusManager.clearFocus()
-            repo.createTask(projectId, modelId, reasoning?.id.orEmpty(), prompt, target, onCreated)
+            repo.createTask(projectId, modelId, reasoning?.id.orEmpty(), prompt, target, planMode && target == "bridge", onCreated)
         }
     }
 
@@ -254,6 +255,24 @@ fun NewTaskScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (target == "bridge") {
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = planMode,
+                        onClick = { planMode = !planMode },
+                        label = { Text("Plan 模式 · 先规划") },
+                    )
+                }
+                if (planMode) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "首轮以 Codex 原生 Plan 模式运行：只输出结构化计划，不修改任何文件。确认计划后在会话里回复即可开始执行。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
 
             Spacer(Modifier.height(16.dp))
             SectionLabel("项目")

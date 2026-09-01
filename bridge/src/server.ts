@@ -79,6 +79,13 @@ function desktopOperationError(action: string, error: unknown) {
   return new RpcError("INTERNAL", `${action}失败；请在 Codex Desktop 确认任务状态后重试`);
 }
 
+function planCollaborationMode(model: string, effort?: string) {
+  // Verified against codex-cli 0.151.0-alpha.7.2: turn/start expects the full
+  // CollaborationMode struct; settings.model must be a concrete model id and
+  // developer_instructions: null selects the built-in Plan instructions.
+  return { mode: "plan", settings: { model, reasoning_effort: effort || null, developer_instructions: null } };
+}
+
 function questionAnswers(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(value).length > 64 * 1024) {
     throw new RpcError(ErrorName.INVALID_REQUEST, "answers 格式或长度无效");
@@ -287,6 +294,9 @@ export class BridgeServer {
       case "turn/interrupt": return this.interruptTurn(params);
       case "approval/respond": return this.respondApproval(params);
       case "question/respond": return this.respondQuestion(params);
+      case "goal/get": return this.goalCall(params, "get");
+      case "goal/set": return this.goalCall(params, "set");
+      case "goal/clear": return this.goalCall(params, "clear");
       default: throw new RpcError(ErrorName.NOT_FOUND, `未知方法：${method}`);
     }
   }
@@ -366,6 +376,9 @@ export class BridgeServer {
     }
 
     this.codex.assertWritable();
+    const mode = stringParam(params.mode, "mode", 32, false)?.trim() || undefined;
+    if (mode && mode !== "plan") throw new RpcError(ErrorName.INVALID_REQUEST, "mode 仅支持 plan");
+    if (mode === "plan" && !model) throw new RpcError(ErrorName.INVALID_REQUEST, "Plan 模式需要指定模型");
     const started = await this.codex.request("thread/start", {
       cwd, model, approvalPolicy: "on-request",
     });
@@ -373,6 +386,7 @@ export class BridgeServer {
     this.store.setThreadOwner(threadId, "bridge");
     const turn = await this.codex.request("turn/start", {
       threadId, input: [{ type: "text", text }], model, effort,
+      ...(mode === "plan" ? { collaborationMode: planCollaborationMode(model!, effort) } : {}),
     });
     this.codex.markTurn(threadId, turn.turn.id);
     this.writeRuntimeStatus();
@@ -685,6 +699,19 @@ export class BridgeServer {
     return { ok: true, duplicate: resolved.duplicate };
   }
 
+  /** Persisted thread goal (objective + budget/usage), bridge-owned threads only. */
+  async goalCall(params: any, action: "get" | "set" | "clear") {
+    const threadId = stringParam(params.threadId, "threadId", 100)!;
+    if (this.store.threadOwner(threadId) !== "bridge") {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "目标仅支持 Bridge 任务；Desktop 任务请在电脑上管理");
+    }
+    if (action === "get") return this.codex.request("thread/goal/get", { threadId });
+    this.codex.assertWritable();
+    if (action === "clear") return this.codex.request("thread/goal/clear", { threadId });
+    const objective = stringParam(params.objective, "objective", 4000)!;
+    return this.codex.request("thread/goal/set", { threadId, objective });
+  }
+
   async onCodexRequest(message: any) {
     const method = String(message.method);
     const isQuestion = method === "item/tool/requestUserInput";
@@ -713,8 +740,11 @@ export class BridgeServer {
         }
         break;
       case "turn/plan/updated":
-      case "item/plan/delta":
         this.publish(newEvent("plan.updated", { ...p })); break;
+      case "item/plan/delta":
+        // Plan 文档是流式 markdown 文本，不是结构化步骤；按助手消息增量下发，
+        // 与 thread/read 里同 itemId 的 plan item 自然对齐。
+        this.publish(newEvent("message.delta", { ...p, role: "assistant" })); break;
       case "item/commandExecution/outputDelta": {
         const key = `${p.threadId || ""}:${p.turnId || ""}:${p.itemId || ""}`;
         const used = this.commandOutputBytes.get(key) || 0;

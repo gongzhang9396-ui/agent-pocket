@@ -19,9 +19,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Difference
+import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -35,6 +37,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -81,6 +84,10 @@ fun SessionDetailScreen(
     val actionError by repo.actionError.collectAsState()
     val refreshingThreads by repo.refreshingThreads.collectAsState()
     val refreshing = threadId in refreshingThreads
+    var goalDialogOpen by remember { mutableStateOf(false) }
+    var goalCurrent by remember { mutableStateOf<String?>(null) }
+    var goalDraft by remember { mutableStateOf("") }
+    var goalLoading by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
     var initialScrollDone by rememberSaveable(threadId) { mutableStateOf(false) }
@@ -157,6 +164,19 @@ fun SessionDetailScreen(
                         }
                     },
                     actions = {
+                        if (!desktopOwned) {
+                            IconButton(onClick = {
+                                goalDialogOpen = true
+                                goalLoading = true
+                                repo.threadGoal(threadId) {
+                                    goalCurrent = it
+                                    goalDraft = it.orEmpty()
+                                    goalLoading = false
+                                }
+                            }) {
+                                Icon(Icons.Filled.Flag, contentDescription = "任务目标")
+                            }
+                        }
                         IconButton(onClick = { repo.refreshThread(threadId) }, enabled = !refreshing) {
                             Icon(Icons.Filled.Refresh, contentDescription = "重新同步会话")
                         }
@@ -232,6 +252,54 @@ fun SessionDetailScreen(
                 Spacer(Modifier.height(1.dp))
             }
         }
+    }
+
+    if (goalDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { goalDialogOpen = false },
+            title = { Text("任务目标") },
+            text = {
+                Column {
+                    Text(
+                        when {
+                            goalLoading -> "正在读取…"
+                            goalCurrent == null -> "尚未设置目标。目标会持久保存在该任务上，Codex 会围绕它持续推进。"
+                            else -> "当前目标（修改后保存即替换）："
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = goalDraft,
+                        onValueChange = { goalDraft = it },
+                        placeholder = { Text("例如：把 p95 延迟降到 120ms 以下", style = MaterialTheme.typography.bodySmall) },
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        repo.setThreadGoal(threadId, goalDraft.trim()) { goalCurrent = it }
+                        goalDialogOpen = false
+                    },
+                    enabled = goalDraft.isNotBlank() && !goalLoading,
+                ) { Text("保存") }
+            },
+            dismissButton = {
+                Row {
+                    if (goalCurrent != null) {
+                        TextButton(onClick = {
+                            repo.clearThreadGoal(threadId) { goalCurrent = it }
+                            goalDialogOpen = false
+                        }) { Text("清除") }
+                    }
+                    TextButton(onClick = { goalDialogOpen = false }) { Text("关闭") }
+                }
+            },
+        )
     }
 }
 

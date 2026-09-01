@@ -560,6 +560,9 @@ object MockPocketRepository : PocketRepository {
     override fun refreshAll() = Unit
     override fun refreshThread(threadId: String) = Unit
     override fun setActiveThread(threadId: String?) = Unit
+    override fun threadGoal(threadId: String, onResult: (String?) -> Unit) = onResult(null)
+    override fun setThreadGoal(threadId: String, objective: String, onResult: (String?) -> Unit) = onResult(objective)
+    override fun clearThreadGoal(threadId: String, onResult: (String?) -> Unit) = onResult(null)
     override fun selectHost(hostId: String?) = Unit
     override fun lastTaskTarget(): String = "bridge"
 
@@ -569,6 +572,7 @@ object MockPocketRepository : PocketRepository {
         reasoningId: String,
         prompt: String,
         target: String,
+        planMode: Boolean,
         onCreated: (String) -> Unit,
     ) {
         createdCount += 1

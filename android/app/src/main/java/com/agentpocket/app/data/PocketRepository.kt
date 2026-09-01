@@ -71,9 +71,20 @@ interface PocketRepository {
      * "desktop" creates a real Codex Desktop task (requires the official
      * Responses WebSocket v2 channel); "bridge" runs it on the host's own
      * codex app-server, which works on any HTTP model channel and enables
-     * approvals/questions/interrupt from the phone.
+     * approvals/questions/interrupt from the phone. [planMode] runs the
+     * first turn in Codex's native Plan collaboration mode (bridge only):
+     * the model produces a plan document without touching files.
      */
-    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, onCreated: (String) -> Unit)
+    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, onCreated: (String) -> Unit)
+
+    /** Reads the thread's persisted goal objective (bridge tasks only); null when unset. */
+    fun threadGoal(threadId: String, onResult: (String?) -> Unit)
+
+    /** Sets/replaces the thread goal objective; [onResult] gets the stored objective. */
+    fun setThreadGoal(threadId: String, objective: String, onResult: (String?) -> Unit)
+
+    /** Clears the thread goal; [onResult] always gets null on success. */
+    fun clearThreadGoal(threadId: String, onResult: (String?) -> Unit)
 
     /** Appends a user steer message to a running turn. */
     fun sendSteer(threadId: String, text: String)
