@@ -42,7 +42,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.agentpocket.app.data.model.ApprovalDecision
@@ -54,6 +59,8 @@ import com.agentpocket.app.data.model.StepStatus
 import com.agentpocket.app.data.model.TimelineItem
 import com.agentpocket.app.ui.theme.StatusColors
 import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.markdownTypography
+import com.mikepenz.markdown.model.MarkdownTypography
 
 /**
  * Renders one timeline item. Items are consumed from a keyed LazyColumn, so a
@@ -152,6 +159,7 @@ private fun MessageRow(message: TimelineItem.Message) {
                 if (message.text.isNotBlank()) {
                     Markdown(
                         content = message.text,
+                        typography = compactMarkdownTypography(),
                         modifier = Modifier.weight(1f, fill = false),
                     )
                 }
@@ -161,6 +169,36 @@ private fun MessageRow(message: TimelineItem.Message) {
             }
         }
     }
+}
+
+/** Compact Markdown scale for assistant replies inside a chat timeline. */
+@Composable
+private fun compactMarkdownTypography(): MarkdownTypography {
+    val typography = MaterialTheme.typography
+    return markdownTypography(
+        h1 = typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
+        h2 = typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+        h3 = typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+        h4 = typography.titleSmall,
+        h5 = typography.labelLarge,
+        h6 = typography.labelMedium,
+        text = typography.bodyMedium,
+        paragraph = typography.bodyMedium,
+        ordered = typography.bodyMedium,
+        bullet = typography.bodyMedium,
+        list = typography.bodyMedium,
+        code = typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+        inlineCode = typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+        quote = typography.bodyMedium.copy(fontStyle = FontStyle.Italic),
+        textLink = TextLinkStyles(
+            style = SpanStyle(
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Medium,
+                textDecoration = TextDecoration.Underline,
+            ),
+        ),
+        table = typography.bodySmall,
+    )
 }
 
 @Composable
