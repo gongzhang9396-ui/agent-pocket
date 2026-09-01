@@ -26,6 +26,8 @@ type DesktopWatcher = {
   stopped: boolean;
   lastPublishedKey?: string;
   task?: Promise<void>;
+  /** One-shot bootstrap recovery: re-queue this prompt if the first turn dies. */
+  recoveryText?: string;
 };
 
 const MAINTENANCE_BLOCKED_METHODS = new Set([
@@ -342,7 +344,11 @@ export class BridgeServer {
         const owner = this.store.claimThreadOwner(threadId, "desktop");
         if (owner !== "desktop") throw new Error("新任务 ID 已被其他 writer 占用");
         this.publishDesktopMessage(threadId, clientMessageId, "user", text, { complete: true });
-        this.startDesktopWatcher(threadId);
+        // The attach plugin only re-queues bootstrap failures it can observe
+        // within its short verify window; later deaths are recovered by the
+        // watcher. Skip watcher recovery when the plugin already re-queued.
+        const pluginRequeued = typeof (created as any)?.warning === "string" && (created as any).warning.includes("re-queued");
+        this.startDesktopWatcher(threadId, undefined, pluginRequeued ? undefined : text);
         return {
           ...created,
           source: "desktop",
@@ -558,13 +564,14 @@ export class BridgeServer {
     }
   }
 
-  startDesktopWatcher(threadId: string, cursor?: string) {
+  startDesktopWatcher(threadId: string, cursor?: string, recoveryText?: string) {
     const existing = this.desktopWatchers.get(threadId);
     if (existing) {
       existing.generation += 1;
+      if (recoveryText && !existing.recoveryText) existing.recoveryText = recoveryText;
       return;
     }
-    const watcher: DesktopWatcher = { cursor, generation: 1, stopped: false };
+    const watcher: DesktopWatcher = { cursor, generation: 1, stopped: false, recoveryText };
     this.desktopWatchers.set(threadId, watcher);
     this.writeRuntimeStatus();
     watcher.task = this.runDesktopWatcher(threadId, watcher).finally(() => {
@@ -607,6 +614,23 @@ export class BridgeServer {
               turnStatus: result.turnStatus,
               wakeReason: result.wakeReason,
             }));
+          }
+          const bootstrapDied = result.turnStatus === "failed" || result.threadStatus === "systemError";
+          if (bootstrapDied && watcher.recoveryText) {
+            // The first turn died after creation (typical on third-party HTTP
+            // model channels, where Desktop's stateful bootstrap needs the
+            // official Responses WebSocket v2). Re-deliver the prompt once via
+            // the stateless queue path and keep watching for the recovery turn.
+            const recoveryText = watcher.recoveryText;
+            watcher.recoveryText = undefined;
+            try {
+              await this.desktop.sendMessage(threadId, recoveryText);
+              watcher.generation += 1;
+              this.publish(newEvent("sync.required", { threadId, reason: "bootstrap-requeue" }));
+              continue;
+            } catch (error) {
+              console.error("Desktop bootstrap requeue:", error instanceof Error ? error.message : error);
+            }
           }
           if (generationAtWait === watcher.generation && terminal) return;
         } else {
