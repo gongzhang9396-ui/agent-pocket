@@ -430,11 +430,13 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 val ref = ThreadRef(hostId, rawId)
                 val summary = summaryFromJson(hostId, thread).let { base ->
                     // Bridge threads carry no preview yet; fall back to the prompt.
-                    if (base.title != "未命名任务") base
+                    val titled = if (base.title != "未命名任务") base
                     else base.copy(
                         title = prompt.lineSequence().firstOrNull()?.take(40).orEmpty().ifBlank { base.title },
                         lastMessage = prompt.take(120),
                     )
+                    if (titled.updatedAtEpoch > 0) titled
+                    else titled.copy(updatedAtEpoch = System.currentTimeMillis() / 1000, updatedAt = formatTime(System.currentTimeMillis() / 1000))
                 }
                 threadLists[hostId] = listOf(summary) + threadLists[hostId].orEmpty().filterNot { it.id == rawId }
                 updateVisibleThreads()
@@ -987,16 +989,18 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private fun summaryFromJson(hostId: String, thread: JsonObject): ThreadSummary {
         val id = thread.string("id").orEmpty()
         val preview = thread.string("preview").orEmpty()
+        val epoch = thread.long("updatedAt") ?: 0
         return ThreadSummary(
             id = id,
             title = thread.string("name") ?: preview.lineSequence().firstOrNull()?.take(40).orEmpty().ifBlank { "未命名任务" },
             cwd = thread.string("cwd").orEmpty(),
             status = if (thread.string("source") == "desktop") ThreadStatus.DesktopOwned else statusFromJson(ThreadRef(hostId, id).encoded(), thread.obj("status")),
-            updatedAt = formatTime(thread.long("updatedAt")),
+            updatedAt = formatTime(epoch.takeIf { it > 0 }),
             lastMessage = preview.take(120),
             unreadCount = 0,
             hostId = hostId,
             hostName = hostInfos[hostId]?.name ?: "Windows Codex",
+            updatedAtEpoch = epoch,
         )
     }
 
@@ -1220,7 +1224,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private fun updateVisibleThreads() {
         val selected = _selectedHostId.value
         _threads.value = (if (selected == null) threadLists.values.flatten() else threadLists[selected].orEmpty())
-            .sortedByDescending { it.updatedAt }
+            .sortedByDescending { it.updatedAtEpoch }
     }
 
     private fun selectedOrAggregateHost() = _selectedHostId.value?.let { selected -> _hosts.value.firstOrNull { it.id == selected } }

@@ -70,6 +70,8 @@ data class ThreadSummary(
     val unreadCount: Int,
     val hostId: String = "",
     val hostName: String = "",
+    /** Raw epoch seconds used for ordering; [updatedAt] is display-only. */
+    val updatedAtEpoch: Long = 0,
 )
 
 enum class Role { User, Assistant, System }

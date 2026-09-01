@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Badge
@@ -37,6 +38,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -45,10 +47,12 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
+import com.agentpocket.app.data.ThreadSection
 import com.agentpocket.app.data.model.ConnectionState
 import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadSummary
+import com.agentpocket.app.data.threadSections
 import com.agentpocket.app.ui.components.ConnectionPill
 import com.agentpocket.app.ui.components.ThreadStatusChip
 import com.agentpocket.app.ui.theme.AgentPocketTheme
@@ -67,8 +71,12 @@ fun InboxScreen(
     val hosts by repo.hosts.collectAsState()
     val selectedHostId by repo.selectedHostId.collectAsState()
     val threads by repo.threads.collectAsState()
+    val projects by repo.projects.collectAsState()
     val syncing by repo.syncing.collectAsState()
     val syncStatus by repo.syncStatus.collectAsState()
+    val sections = remember(threads, selectedHostId, projects) {
+        threadSections(threads, showHost = selectedHostId == null, projects = projects)
+    }
     val desktopCount = threads.count { it.status == ThreadStatus.DesktopOwned }
     val externalCount = threads.count { it.status == ThreadStatus.ExternalBusy }
 
@@ -178,16 +186,71 @@ fun InboxScreen(
                             )
                         }
                     }
-                    items(threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
-                        ThreadCard(
-                            thread = thread,
-                            showHost = selectedHostId == null,
-                            onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
-                        )
+                    // 按 Codex Desktop 的体系分组：一个项目一节，节内与节间都按最新活动排序。
+                    sections.forEach { section ->
+                        item(key = "section:${section.key}", contentType = "section") {
+                            ProjectHeader(section)
+                        }
+                        items(section.threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
+                            ThreadCard(
+                                thread = thread,
+                                showHost = false,
+                                onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ProjectHeader(section: ThreadSection) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Filled.Folder,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.width(16.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    section.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                section.hostName?.let {
+                    Spacer(Modifier.width(6.dp))
+                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                }
+            }
+            if (section.cwd.isNotBlank()) {
+                Text(
+                    section.cwd,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "${section.threads.size} 个任务",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
