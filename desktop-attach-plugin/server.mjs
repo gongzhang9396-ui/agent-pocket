@@ -326,20 +326,26 @@ async function createDesktopThread(cwd, text, model, effort, workspaceMode, cont
   }
   if (!threadId) throw new Error("Codex Desktop create_thread returned no threadId");
 
+  // Advisory only: Desktop (and some model relays) retry transient bootstrap
+  // failures on their own, so one early systemError/failed sample must not
+  // discard a thread that already exists — the phone would report a false
+  // failure while the task actually runs, and a user retry would duplicate
+  // it. The bridge watcher and thread/read surface the real terminal state.
   const verification = await waitDesktopThread(
     threadId,
     undefined,
     NEW_THREAD_VERIFY_TIMEOUT_MS,
     subcallContext(context, "create-verify"),
   );
-  if (verification.threadStatus === "systemError" || verification.turnStatus === "failed") {
-    const detail = verification.turnError ? `: ${verification.turnError}` : "";
-    throw new Error(`Codex Desktop created the task but failed to initialize it${detail}`);
-  }
+  const verifySuspect = verification.threadStatus === "systemError" || verification.turnStatus === "failed";
+  const warning = verifySuspect
+    ? `Desktop reported ${verification.threadStatus === "systemError" ? "systemError" : "a failed first turn"} right after creation${verification.turnError ? `: ${verification.turnError}` : ""}; it may recover automatically — check the task status before retrying`
+    : undefined;
 
   return {
     source: "desktop",
     hostId: firstString(created?.hostId),
+    ...(warning ? { warning } : {}),
     thread: {
       id: threadId,
       name: text.trim().split(/\r?\n/, 1)[0]?.slice(0, 80) || "新任务",
