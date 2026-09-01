@@ -20,12 +20,14 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Difference
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -76,6 +78,8 @@ fun SessionDetailScreen(
     val detailState = remember(repo, threadId) { repo.threadDetail(threadId) }
     val detail by detailState.collectAsState()
     val actionError by repo.actionError.collectAsState()
+    val refreshingThreads by repo.refreshingThreads.collectAsState()
+    val refreshing = threadId in refreshingThreads
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
     var initialScrollDone by rememberSaveable(threadId) { mutableStateOf(false) }
@@ -117,41 +121,47 @@ fun SessionDetailScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    detail.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                ThreadStatusChip(detail.status)
+                            }
                             Text(
-                                detail.title,
-                                style = MaterialTheme.typography.titleSmall,
+                                detail.cwd,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false),
                             )
-                            Spacer(Modifier.width(8.dp))
-                            ThreadStatusChip(detail.status)
                         }
-                        Text(
-                            detail.cwd,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { onOpenDiff(threadId) }) {
-                        Icon(Icons.Filled.Difference, contentDescription = "查看变更")
-                    }
-                },
-            )
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { repo.refreshThread(threadId) }, enabled = !refreshing) {
+                            Icon(Icons.Filled.Refresh, contentDescription = "重新同步会话")
+                        }
+                        IconButton(onClick = { onOpenDiff(threadId) }) {
+                            Icon(Icons.Filled.Difference, contentDescription = "查看变更")
+                        }
+                    },
+                )
+                if (refreshing) LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
         },
         bottomBar = {
             Composer(

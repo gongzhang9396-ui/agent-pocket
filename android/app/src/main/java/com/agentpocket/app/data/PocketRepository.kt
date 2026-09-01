@@ -33,11 +33,27 @@ interface PocketRepository {
     val actionError: StateFlow<String?>
     val creatingTask: StateFlow<Boolean>
 
+    /** True while a full relay/host sync (startup or manual refresh) is running. */
+    val syncing: StateFlow<Boolean>
+
+    /** Human-readable progress line for the running sync, null when idle. */
+    val syncStatus: StateFlow<String?>
+
+    /** Encoded thread refs whose full history is being fetched right now. */
+    val refreshingThreads: StateFlow<Set<String>>
+
     fun threadDetail(threadId: String): StateFlow<ThreadDetail>
     fun threadDiff(threadId: String): StateFlow<List<DiffFile>>
     fun openNotification(hostId: String, eventId: String, onResolved: (String?) -> Unit)
 
     fun refreshProjects()
+
+    /** Manually re-runs the full sync pipeline (hosts, devices, snapshots, events, thread lists). */
+    fun refreshAll()
+
+    /** Manually re-reads one thread's full history from its host. */
+    fun refreshThread(threadId: String)
+
     fun selectHost(hostId: String?)
     fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, onCreated: (String) -> Unit)
 

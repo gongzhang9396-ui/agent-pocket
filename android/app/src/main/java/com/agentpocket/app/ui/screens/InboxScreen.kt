@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Card
@@ -27,10 +28,12 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -64,6 +67,8 @@ fun InboxScreen(
     val hosts by repo.hosts.collectAsState()
     val selectedHostId by repo.selectedHostId.collectAsState()
     val threads by repo.threads.collectAsState()
+    val syncing by repo.syncing.collectAsState()
+    val syncStatus by repo.syncStatus.collectAsState()
     val desktopCount = threads.count { it.status == ThreadStatus.DesktopOwned }
     val externalCount = threads.count { it.status == ThreadStatus.ExternalBusy }
 
@@ -77,6 +82,9 @@ fun InboxScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { repo.refreshAll() }, enabled = !syncing) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "设置")
                     }
@@ -91,70 +99,93 @@ fun InboxScreen(
             )
         },
     ) { padding ->
-        LazyColumn(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                start = 16.dp,
-                end = 16.dp,
-                top = 8.dp,
-                bottom = 96.dp,
-            ),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            item(key = "host-filter", contentType = "filter") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    FilterChip(
-                        selected = selectedHostId == null,
-                        onClick = { repo.selectHost(null) },
-                        label = { Text("全部电脑") },
+            if (syncing) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+                syncStatus?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                     )
-                    hosts.forEach { item ->
-                        FilterChip(
-                            selected = selectedHostId == item.id,
-                            onClick = { repo.selectHost(item.id) },
-                            label = {
-                                Text(
-                                    if (item.connectionState == ConnectionState.Connected) item.name else "${item.name} · 离线",
-                                    maxLines = 1,
+                }
+            }
+            PullToRefreshBox(
+                isRefreshing = syncing,
+                onRefresh = { repo.refreshAll() },
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+            ) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        start = 16.dp,
+                        end = 16.dp,
+                        top = 8.dp,
+                        bottom = 96.dp,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    item(key = "host-filter", contentType = "filter") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            FilterChip(
+                                selected = selectedHostId == null,
+                                onClick = { repo.selectHost(null) },
+                                label = { Text("全部电脑") },
+                            )
+                            hosts.forEach { item ->
+                                FilterChip(
+                                    selected = selectedHostId == item.id,
+                                    onClick = { repo.selectHost(item.id) },
+                                    label = {
+                                        Text(
+                                            if (item.connectionState == ConnectionState.Connected) item.name else "${item.name} · 离线",
+                                            maxLines = 1,
+                                        )
+                                    },
                                 )
-                            },
+                            }
+                        }
+                    }
+                    if (desktopCount > 0) {
+                        item(key = "desktop-attached", contentType = "banner") {
+                            DesktopAttachedBanner(desktopCount)
+                        }
+                    }
+                    if (externalCount > 0) {
+                        item(key = "external-warning", contentType = "banner") {
+                            ExternalBusyBanner(externalCount)
+                        }
+                    }
+                    if (threads.isEmpty()) {
+                        item(key = "empty", contentType = "empty") {
+                            Text(
+                                if (hosts.isEmpty()) "还没有绑定 Windows 电脑" else "这台电脑暂时没有可显示的任务",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 32.dp),
+                            )
+                        }
+                    }
+                    items(threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
+                        ThreadCard(
+                            thread = thread,
+                            showHost = selectedHostId == null,
+                            onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
                         )
                     }
                 }
-            }
-            if (desktopCount > 0) {
-                item(key = "desktop-attached", contentType = "banner") {
-                    DesktopAttachedBanner(desktopCount)
-                }
-            }
-            if (externalCount > 0) {
-                item(key = "external-warning", contentType = "banner") {
-                    ExternalBusyBanner(externalCount)
-                }
-            }
-            if (threads.isEmpty()) {
-                item(key = "empty", contentType = "empty") {
-                    Text(
-                        if (hosts.isEmpty()) "还没有绑定 Windows 电脑" else "这台电脑暂时没有可显示的任务",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 32.dp),
-                    )
-                }
-            }
-            items(threads, key = { ThreadRef(it.hostId, it.id).encoded() }, contentType = { "thread" }) { thread ->
-                ThreadCard(
-                    thread = thread,
-                    showHost = selectedHostId == null,
-                    onClick = { onOpenThread(ThreadRef(thread.hostId, thread.id).encoded()) },
-                )
             }
         }
     }

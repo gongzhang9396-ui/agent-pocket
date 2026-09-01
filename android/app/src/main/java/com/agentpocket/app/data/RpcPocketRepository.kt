@@ -36,11 +36,13 @@ import java.time.format.DateTimeFormatter
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -48,6 +50,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.decodeFromString
@@ -104,9 +108,15 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val deltaBuffers = mutableMapOf<Pair<String, String>, StringBuilder>()
     private val deltaJobs = mutableMapOf<Pair<String, String>, Job>()
     private val notificationRefs = mutableMapOf<String, String>()
+    private val hostEventMutexes = mutableMapOf<String, Mutex>()
+    private val hostSyncJobs = mutableMapOf<String, Job>()
+    private val hostSyncRerun = mutableSetOf<String>()
+    private val threadRefreshJobs = mutableMapOf<String, Job>()
     private var rpc: BridgeRpcClient? = null
     private var connectionJob: Job? = null
     private var pendingApprovalJob: Job? = null
+    private var fullSyncJob: Job? = null
+    private var fullSyncRerun = false
     private var fcmToken: String? = null
     private var pausedForLimit = false
 
@@ -138,6 +148,12 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     override val actionError: StateFlow<String?> = _actionError.asStateFlow()
     private val _creatingTask = MutableStateFlow(false)
     override val creatingTask: StateFlow<Boolean> = _creatingTask.asStateFlow()
+    private val _syncing = MutableStateFlow(false)
+    override val syncing: StateFlow<Boolean> = _syncing.asStateFlow()
+    private val _syncStatus = MutableStateFlow<String?>(null)
+    override val syncStatus: StateFlow<String?> = _syncStatus.asStateFlow()
+    private val _refreshingThreads = MutableStateFlow<Set<String>>(emptySet())
+    override val refreshingThreads: StateFlow<Set<String>> = _refreshingThreads.asStateFlow()
 
     init {
         context.getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(
@@ -317,7 +333,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     override fun selectHost(hostId: String?) {
         _selectedHostId.value = hostId?.takeIf { candidate -> _hosts.value.any { it.id == candidate } }
         updateVisibleState()
-        _selectedHostId.value?.let { selected -> scope.launch { syncHost(selected) } }
+        _selectedHostId.value?.let { selected -> scheduleHostSync(selected) }
     }
 
     override fun threadDetail(threadId: String): StateFlow<ThreadDetail> {
@@ -360,6 +376,24 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             runCatching { syncHostMetadata(hostId) }
                 .onFailure { _projectsError.value = actionError("读取项目和模型", it) }
         }
+    }
+
+    override fun refreshAll() {
+        if (secure.load()?.approved != true) return
+        if (rpc == null) {
+            reconnect()
+            return
+        }
+        startFullSync()
+    }
+
+    override fun refreshThread(threadId: String) {
+        val ref = runCatching { ThreadRef.parse(threadId) }.getOrElse { ThreadRef(_selectedHostId.value.orEmpty(), threadId) }
+        if (hostInfos[ref.hostId]?.online != true) {
+            _actionError.value = "刷新失败：${hostInfos[ref.hostId]?.name ?: "目标电脑"}当前离线"
+            return
+        }
+        scope.launch { fetchThread(ref) }
     }
 
     override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, onCreated: (String) -> Unit) {
@@ -468,6 +502,16 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         connectionGeneration.incrementAndGet()
         connectionJob?.cancel()
         pendingApprovalJob?.cancel()
+        fullSyncJob?.cancel()
+        fullSyncRerun = false
+        hostSyncJobs.values.forEach { it.cancel() }
+        hostSyncJobs.clear()
+        hostSyncRerun.clear()
+        threadRefreshJobs.values.forEach { it.cancel() }
+        threadRefreshJobs.clear()
+        _syncing.value = false
+        _syncStatus.value = null
+        _refreshingThreads.value = emptySet()
         rpc?.close()
         channels.clear()
         innerPending.values.forEach { it.cancel() }
@@ -519,11 +563,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 client.connect()
                 withTimeout(15_000) { client.awaitOpen() }
                 client.call("relay/hello", obj("protocolVersion" to 2, "deviceId" to credentials.deviceId))
-                syncHosts()
-                reloadDevices()
-                registerPushIfReady()
-                for (hostId in hostInfos.keys.toList()) syncHost(hostId)
                 backoff = 1_000L
+                startFullSync()
                 client.awaitClosed()
             } catch (error: Throwable) {
                 if (!currentCoroutineContext().isActive) return
@@ -531,6 +572,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             } finally {
                 rpc?.close()
                 rpc = null
+                channels.values.forEach { it.ready.completeExceptionally(BridgeRpcException("Relay 连接中断")) }
                 channels.clear()
                 innerPending.values.forEach { it.completeExceptionally(BridgeRpcException("Relay 连接中断")) }
                 innerPending.clear()
@@ -558,19 +600,74 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         updateHosts()
     }
 
+    /** Single-flight full sync; triggers while one is running coalesce into one rerun. */
+    private fun startFullSync() {
+        if (fullSyncJob?.isActive == true) {
+            fullSyncRerun = true
+            return
+        }
+        fullSyncJob = scope.launch {
+            do {
+                fullSyncRerun = false
+                try {
+                    performFullSync()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    if (rpc != null) _actionError.value = actionError("刷新", error)
+                }
+            } while (fullSyncRerun)
+        }
+    }
+
+    private suspend fun performFullSync() {
+        _syncing.value = true
+        try {
+            _syncStatus.value = "正在获取电脑与设备列表…"
+            syncHosts()
+            reloadDevices()
+            registerPushIfReady()
+            val ids = hostInfos.keys.toList()
+            ids.forEachIndexed { index, hostId ->
+                _syncStatus.value = "正在同步 ${hostInfos[hostId]?.name ?: "Windows Codex"}（${index + 1}/${ids.size}）…"
+                syncHost(hostId)
+            }
+        } finally {
+            _syncing.value = false
+            _syncStatus.value = null
+        }
+    }
+
+    /** Single-flight per-host resync; triggers while one is running coalesce into one rerun. */
+    private fun scheduleHostSync(hostId: String) {
+        if (hostSyncJobs[hostId]?.isActive == true) {
+            hostSyncRerun.add(hostId)
+            return
+        }
+        hostSyncJobs[hostId] = scope.launch {
+            do {
+                syncHost(hostId)
+            } while (hostSyncRerun.remove(hostId))
+        }
+    }
+
     private suspend fun syncHost(hostId: String) {
         val credentials = secure.load()?.takeIf { it.approved } ?: return
+        var failure: Throwable? = null
         runCatching {
             val snapshot = outerCall("snapshot/get", obj("hostId" to hostId)).asObject()
             val envelope = snapshot?.obj("envelope")?.let(::envelopeFromJson)
             if (envelope != null) applySnapshot(hostId, RelayCrypto.decryptAccountEnvelope(envelope, credentials.contentKey!!))
-            replayEvents(hostId, credentials)
-            if (hostInfos[hostId]?.online == true) {
+        }.onFailure { failure = it }
+        runCatching { replayEvents(hostId, credentials) }.onFailure { failure = it }
+        if (hostInfos[hostId]?.online == true) {
+            runCatching {
                 ensureChannel(hostId)
                 syncHostMetadata(hostId)
                 syncThreads(hostId)
-            }
-        }.onFailure { if (hostInfos[hostId]?.online == true) _actionError.value = "同步 ${hostInfos[hostId]?.name} 失败：${it.message}" }
+            }.onFailure { failure = it }
+            failure?.let { _actionError.value = "同步 ${hostInfos[hostId]?.name} 失败：${it.message}" }
+        }
     }
 
     private suspend fun syncHostMetadata(hostId: String) {
@@ -599,30 +696,47 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private suspend fun fetchThread(ref: ThreadRef) {
         if (hostInfos[ref.hostId]?.online != true) return
-        runCatching {
-            var cursor: String? = null
-            var base: JsonObject? = null
-            var order: String? = null
-            val turns = mutableListOf<JsonElement>()
-            val seen = mutableSetOf<String>()
-            do {
-                val result = innerCall(ref.hostId, "thread/read", buildJsonObject { put("threadId", ref.threadId); cursor?.let { put("cursor", it) } }).requireObject("读取任务")
-                val thread = result.obj("thread") ?: error("任务详情缺少 thread")
-                if (base == null) base = thread
-                turns.addAll(thread.array("turns"))
-                val page = result.obj("page")
-                if (order == null) order = page?.string("order")
-                cursor = page?.takeIf { it.boolean("hasMore") == true }?.string("nextCursor")
-                if (cursor != null && !seen.add(cursor!!)) error("任务历史分页游标重复")
-            } while (cursor != null)
-            val merged = JsonObject(base!!.toMutableMap().apply { put("turns", JsonArray(if (order == "newest_first") turns.asReversed() else turns)) })
-            detailFromJson(ref, merged)
-        }.onSuccess { details.getOrPut(ref.encoded()) { MutableStateFlow(emptyDetail(ref)) }.value = it }
-            .onFailure { _actionError.value = actionError("读取任务", it) }
+        val key = ref.encoded()
+        _refreshingThreads.value = _refreshingThreads.value + key
+        try {
+            runCatching {
+                var cursor: String? = null
+                var base: JsonObject? = null
+                var order: String? = null
+                val turns = mutableListOf<JsonElement>()
+                val seen = mutableSetOf<String>()
+                do {
+                    val result = innerCall(ref.hostId, "thread/read", buildJsonObject { put("threadId", ref.threadId); cursor?.let { put("cursor", it) } }).requireObject("读取任务")
+                    val thread = result.obj("thread") ?: error("任务详情缺少 thread")
+                    if (base == null) base = thread
+                    turns.addAll(thread.array("turns"))
+                    val page = result.obj("page")
+                    if (order == null) order = page?.string("order")
+                    cursor = page?.takeIf { it.boolean("hasMore") == true }?.string("nextCursor")
+                    if (cursor != null && !seen.add(cursor!!)) error("任务历史分页游标重复")
+                } while (cursor != null)
+                val merged = JsonObject(base!!.toMutableMap().apply { put("turns", JsonArray(if (order == "newest_first") turns.asReversed() else turns)) })
+                detailFromJson(ref, merged)
+            }.onSuccess { fetched ->
+                val flow = details.getOrPut(key) { MutableStateFlow(emptyDetail(ref)) }
+                flow.value = fetched.copy(items = mergeTimelineItems(fetched.items, flow.value.items))
+            }.onFailure { _actionError.value = actionError("读取任务", it) }
+        } finally {
+            _refreshingThreads.value = _refreshingThreads.value - key
+        }
     }
 
     private suspend fun ensureChannel(hostId: String): ChannelState {
-        channels[hostId]?.let { existing -> withTimeout(15_000) { existing.ready.await() }; return existing }
+        channels[hostId]?.let { existing ->
+            try {
+                withTimeout(15_000) { existing.ready.await() }
+                return existing
+            } catch (error: Throwable) {
+                // 通道未就绪或握手失败：丢弃后重建，而不是让这台 Host 永久占着一条死通道。
+                channels.remove(hostId, existing)
+                if (error is CancellationException && error !is TimeoutCancellationException) throw error
+            }
+        }
         val credentials = secure.load()?.takeIf { it.approved } ?: throw BridgeRpcException("尚未登录")
         val host = hostInfos[hostId]?.takeIf { it.online } ?: throw BridgeRpcException("目标电脑离线", "HOST_OFFLINE")
         val (crypto, envelope) = RelayCrypto.openChannel(credentials, host, UUID.randomUUID().toString())
@@ -650,6 +764,11 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 outerCall("channel/data", buildJsonObject { put("envelope", json.encodeToJsonElement(RelayEnvelope.serializer(), envelope)) })
                 deferred.await()
             }
+        } catch (error: TimeoutCancellationException) {
+            // 超时通常意味着对端已经丢弃了这条通道（解密失败或 Host 重启）；
+            // 丢弃本地通道，让下一次调用重新握手，而不是在死通道上反复超时。
+            channels.remove(hostId, state)
+            throw BridgeRpcException("Host 响应超时，已重置加密通道，请重试")
         } finally {
             innerPending.remove(state.crypto.channelId to id)
         }
@@ -681,50 +800,69 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             "snapshot/updated" -> {
                 val hostId = params.string("hostId") ?: return
                 if (hostInfos[hostId] == null) syncHosts()
-                if (hostInfos[hostId] != null) syncHost(hostId)
+                if (hostInfos[hostId] != null) scheduleHostSync(hostId)
             }
             "host/status" -> {
                 val hostId = params.string("hostId") ?: return
                 if (hostInfos[hostId] == null) syncHosts()
                 hostInfos[hostId]?.let { hostInfos[hostId] = it.copy(online = params.boolean("online") == true) }
                 updateHosts()
-                if (params.boolean("online") == true) syncHost(hostId)
+                if (params.boolean("online") == true) scheduleHostSync(hostId)
             }
         }
     }
 
+    private fun eventMutex(hostId: String) = hostEventMutexes.getOrPut(hostId) { Mutex() }
+
     private suspend fun replayEvents(hostId: String, credentials: RelayCredentials) {
-        try {
-            val events = outerCall("event/replay", obj("hostId" to hostId, "lastSeq" to secure.lastSeq(hostId))) as? JsonArray ?: return
-            for (event in events.mapNotNull { it.asObject() }) applyStoredEvent(event, credentials)
+        val events = try {
+            outerCall("event/replay", obj("hostId" to hostId, "lastSeq" to secure.lastSeq(hostId))) as? JsonArray ?: return
         } catch (error: BridgeRpcException) {
             if (error.nameCode != "EVENT_GAP") throw error
             secure.setLastSeq(hostId, 0)
-            val events = outerCall("event/replay", obj("hostId" to hostId, "lastSeq" to 0)) as? JsonArray ?: return
-            for (event in events.mapNotNull { it.asObject() }) applyStoredEvent(event, credentials)
+            outerCall("event/replay", obj("hostId" to hostId, "lastSeq" to 0)) as? JsonArray ?: return
+        }
+        eventMutex(hostId).withLock {
+            for (event in events.mapNotNull { it.asObject() }) {
+                val envelope = event.obj("envelope")?.let(::envelopeFromJson) ?: continue
+                applyStoredEventLocked(hostId, envelope, event, credentials)
+            }
         }
     }
 
-    private suspend fun applyStoredEvent(stored: JsonObject, supplied: RelayCredentials? = null) {
+    private suspend fun applyStoredEvent(stored: JsonObject) {
         val envelope = stored.obj("envelope")?.let(::envelopeFromJson) ?: return
-        val seq = stored.long("seq") ?: return
-        val credentials = supplied ?: secure.load()?.takeIf { it.approved } ?: return
-        val lastSeq = secure.lastSeq(envelope.hostId)
-        if (seq <= lastSeq) return
-        if (lastSeq > 0 && seq != lastSeq + 1) {
-            secure.setLastSeq(envelope.hostId, 0)
-            syncHost(envelope.hostId)
-            return
-        }
-        val event = json.parseToJsonElement(RelayCrypto.decryptAccountEnvelope(envelope, credentials.contentKey!!)) as JsonObject
-        envelope.eventId?.let { eventId ->
-            event.string("threadId")?.let { threadId -> notificationRefs[eventId] = ThreadRef(envelope.hostId, threadId).encoded() }
-        }
-        processBridgeEvent(envelope.hostId, event)
-        secure.setLastSeq(envelope.hostId, seq)
+        val hostId = envelope.hostId
+        val gap = eventMutex(hostId).withLock { applyStoredEventLocked(hostId, envelope, stored, null) }
+        if (gap) scheduleHostSync(hostId)
     }
 
-    private suspend fun processBridgeEvent(hostId: String, event: JsonObject) {
+    /**
+     * Applies one stored event under the host's event mutex and returns true
+     * when a sequence gap requires a host resync. A single undecryptable or
+     * unprocessable event no longer wedges the cursor: it is skipped, the
+     * cursor still advances, and a scheduled resync repairs thread state.
+     */
+    private fun applyStoredEventLocked(hostId: String, envelope: RelayEnvelope, stored: JsonObject, supplied: RelayCredentials?): Boolean {
+        val seq = stored.long("seq") ?: return false
+        val credentials = supplied ?: secure.load()?.takeIf { it.approved } ?: return false
+        when (eventSeqDecision(secure.lastSeq(hostId), seq)) {
+            EventSeqDecision.Skip -> return false
+            EventSeqDecision.Gap -> return true
+            EventSeqDecision.Apply -> Unit
+        }
+        runCatching {
+            val event = json.parseToJsonElement(RelayCrypto.decryptAccountEnvelope(envelope, credentials.contentKey!!)) as JsonObject
+            envelope.eventId?.let { eventId ->
+                event.string("threadId")?.let { threadId -> notificationRefs[eventId] = ThreadRef(hostId, threadId).encoded() }
+            }
+            processBridgeEvent(hostId, event)
+        }.onFailure { scheduleHostSync(hostId) }
+        secure.setLastSeq(hostId, seq)
+        return false
+    }
+
+    private fun processBridgeEvent(hostId: String, event: JsonObject) {
         val type = event.string("type") ?: return
         val rawThreadId = event.string("threadId")
         val ref = rawThreadId?.let { ThreadRef(hostId, it) }
@@ -738,7 +876,18 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             "approval.request" -> if (ref != null) applyApproval(ref, payload)
             "question.request" -> if (ref != null) applyQuestion(ref, payload)
             "turn.status" -> if (ref != null) applyTurnStatus(ref, turnId, payload)
-            "sync.required" -> if (ref != null) fetchThread(ref) else syncHost(hostId)
+            // 全量拉取不再阻塞事件游标：改为防抖后的后台校正。
+            "sync.required" -> if (ref != null) scheduleThreadRefresh(ref) else scheduleHostSync(hostId)
+        }
+    }
+
+    /** Debounced full-thread correction; coalesces bursts of sync.required events. */
+    private fun scheduleThreadRefresh(ref: ThreadRef) {
+        val key = ref.encoded()
+        if (threadRefreshJobs[key]?.isActive == true) return
+        threadRefreshJobs[key] = scope.launch {
+            delay(400)
+            fetchThread(ref)
         }
     }
 

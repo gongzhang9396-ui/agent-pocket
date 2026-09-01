@@ -64,6 +64,9 @@ object MockPocketRepository : PocketRepository {
 
     override val actionError: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
     override val creatingTask: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
+    override val syncing: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
+    override val syncStatus: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
+    override val refreshingThreads: StateFlow<Set<String>> = MutableStateFlow(emptySet<String>()).asStateFlow()
 
     override val projects: StateFlow<List<Project>> = MutableStateFlow(listOf(
         Project("proj-agent-pocket", "agent-pocket", "C:\\workspace\\agent-pocket"),
@@ -554,6 +557,8 @@ object MockPocketRepository : PocketRepository {
     private var createdCount = 0
 
     override fun refreshProjects() = Unit
+    override fun refreshAll() = Unit
+    override fun refreshThread(threadId: String) = Unit
     override fun selectHost(hostId: String?) = Unit
 
     override fun createTask(
