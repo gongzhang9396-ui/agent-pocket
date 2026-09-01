@@ -16,6 +16,7 @@ const MAX_WAIT_CURSOR_CHARS = 2048;
 const MAX_THREAD_CURSOR_CHARS = 4096;
 const MAX_WAIT_TIMEOUT_MS = 8_000;
 const NEW_THREAD_VERIFY_TIMEOUT_MS = 8_000;
+const NEW_THREAD_RECHECK_TIMEOUT_MS = 4_000;
 const MAX_DESKTOP_ITEM_CHARS = 20_000;
 const MAX_CODEX_QUEUE_MESSAGE_CHARS = 24_000;
 const CODEX_QUEUE_TIMEOUT_MS = 15_000;
@@ -326,21 +327,41 @@ async function createDesktopThread(cwd, text, model, effort, workspaceMode, cont
   }
   if (!threadId) throw new Error("Codex Desktop create_thread returned no threadId");
 
-  // Advisory only: Desktop (and some model relays) retry transient bootstrap
-  // failures on their own, so one early systemError/failed sample must not
-  // discard a thread that already exists — the phone would report a false
-  // failure while the task actually runs, and a user retry would duplicate
-  // it. The bridge watcher and thread/read surface the real terminal state.
+  // Advisory verify with automatic recovery. Desktop's bootstrap turn can
+  // fail on third-party HTTP model channels (previous_response_id needs the
+  // official Responses WebSocket v2), sometimes recovering by itself and
+  // sometimes staying dead. The thread exists either way, so never throw:
+  // confirm the failure with a second sample, then re-deliver the prompt as
+  // a standard queued user turn — the stateless path that works on any
+  // channel — instead of returning a dead task.
   const verification = await waitDesktopThread(
     threadId,
     undefined,
     NEW_THREAD_VERIFY_TIMEOUT_MS,
     subcallContext(context, "create-verify"),
   );
-  const verifySuspect = verification.threadStatus === "systemError" || verification.turnStatus === "failed";
-  const warning = verifySuspect
-    ? `Desktop reported ${verification.threadStatus === "systemError" ? "systemError" : "a failed first turn"} right after creation${verification.turnError ? `: ${verification.turnError}` : ""}; it may recover automatically — check the task status before retrying`
-    : undefined;
+  let warning;
+  if (verification.threadStatus === "systemError" || verification.turnStatus === "failed") {
+    const recheck = await waitDesktopThread(
+      threadId,
+      undefined,
+      NEW_THREAD_RECHECK_TIMEOUT_MS,
+      subcallContext(context, "create-recheck"),
+    );
+    const recovered = recheck.turnStatus
+      ? !["failed", "cancelled"].includes(recheck.turnStatus)
+      : recheck.threadStatus
+        ? recheck.threadStatus !== "systemError"
+        : false;
+    if (!recovered) {
+      try {
+        await queueCodexMessage(threadId, text);
+        warning = "Desktop bootstrap turn failed; the prompt was re-queued as a standard user turn and should run shortly";
+      } catch (error) {
+        warning = `Desktop bootstrap turn failed and automatic re-queue also failed: ${error instanceof Error ? error.message : error}`;
+      }
+    }
+  }
 
   return {
     source: "desktop",

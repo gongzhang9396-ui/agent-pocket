@@ -1,6 +1,6 @@
 {
   "name": "agent-pocket-desktop-attach",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Local adapter that lets Agent Pocket create, read, and continue Codex Desktop tasks through authenticated Bridge IPC.",
   "author": {
     "name": "gongzhang9396-ui",
