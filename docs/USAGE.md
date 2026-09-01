@@ -247,11 +247,12 @@ Android 系统会显示一次安装确认。侧载时请核对发布页提供的
 
 1. 点击新建任务；
 2. 先选择在线 Host；
-3. 选择该 Host 动态提供的项目；
-4. 选择模型和 reasoning；
-5. 输入提示词并发送。
+3. 选择运行方式：**Bridge · 手机完整控制**（默认；由 Host 的 codex app-server 执行，兼容第三方模型通道，支持审批/提问/中断，可勾选 Plan 模式让首轮只输出计划不改文件）或 **Codex Desktop**（真实 Desktop 任务，需要官方 WebSocket v2 模型通道）；
+4. 选择该 Host 动态提供的项目；
+5. 选择模型和 reasoning；
+6. 输入提示词并发送。
 
-模型和 reasoning 不在 App 中硬编码。活动回复不会中途切换模型；新的选择从下一次任务或 turn 开始生效。
+模型和 reasoning 不在 App 中硬编码。活动回复不会中途切换模型；新的选择从下一次任务或 turn 开始生效。Bridge 任务同样出现在 Codex Desktop 的任务列表中，可在电脑上查看，但请不要在电脑端续写它（一个任务只能有一个 writer）。
 
 ### 6.3 续写、追问和中断
 
@@ -361,7 +362,7 @@ Relay 更新前应：
 
 ### 新建任务失败
 
-先在 App 中重新选择在线 Host、项目、模型和 reasoning。若任务短暂出现后变成系统错误，可能是 Codex Desktop 上游版本回归；这不是通过重复点击可以解决的问题，应先查看 Host/Relay 日志并确认 Desktop 版本。
+先在 App 中重新选择在线 Host、项目、模型和 reasoning。若使用 Desktop 运行方式且任务短暂出现后变成系统错误（`function_call_output requires call_id ...`），说明当前模型通道是第三方 HTTP 中转，Desktop 引擎的有状态首轮在该通道上不稳定：改用 Bridge 运行方式即可稳定新建；已创建的 Desktop 任务会被自动重投一次提示词尝试救活，仍失败时在会话里再发一条消息或换 Bridge 重建。
 
 ### 二维码没有显示
 
