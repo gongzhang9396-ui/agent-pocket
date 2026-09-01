@@ -62,7 +62,7 @@ fun ThreadStatus.style(): StatusStyle = when (this) {
     ThreadStatus.Active -> StatusStyle("运行中", StatusColors.running, "●")
     ThreadStatus.NeedsAttention -> StatusStyle("待处理", StatusColors.attention, "▲")
     ThreadStatus.Completed -> StatusStyle("已完成", StatusColors.completed, "✓")
-    ThreadStatus.Idle -> StatusStyle("已断开", StatusColors.disconnected, "○")
+    ThreadStatus.Idle -> StatusStyle("空闲", StatusColors.disconnected, "○")
     ThreadStatus.DesktopOwned -> StatusStyle("Desktop 可续写", StatusColors.external, "◆")
     ThreadStatus.ExternalBusy -> StatusStyle("外部占用", StatusColors.external, "◇")
 }

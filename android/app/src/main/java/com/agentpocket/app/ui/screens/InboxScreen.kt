@@ -54,7 +54,7 @@ import com.agentpocket.app.ui.components.ThreadStatusChip
 import com.agentpocket.app.ui.theme.AgentPocketTheme
 import com.agentpocket.app.ui.theme.StatusColors
 
-/** 会话收件箱：默认落地页。区分运行中 / 待处理 / 已完成 / 已断开 / 桌面端运行中。 */
+/** 会话收件箱：默认落地页。区分运行中 / 待处理 / 已完成 / 空闲 / 桌面端运行中。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun InboxScreen(
