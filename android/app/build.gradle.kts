@@ -33,8 +33,8 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "com.agentpocket.app.data.ReleaseNativeCryptoInstrumentation"
-        versionCode = 26
-        versionName = "0.2.13"
+        versionCode = 27
+        versionName = "0.2.14"
         buildConfigField(
             "String",
             "UPDATE_API_URL",
