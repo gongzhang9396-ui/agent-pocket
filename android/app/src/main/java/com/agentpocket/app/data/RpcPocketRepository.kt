@@ -1,10 +1,14 @@
 package com.agentpocket.app.data
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
+import android.util.Base64
+import android.webkit.MimeTypeMap
 import com.agentpocket.app.BridgeSyncService
 import com.agentpocket.app.data.model.ApprovalDecision
 import com.agentpocket.app.data.model.CommandStatus
@@ -16,6 +20,8 @@ import com.agentpocket.app.data.model.DiffHunk
 import com.agentpocket.app.data.model.DiffLine
 import com.agentpocket.app.data.model.DiffLineKind
 import com.agentpocket.app.data.model.Host
+import com.agentpocket.app.data.model.HostRuntime
+import com.agentpocket.app.data.model.DesktopRuntimeState
 import com.agentpocket.app.data.model.MessageStatus
 import com.agentpocket.app.data.model.ModelOption
 import com.agentpocket.app.data.model.PlanStatus
@@ -30,6 +36,7 @@ import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadSummary
 import com.agentpocket.app.data.model.TimelineItem
 import java.net.URI
+import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -75,6 +82,18 @@ import okhttp3.RequestBody.Companion.toRequestBody
 
 private const val MAX_COMMAND_OUTPUT_CHARS = 256 * 1024
 private const val INNER_RPC_TIMEOUT_MS = 30_000L
+private const val MAX_ATTACHMENT_COUNT = 3
+private const val MAX_ATTACHMENT_TOTAL_BYTES = 800 * 1024
+private const val MAX_FILE_ATTACHMENT_BYTES = 512 * 1024
+
+private val SAFE_FILE_EXTENSIONS = setOf(
+    "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml", "log",
+    "kt", "kts", "java", "js", "jsx", "ts", "tsx", "py", "rs", "go", "c", "cc", "cpp",
+    "h", "hpp", "cs", "swift", "rb", "php", "sh", "ps1", "bat", "cmd", "toml", "ini", "conf",
+    "cfg", "gradle", "sql", "html", "css", "scss", "vue", "svelte", "properties", "pdf",
+)
+
+private data class EncodedAttachments(val images: JsonArray, val files: JsonArray)
 
 internal fun isPendingSessionRejected(error: Throwable): Boolean =
     error is BridgeRpcException && error.nameCode == "AUTH_FAILED"
@@ -100,6 +119,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val connectionGeneration = AtomicLong(0)
     private val innerIds = AtomicLong(1)
     private val hostInfos = mutableMapOf<String, RelayHostInfo>()
+    private val capabilitiesByHost = mutableMapOf<String, Set<String>>()
     private val threadLists = mutableMapOf<String, List<ThreadSummary>>()
     private val details = mutableMapOf<String, MutableStateFlow<ThreadDetail>>()
     private val diffs = mutableMapOf<String, MutableStateFlow<List<DiffFile>>>()
@@ -130,6 +150,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private val _hosts = MutableStateFlow<List<Host>>(emptyList())
     override val hosts: StateFlow<List<Host>> = _hosts.asStateFlow()
+    private val _hostRuntimes = MutableStateFlow<Map<String, HostRuntime>>(emptyMap())
+    override val hostRuntimes: StateFlow<Map<String, HostRuntime>> = _hostRuntimes.asStateFlow()
     private val _selectedHostId = MutableStateFlow<String?>(null)
     override val selectedHostId: StateFlow<String?> = _selectedHostId.asStateFlow()
     private val _host = MutableStateFlow(aggregateHost())
@@ -386,6 +408,41 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         }
     }
 
+    override fun refreshHostRuntime(hostId: String) {
+        if (hostInfos[hostId]?.online != true) {
+            _hostRuntimes.value = _hostRuntimes.value + (hostId to HostRuntime(hostId))
+            return
+        }
+        scope.launch {
+            runCatching { fetchHostRuntime(hostId) }
+                .onFailure { _actionError.value = actionError("读取 Desktop 状态", it) }
+        }
+    }
+
+    override fun launchDesktop(hostId: String) {
+        if (hostInfos[hostId]?.online != true) {
+            _actionError.value = "启动失败：目标电脑当前离线"
+            return
+        }
+        _hostRuntimes.value = _hostRuntimes.value + (
+            hostId to (_hostRuntimes.value[hostId] ?: HostRuntime(hostId)).copy(
+                desktopState = DesktopRuntimeState.Starting,
+                canWake = false,
+            )
+        )
+        scope.launch {
+            runCatching {
+                val result = innerCall(hostId, "desktop/launch").requireObject("启动 Desktop")
+                updateHostRuntime(hostId, result)
+                delay(2_000)
+                fetchHostRuntime(hostId)
+            }.onFailure {
+                _actionError.value = actionError("启动 Desktop", it)
+                fetchHostRuntime(hostId)
+            }
+        }
+    }
+
     override fun refreshAll() {
         if (secure.load()?.approved != true) return
         if (rpc == null) {
@@ -426,7 +483,10 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     override fun lastTaskTarget(): String = settings.getString("newTaskTarget", "bridge") ?: "bridge"
 
-    override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, onCreated: (String) -> Unit) {
+    override fun hostSupports(capability: String, hostId: String?): Boolean =
+        capabilitiesByHost[hostId ?: _selectedHostId.value]?.contains(capability) == true
+
+    override fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, goal: String?, images: List<Uri>, files: List<Uri>, onCreated: (String) -> Unit) {
         val resolvedTarget = if (target == "desktop") "desktop" else "bridge"
         val hostId = _selectedHostId.value
         val project = _projects.value.firstOrNull { it.id == projectId }
@@ -435,11 +495,24 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             return
         }
         if (_creatingTask.value) return
+        if ((images.isNotEmpty() || files.isNotEmpty()) && !hostSupports("attachments-v1", hostId)) {
+            _actionError.value = "这台 Windows Host 版本过旧，不支持附件；请先覆盖更新 Host"
+            return
+        }
+        if (planMode && resolvedTarget == "bridge" && !hostSupports("plan-v1", hostId)) {
+            _actionError.value = "这台 Windows Host 版本过旧，不支持 Plan 模式；请先覆盖更新 Host"
+            return
+        }
+        if (!goal.isNullOrBlank() && resolvedTarget == "bridge" && !hostSupports("goal-v1", hostId)) {
+            _actionError.value = "这台 Windows Host 版本过旧，不支持持久 Goal；请先覆盖更新 Host"
+            return
+        }
         settings.edit().putString("newTaskTarget", resolvedTarget).apply()
         _creatingTask.value = true
         scope.launch {
             runCatching {
-                innerCall(
+                val encoded = encodeAttachments(images, files)
+                val result = innerCall(
                     hostId,
                     "thread/start",
                     obj(
@@ -449,10 +522,14 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                         "effort" to reasoningId,
                         "target" to resolvedTarget,
                         "mode" to (if (planMode && resolvedTarget == "bridge") "plan" else null),
+                        "goal" to goal?.trim()?.takeIf { resolvedTarget == "bridge" && it.isNotBlank() },
                         "workspaceMode" to "local",
                         "clientMessageId" to "mobile-${System.currentTimeMillis()}",
+                        "images" to encoded.images,
+                        "files" to encoded.files,
                     ),
                 ).requireObject("新建任务")
+                result
             }.onSuccess { result ->
                 val thread = result.obj("thread") ?: return@onSuccess
                 val rawId = thread.string("id") ?: return@onSuccess
@@ -470,6 +547,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 threadLists[hostId] = listOf(summary) + threadLists[hostId].orEmpty().filterNot { it.id == rawId }
                 updateVisibleThreads()
                 onCreated(ref.encoded())
+                result.string("warning")?.takeIf { it.isNotBlank() }?.let { _actionError.value = it }
                 fetchThread(ref)
             }.onFailure { _actionError.value = actionError("创建任务", it) }
             _creatingTask.value = false
@@ -501,19 +579,72 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         }
     }
 
-    override fun sendSteer(threadId: String, text: String) {
+    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>) {
         val ref = resolveThreadRef(threadId, _selectedHostId.value) ?: run {
             _actionError.value = "发送失败：任务缺少电脑上下文，请从任务列表重新打开"
             return
         }
         val key = ref.encoded()
+        if ((images.isNotEmpty() || files.isNotEmpty()) && !hostSupports("attachments-v1", ref.hostId)) {
+            _actionError.value = "发送失败：这台 Windows Host 版本过旧，不支持附件；请先覆盖更新 Host"
+            return
+        }
+        if (planMode && !hostSupports("plan-v1", ref.hostId)) {
+            _actionError.value = "发送失败：这台 Windows Host 版本过旧，不支持 Plan 模式；请先覆盖更新 Host"
+            return
+        }
+        val effectiveText = text.ifBlank {
+            when {
+                images.isNotEmpty() && files.isNotEmpty() -> "请分析附加的图片和文件。"
+                images.isNotEmpty() -> "请分析附加的图片。"
+                else -> "请分析附加的文件。"
+            }
+        }
         val messageId = "user-${System.currentTimeMillis()}"
-        upsert(ref, TimelineItem.Message(messageId, Role.User, text, MessageStatus.Streaming))
+        upsert(
+            ref,
+            TimelineItem.Message(
+                messageId,
+                Role.User,
+                buildString {
+                    append(effectiveText)
+                    val labels = buildList {
+                        if (images.isNotEmpty()) add("${images.size} 张图片")
+                        if (files.isNotEmpty()) add("${files.size} 个文件")
+                    }
+                    if (labels.isNotEmpty()) append("\n\n（附带 ${labels.joinToString("、")}）")
+                },
+                MessageStatus.Streaming,
+            ),
+        )
         scope.launch {
             runCatching {
+                val encoded = encodeAttachments(images, files)
                 val turnId = details[key]?.value?.activeTurnId
-                if (turnId == null) innerCall(ref.hostId, "turn/start", obj("threadId" to ref.threadId, "text" to text, "clientMessageId" to messageId))
-                else innerCall(ref.hostId, "turn/steer", obj("threadId" to ref.threadId, "expectedTurnId" to turnId, "text" to text, "clientMessageId" to messageId))
+                if (turnId == null) innerCall(
+                    ref.hostId,
+                    "turn/start",
+                    obj(
+                        "threadId" to ref.threadId,
+                        "text" to effectiveText,
+                        "mode" to (if (planMode) "plan" else null),
+                        "images" to encoded.images,
+                        "files" to encoded.files,
+                        "clientMessageId" to messageId,
+                    ),
+                )
+                else innerCall(
+                    ref.hostId,
+                    "turn/steer",
+                    obj(
+                        "threadId" to ref.threadId,
+                        "expectedTurnId" to turnId,
+                        "text" to effectiveText,
+                        "images" to encoded.images,
+                        "files" to encoded.files,
+                        "clientMessageId" to messageId,
+                    ),
+                )
             }.onSuccess { updateMessageStatus(ref, messageId, MessageStatus.Done) }
                 .onFailure { error ->
                     val currentStatus = details[key]?.value?.items
@@ -586,6 +717,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         _refreshingThreads.value = emptySet()
         rpc?.close()
         channels.clear()
+        capabilitiesByHost.clear()
         innerPending.values.forEach { it.cancel() }
         innerPending.clear()
         secure.clear()
@@ -669,6 +801,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             )
             hostInfos[info.id] = info
         }
+        capabilitiesByHost.keys.retainAll(hostInfos.keys)
         updateHosts()
     }
 
@@ -745,6 +878,16 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private suspend fun syncHostMetadata(hostId: String) {
         _projectsLoading.value = true
         try {
+            val credentials = secure.load()?.takeIf { it.approved } ?: throw BridgeRpcException("尚未登录")
+            val hello = innerCall(
+                hostId,
+                "bridge/hello",
+                obj("protocolVersion" to 1, "deviceId" to credentials.deviceId),
+            ).requireObject("Host 能力")
+            capabilitiesByHost[hostId] = hello.array("capabilities")
+                .mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                .toSet()
+            runCatching { fetchHostRuntime(hostId) }
             val projectsResult = innerCall(hostId, "project/list").requireObject("项目列表")
             projectsByHost[hostId] = projectsResult.array("data").mapNotNull { element ->
                 val item = element.asObject() ?: return@mapNotNull null
@@ -757,6 +900,143 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             if (_selectedHostId.value == hostId) updateVisibleState()
         } finally {
             _projectsLoading.value = false
+        }
+    }
+
+    private suspend fun fetchHostRuntime(hostId: String) {
+        updateHostRuntime(hostId, innerCall(hostId, "host/runtime").requireObject("Desktop 状态"))
+    }
+
+    private fun updateHostRuntime(hostId: String, value: JsonObject) {
+        val desktop = value.obj("desktop")
+        val state = when (desktop?.string("state")) {
+            "ready" -> DesktopRuntimeState.Ready
+            "starting" -> DesktopRuntimeState.Starting
+            "closed" -> DesktopRuntimeState.Closed
+            else -> DesktopRuntimeState.Unavailable
+        }
+        _hostRuntimes.value = _hostRuntimes.value + (
+            hostId to HostRuntime(
+                hostId = hostId,
+                desktopState = state,
+                attachReady = desktop?.boolean("attachReady") == true,
+                processRunning = desktop?.boolean("processRunning") == true,
+                canWake = desktop?.boolean("canWake") == true,
+            )
+        )
+    }
+
+    /**
+     * Keep encrypted relay messages comfortably below the 2 MiB ciphertext
+     * ceiling. Images are sampled and JPEG-compressed on-device. Small user
+     * documents are copied as bytes and materialized only on the selected Host;
+     * Relay receives the already E2E-encrypted RPC envelope.
+     */
+    private suspend fun encodeAttachments(imageUris: List<Uri>, fileUris: List<Uri>): EncodedAttachments = withContext(Dispatchers.IO) {
+        if (imageUris.size + fileUris.size > MAX_ATTACHMENT_COUNT) {
+            throw BridgeRpcException("每次最多发送 $MAX_ATTACHMENT_COUNT 个附件")
+        }
+        var totalBytes = 0
+        val encodedImages = buildJsonArray {
+            imageUris.forEach { uri ->
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw BridgeRpcException("无法读取所选图片")
+                var sample = 1
+                while (bounds.outWidth / sample > 1600 || bounds.outHeight / sample > 1600) sample *= 2
+                val bitmap = context.contentResolver.openInputStream(uri)?.use {
+                    BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+                } ?: throw BridgeRpcException("无法解码所选图片")
+                val output = ByteArrayOutputStream()
+                try {
+                    var quality = 84
+                    do {
+                        output.reset()
+                        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, output)
+                        quality -= 12
+                    } while (output.size() > 360 * 1024 && quality >= 36)
+                    val bytes = output.toByteArray()
+                    if (bytes.size > 450 * 1024) throw BridgeRpcException("图片过大，请裁剪后重试")
+                    totalBytes += bytes.size
+                    if (totalBytes > MAX_ATTACHMENT_TOTAL_BYTES) throw BridgeRpcException("附件总量过大，请减少附件数量")
+                    add(buildJsonObject {
+                        put("mimeType", "image/jpeg")
+                        put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                    })
+                } finally {
+                    bitmap.recycle()
+                    output.close()
+                }
+            }
+        }
+        val encodedFiles = buildJsonArray {
+            fileUris.forEach { uri ->
+                val filename = attachmentDisplayName(uri)
+                val extension = filename.substringAfterLast('.', "").lowercase()
+                val mimeType = context.contentResolver.getType(uri)?.lowercase()
+                    ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+                    ?: "application/octet-stream"
+                if (!isSupportedAttachmentFile(filename, mimeType)) {
+                    throw BridgeRpcException("暂不支持文件：$filename；请选择文本、代码、配置、日志、CSV 或 PDF")
+                }
+                val bytes = readAttachmentBytes(uri)
+                totalBytes += bytes.size
+                if (totalBytes > MAX_ATTACHMENT_TOTAL_BYTES) throw BridgeRpcException("附件总量过大，请减少附件数量")
+                add(buildJsonObject {
+                    put("filename", filename)
+                    put("mimeType", mimeType)
+                    put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                })
+            }
+        }
+        EncodedAttachments(encodedImages, encodedFiles)
+    }
+
+    private fun attachmentDisplayName(uri: Uri): String {
+        val queried = runCatching {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    .takeIf { it >= 0 }
+                    ?.let(cursor::getString)
+                else null
+            }
+        }.getOrNull()
+        return (queried ?: uri.lastPathSegment ?: "attachment.txt")
+            .replace(Regex("[\\u0000-\\u001F\\u007F]"), "_")
+            .take(160)
+            .ifBlank { "attachment.txt" }
+    }
+
+    private fun isSupportedAttachmentFile(filename: String, mimeType: String): Boolean {
+        val lowerName = filename.lowercase()
+        val extension = lowerName.substringAfterLast('.', "")
+        if (extension in SAFE_FILE_EXTENSIONS || lowerName in setOf(".env", "dockerfile", "makefile")) return true
+        return mimeType.startsWith("text/") || mimeType in setOf(
+            "application/json",
+            "application/xml",
+            "application/pdf",
+            "application/yaml",
+            "application/x-yaml",
+            "application/javascript",
+            "application/sql",
+        )
+    }
+
+    private fun readAttachmentBytes(uri: Uri): ByteArray {
+        val output = ByteArrayOutputStream()
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val buffer = ByteArray(16 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                if (output.size() + read > MAX_FILE_ATTACHMENT_BYTES) {
+                    throw BridgeRpcException("单个文件不能超过 512 KiB")
+                }
+                output.write(buffer, 0, read)
+            }
+        } ?: throw BridgeRpcException("无法读取所选文件")
+        return output.toByteArray().also {
+            if (it.isEmpty()) throw BridgeRpcException("不能发送空文件")
         }
     }
 

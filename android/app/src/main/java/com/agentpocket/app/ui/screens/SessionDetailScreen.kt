@@ -1,5 +1,7 @@
 package com.agentpocket.app.ui.screens
 
+import android.net.Uri
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -18,14 +21,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Difference
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -59,9 +68,16 @@ import androidx.compose.ui.unit.dp
 import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.data.model.ThreadStatus
+import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.data.model.TimelineItem
+import com.agentpocket.app.ui.components.AgentBadge
+import com.agentpocket.app.ui.components.AgentRegistry
+import com.agentpocket.app.ui.components.PendingAttachmentStrip
+import com.agentpocket.app.ui.components.PendingFileList
 import com.agentpocket.app.ui.components.ThreadStatusChip
 import com.agentpocket.app.ui.components.TimelineItemContent
+import com.agentpocket.app.ui.components.rememberFilePicker
+import com.agentpocket.app.ui.components.rememberImagePicker
 import com.agentpocket.app.ui.theme.AgentPocketTheme
 import com.agentpocket.app.ui.theme.StatusColors
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -83,6 +99,10 @@ fun SessionDetailScreen(
     val detail by detailState.collectAsState()
     val actionError by repo.actionError.collectAsState()
     val refreshingThreads by repo.refreshingThreads.collectAsState()
+    val threadHostId = remember(threadId) { runCatching { ThreadRef.parse(threadId).hostId }.getOrNull() }
+    val attachmentsSupported = repo.hostSupports("attachments-v1", threadHostId)
+    val planSupported = repo.hostSupports("plan-v1", threadHostId)
+    val goalSupported = repo.hostSupports("goal-v1", threadHostId)
     val refreshing = threadId in refreshingThreads
     var goalDialogOpen by remember { mutableStateOf(false) }
     var goalCurrent by remember { mutableStateOf<String?>(null) }
@@ -105,7 +125,20 @@ fun SessionDetailScreen(
         null -> ""
     }
 
+    fun openGoalDialog() {
+        goalDialogOpen = true
+        goalLoading = true
+        repo.threadGoal(threadId) {
+            goalCurrent = it
+            goalDraft = it.orEmpty()
+            goalLoading = false
+        }
+    }
+
     LaunchedEffect(threadId) { repo.clearActionError() }
+    LaunchedEffect(threadId, desktopOwned) {
+        if (!desktopOwned) repo.threadGoal(threadId) { goalCurrent = it }
+    }
     DisposableEffect(threadId) {
         repo.setActiveThread(threadId)
         onDispose { repo.setActiveThread(null) }
@@ -138,6 +171,8 @@ fun SessionDetailScreen(
                     title = {
                         Column {
                             Row(verticalAlignment = Alignment.CenterVertically) {
+                                AgentBadge(AgentRegistry.codex)
+                                Spacer(Modifier.width(6.dp))
                                 Text(
                                     detail.title,
                                     style = MaterialTheme.typography.titleSmall,
@@ -164,16 +199,8 @@ fun SessionDetailScreen(
                         }
                     },
                     actions = {
-                        if (!desktopOwned) {
-                            IconButton(onClick = {
-                                goalDialogOpen = true
-                                goalLoading = true
-                                repo.threadGoal(threadId) {
-                                    goalCurrent = it
-                                    goalDraft = it.orEmpty()
-                                    goalLoading = false
-                                }
-                            }) {
+                        if (!desktopOwned && goalSupported) {
+                            IconButton(onClick = { openGoalDialog() }) {
                                 Icon(Icons.Filled.Flag, contentDescription = "任务目标")
                             }
                         }
@@ -185,6 +212,30 @@ fun SessionDetailScreen(
                         }
                     },
                 )
+                goalCurrent?.takeIf { it.isNotBlank() }?.let { goal ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.10f),
+                    ) {
+                        Row(
+                            Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons.Filled.Flag, contentDescription = null, tint = MaterialTheme.colorScheme.tertiary)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "目标 · $goal",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.tertiary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
                 if (refreshing) LinearProgressIndicator(Modifier.fillMaxWidth())
             }
         },
@@ -193,10 +244,12 @@ fun SessionDetailScreen(
                 running = running,
                 desktopOwned = desktopOwned,
                 readOnly = readOnly,
+                attachmentsSupported = attachmentsSupported,
+                planSupported = planSupported,
                 errorMessage = actionError,
-                onSend = {
+                onSend = { text, planMode, images, files ->
                     followTail = true
-                    repo.sendSteer(threadId, it)
+                    repo.sendSteer(threadId, text, planMode, images, files)
                     forceScrollRequest += 1
                 },
                 onInterrupt = { repo.interruptTurn(threadId) },
@@ -313,16 +366,28 @@ private fun Composer(
     running: Boolean,
     desktopOwned: Boolean,
     readOnly: Boolean,
+    attachmentsSupported: Boolean,
+    planSupported: Boolean,
     errorMessage: String?,
-    onSend: (String) -> Unit,
+    onSend: (String, Boolean, List<Uri>, List<Uri>) -> Unit,
     onInterrupt: () -> Unit,
 ) {
     var text by rememberSaveable { mutableStateOf("") }
+    var planMode by rememberSaveable { mutableStateOf(false) }
+    var attachmentMenuOpen by remember { mutableStateOf(false) }
+    var imageAttachments by rememberSaveable { mutableStateOf(listOf<Uri>()) }
+    var fileAttachments by rememberSaveable { mutableStateOf(listOf<Uri>()) }
+    val pickImages = rememberImagePicker { picked ->
+        imageAttachments = (imageAttachments + picked).distinct().take((3 - fileAttachments.size).coerceAtLeast(0))
+    }
+    val pickFiles = rememberFilePicker { picked ->
+        fileAttachments = (fileAttachments + picked).distinct().take((3 - imageAttachments.size).coerceAtLeast(0))
+    }
     Surface(tonalElevation = 3.dp) {
         Column(Modifier.imePadding()) {
             if (desktopOwned) {
                 Text(
-                    "该任务由 Codex Desktop 持有。你可以从手机追加指令；中断、审批和问题回答仍需在电脑端处理。",
+                    "该任务由 Codex Desktop 持有。你可以从手机追加文字、图片和文件；中断、审批和问题回答仍需在电脑端处理。",
                     style = MaterialTheme.typography.labelSmall,
                     color = StatusColors.external,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -343,10 +408,74 @@ private fun Composer(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             }
+            if (!running && !desktopOwned && !readOnly && planSupported) {
+                Row(
+                    modifier = Modifier.padding(start = 16.dp, top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = !planMode,
+                        onClick = { planMode = false },
+                        label = { Text("Execute · 执行") },
+                    )
+                    FilterChip(
+                        selected = planMode,
+                        onClick = { planMode = true },
+                        label = { Text("Plan · 先规划") },
+                    )
+                }
+            }
+            if (!readOnly && attachmentsSupported) {
+                PendingAttachmentStrip(
+                    uris = imageAttachments,
+                    onRemove = { imageAttachments = imageAttachments - it },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+                PendingFileList(
+                    uris = fileAttachments,
+                    onRemove = { fileAttachments = fileAttachments - it },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
             Row(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.Bottom,
             ) {
+                if (!readOnly && attachmentsSupported) {
+                    Box {
+                        IconButton(
+                            onClick = { attachmentMenuOpen = true },
+                            colors = IconButtonDefaults.iconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                contentColor = MaterialTheme.colorScheme.primary,
+                            ),
+                        ) {
+                            Icon(Icons.Filled.Add, contentDescription = "添加附件", modifier = Modifier.size(24.dp))
+                        }
+                        DropdownMenu(
+                            expanded = attachmentMenuOpen,
+                            onDismissRequest = { attachmentMenuOpen = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("添加图片") },
+                                leadingIcon = { Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null) },
+                                onClick = {
+                                    attachmentMenuOpen = false
+                                    pickImages()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("添加文件") },
+                                leadingIcon = { Icon(Icons.Filled.AttachFile, contentDescription = null) },
+                                onClick = {
+                                    attachmentMenuOpen = false
+                                    pickFiles()
+                                },
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(4.dp))
+                }
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
@@ -377,12 +506,15 @@ private fun Composer(
                 }
                 FilledIconButton(
                     onClick = {
-                        if (text.isNotBlank()) {
-                            onSend(text.trim())
+                        if (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()) {
+                            onSend(text.trim(), planMode, imageAttachments, fileAttachments)
                             text = ""
+                            planMode = false
+                            imageAttachments = emptyList()
+                            fileAttachments = emptyList()
                         }
                     },
-                    enabled = !readOnly && text.isNotBlank(),
+                    enabled = !readOnly && (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }

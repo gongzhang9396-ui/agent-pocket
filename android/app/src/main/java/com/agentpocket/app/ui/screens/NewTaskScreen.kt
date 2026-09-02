@@ -1,5 +1,6 @@
 package com.agentpocket.app.ui.screens
 
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -20,6 +21,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -56,10 +59,15 @@ import androidx.compose.ui.unit.dp
 import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.data.model.ConnectionState
+import com.agentpocket.app.ui.components.AgentRegistry
+import com.agentpocket.app.ui.components.PendingAttachmentStrip
+import com.agentpocket.app.ui.components.PendingFileList
 import com.agentpocket.app.ui.components.SectionLabel
+import com.agentpocket.app.ui.components.rememberFilePicker
+import com.agentpocket.app.ui.components.rememberImagePicker
 import com.agentpocket.app.ui.theme.AgentPocketTheme
 
-/** 新建 Codex 任务：项目、动态模型/推理强度选择、提示词与创建动作。 */
+/** 新建任务：Agent、电脑、项目、执行模式、Goal、模型与提示词。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NewTaskScreen(
@@ -76,15 +84,25 @@ fun NewTaskScreen(
     val actionError by repo.actionError.collectAsState()
     val creating by repo.creatingTask.collectAsState()
     var hostMenuExpanded by remember { mutableStateOf(false) }
+    var agentId by rememberSaveable { mutableStateOf(AgentRegistry.codex.kind.id) }
     var projectId by rememberSaveable { mutableStateOf("") }
     var projectMenuExpanded by remember { mutableStateOf(false) }
     var modelId by rememberSaveable { mutableStateOf("") }
     var reasoningId by rememberSaveable { mutableStateOf("") }
     var target by rememberSaveable { mutableStateOf(repo.lastTaskTarget()) }
     var planMode by rememberSaveable { mutableStateOf(false) }
+    var goalDraft by rememberSaveable { mutableStateOf("") }
+    var imageAttachments by rememberSaveable { mutableStateOf(listOf<Uri>()) }
+    var fileAttachments by rememberSaveable { mutableStateOf(listOf<Uri>()) }
     var prompt by rememberSaveable { mutableStateOf("") }
     var promptFocused by remember { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
+    val pickImages = rememberImagePicker { picked ->
+        imageAttachments = (imageAttachments + picked).distinct().take((3 - fileAttachments.size).coerceAtLeast(0))
+    }
+    val pickFiles = rememberFilePicker { picked ->
+        fileAttachments = (fileAttachments + picked).distinct().take((3 - imageAttachments.size).coerceAtLeast(0))
+    }
 
     LaunchedEffect(Unit) {
         repo.clearActionError()
@@ -104,15 +122,30 @@ fun NewTaskScreen(
     val model = models.firstOrNull { it.id == modelId }
     val selectedHost = hosts.firstOrNull { it.id == selectedHostId }
     val selectedProject = projects.firstOrNull { it.id == projectId }
+    val selectedAgent = AgentRegistry.all.firstOrNull { it.kind.id == agentId } ?: AgentRegistry.codex
+    val attachmentsSupported = repo.hostSupports("attachments-v1", selectedHostId)
+    val planSupported = target == "bridge" && repo.hostSupports("plan-v1", selectedHostId)
+    val goalSupported = target == "bridge" && repo.hostSupports("goal-v1", selectedHostId)
     // 推理选项跟随所选模型动态变化；切换模型后回落到该模型的第一个档位。
     val reasoning = model?.reasoningOptions?.firstOrNull { it.id == reasoningId }
         ?: model?.reasoningOptions?.firstOrNull()
-    val canCreate = !creating && selectedHost?.connectionState == ConnectionState.Connected &&
+    val canCreate = !creating && selectedAgent.available && selectedHost?.connectionState == ConnectionState.Connected &&
         prompt.isNotBlank() && projectId.isNotBlank() && modelId.isNotBlank() && reasoning != null
     val submit = {
         if (canCreate) {
             focusManager.clearFocus()
-            repo.createTask(projectId, modelId, reasoning?.id.orEmpty(), prompt, target, planMode && target == "bridge", onCreated)
+            repo.createTask(
+                projectId,
+                modelId,
+                reasoning?.id.orEmpty(),
+                prompt,
+                target,
+                planMode && target == "bridge",
+                goalDraft.trim().takeIf { target == "bridge" && it.isNotBlank() },
+                imageAttachments,
+                fileAttachments,
+                onCreated,
+            )
         }
     }
 
@@ -123,7 +156,7 @@ fun NewTaskScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("新建 Codex 任务") },
+                title = { Text("新建任务") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -163,7 +196,7 @@ fun NewTaskScreen(
                             Spacer(Modifier.size(8.dp))
                             Text("正在创建…")
                         } else {
-                            Text("创建任务")
+                            Text("创建 ${selectedAgent.displayName} 任务")
                         }
                     }
                 }
@@ -231,6 +264,29 @@ fun NewTaskScreen(
             }
 
             Spacer(Modifier.height(16.dp))
+            SectionLabel("编程 Agent")
+            Spacer(Modifier.height(6.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+            ) {
+                AgentRegistry.all.forEach { agent ->
+                    FilterChip(
+                        selected = agentId == agent.kind.id,
+                        onClick = { if (agent.available) agentId = agent.kind.id },
+                        enabled = agent.available,
+                        label = { Text(if (agent.available) agent.displayName else "${agent.displayName} · 即将接入") },
+                    )
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                selectedAgent.capabilities,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(Modifier.height(16.dp))
             SectionLabel("运行方式")
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -250,7 +306,7 @@ fun NewTaskScreen(
                 if (target == "bridge") {
                     "由这台电脑的 codex app-server 执行，兼容第三方模型通道；支持从手机审批、回答提问和中断。任务同样出现在 Codex Desktop 列表中，可在电脑上查看，但请不要在电脑端续写它。"
                 } else {
-                    "创建真实 Codex Desktop 任务，可在电脑上继续操作。注意：第三方 HTTP 模型通道（如 cc-switch 中转）暂不支持新建，需要官方 WebSocket v2 通道。"
+                    "创建真实 Codex Desktop 任务，可在电脑上继续操作。图片和文件会先经端到端加密传到 Host，再以本机临时路径交给 Desktop。注意：第三方 HTTP 模型通道（如 cc-switch 中转）暂不支持新建，需要官方 WebSocket v2 通道。"
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -261,6 +317,7 @@ fun NewTaskScreen(
                     FilterChip(
                         selected = planMode,
                         onClick = { planMode = !planMode },
+                        enabled = planSupported,
                         label = { Text("Plan 模式 · 先规划") },
                     )
                 }
@@ -272,7 +329,66 @@ fun NewTaskScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                Spacer(Modifier.height(12.dp))
+                SectionLabel("长期目标（可选）")
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = goalDraft,
+                    onValueChange = { goalDraft = it },
+                    enabled = goalSupported,
+                    placeholder = { Text("例如：完成可发布的 Android v0.3，并保持升级兼容") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                    textStyle = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Goal 会随 Bridge 任务持久保存，后续续聊仍可查看和修改。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
             }
+
+            Spacer(Modifier.height(12.dp))
+            SectionLabel("附件（可选）")
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(onClick = pickImages, enabled = attachmentsSupported, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.size(6.dp))
+                    Text("添加图片")
+                }
+                OutlinedButton(onClick = pickFiles, enabled = attachmentsSupported, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Filled.AttachFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.size(6.dp))
+                    Text("添加文件")
+                }
+            }
+            PendingAttachmentStrip(
+                uris = imageAttachments,
+                onRemove = { imageAttachments = imageAttachments - it },
+                modifier = Modifier.padding(top = if (imageAttachments.isEmpty()) 0.dp else 8.dp),
+            )
+            PendingFileList(
+                uris = fileAttachments,
+                onRemove = { fileAttachments = fileAttachments - it },
+                modifier = Modifier.padding(top = if (fileAttachments.isEmpty()) 0.dp else 8.dp),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (attachmentsSupported) {
+                    "每次最多 3 个附件；图片会压缩，文件限 512 KiB。内容端到端加密传给 Host，Relay 不保存明文。"
+                } else {
+                    "附件需要 Windows Host v0.3 或更高版本；请先覆盖更新 Host。"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             Spacer(Modifier.height(16.dp))
             SectionLabel("项目")
@@ -411,7 +527,7 @@ fun NewTaskScreen(
             OutlinedTextField(
                 value = prompt,
                 onValueChange = { prompt = it },
-                placeholder = { Text("描述你要 Codex 完成的任务，例如：为订单模块补充退款路径的集成测试…") },
+                placeholder = { Text("描述你要 ${selectedAgent.displayName} 完成的任务，例如：为订单模块补充退款路径的集成测试…") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 140.dp)

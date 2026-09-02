@@ -16,6 +16,13 @@ val TextSecondary = Color(0xFF94A3B8)
 val Accent = Color(0xFF7BD5C3)
 val OnAccent = Color(0xFF0B2B25)
 
+/** Stable visual identity for each coding-agent backend. */
+object AgentAccents {
+    val codex = Color(0xFF7BD5C3)
+    val grok = Color(0xFFB7A6E8)
+    val kimi = Color(0xFF8AB4F8)
+}
+
 // Semantic status colors used across inbox and timeline.
 object StatusColors {
     val running = Color(0xFF6FD3A7)

@@ -20,12 +20,15 @@ Relay 管理员先在后台创建用户邀请。用户通过邀请在 Android �
 - 一个 Relay 账号可绑定多台 Windows Host 和多部 Android 手机。
 - 首页聚合全部电脑的 Codex 任务，也可按电脑筛选在线状态和任务。
 - 读取历史、创建任务、续写原任务、实时同步回复（Markdown 渲染）和查看原生 diff；收件箱按项目分组并支持未读角标。
-- 新建任务默认走 Bridge 模式（Host 的 codex app-server 执行）：兼容 cc-switch 等第三方模型通道，支持从手机审批、回答提问、中断，可选原生 Plan 模式（先规划不动文件）与持久任务目标；任务同样出现在 Codex Desktop 列表中。也可选择创建真实 Desktop 任务（需要官方模型通道）。
+- 新建任务默认走 Bridge 模式（Host 的 codex app-server 执行）：兼容 cc-switch 等第三方模型通道，支持从手机审批、回答提问、中断，可选原生 Plan 模式（先规划不动文件）、持久任务目标，以及端到端加密的图片/小文件附件；任务同样出现在 Codex Desktop 列表中。也可选择创建真实 Desktop 任务（需要官方模型通道），并通过 Host 临时文件路径附加图片或小文件。
+- 首页显示 Host 与 Codex Desktop 的真实运行状态；Desktop 未启动时可从手机请求 Windows Host 唤起固定的 Codex Desktop 应用。
 - 新手机需要可信手机批准；Host 使用五分钟二维码绑定。
 - 任务正文、提示词、代码和命令使用端到端加密，Relay 只保存路由元数据和密文。
 - Android 和 Windows Host 都支持签名更新；Host 有活动任务时不会强制替换。
 
 Desktop 原生任务的硬中断、原生审批响应和结构化问题回答目前没有稳定插件接口。Agent Pocket 不会启动第二个 writer、删除锁或模拟坐标点击来强抢任务。
+
+Android v0.3 的界面方向和附件交互见 [视觉原型](docs/prototypes/agent-pocket-v03-overview.png)。Codex 已接入；Grok 与 Kimi Code 目前只展示能力边界，不会伪装成可用状态。
 
 ## 架构
 

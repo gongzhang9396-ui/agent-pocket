@@ -1,9 +1,11 @@
 package com.agentpocket.app.data
 
+import android.net.Uri
 import com.agentpocket.app.data.model.ApprovalDecision
 import com.agentpocket.app.data.model.Device
 import com.agentpocket.app.data.model.DiffFile
 import com.agentpocket.app.data.model.Host
+import com.agentpocket.app.data.model.HostRuntime
 import com.agentpocket.app.data.model.ModelOption
 import com.agentpocket.app.data.model.Project
 import com.agentpocket.app.data.model.ThreadDetail
@@ -19,6 +21,7 @@ interface PocketRepository {
 
     val host: StateFlow<Host>
     val hosts: StateFlow<List<Host>>
+    val hostRuntimes: StateFlow<Map<String, HostRuntime>>
     val selectedHostId: StateFlow<String?>
     val device: StateFlow<Device>
     val accountDevices: StateFlow<List<Device>>
@@ -47,6 +50,9 @@ interface PocketRepository {
     fun openNotification(hostId: String, eventId: String, onResolved: (String?) -> Unit)
 
     fun refreshProjects()
+    fun refreshHostRuntime(hostId: String)
+    fun launchDesktop(hostId: String)
+    fun hostSupports(capability: String, hostId: String? = null): Boolean
 
     /** Manually re-runs the full sync pipeline (hosts, devices, snapshots, events, thread lists). */
     fun refreshAll()
@@ -75,7 +81,7 @@ interface PocketRepository {
      * first turn in Codex's native Plan collaboration mode (bridge only):
      * the model produces a plan document without touching files.
      */
-    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, onCreated: (String) -> Unit)
+    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, goal: String?, images: List<Uri>, files: List<Uri>, onCreated: (String) -> Unit)
 
     /** Reads the thread's persisted goal objective (bridge tasks only); null when unset. */
     fun threadGoal(threadId: String, onResult: (String?) -> Unit)
@@ -87,7 +93,7 @@ interface PocketRepository {
     fun clearThreadGoal(threadId: String, onResult: (String?) -> Unit)
 
     /** Appends a user steer message to a running turn. */
-    fun sendSteer(threadId: String, text: String)
+    fun sendSteer(threadId: String, text: String, planMode: Boolean = false, images: List<Uri> = emptyList(), files: List<Uri> = emptyList())
 
     fun interruptTurn(threadId: String)
     fun resolveApproval(threadId: String, requestId: String, decision: ApprovalDecision)

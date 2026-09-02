@@ -46,6 +46,8 @@ import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.data.model.ConnectionState
 import com.agentpocket.app.data.model.Device
+import com.agentpocket.app.ui.components.AgentBadge
+import com.agentpocket.app.ui.components.AgentRegistry
 import com.agentpocket.app.ui.components.ConnectionPill
 import com.agentpocket.app.ui.components.QrScannerButton
 import com.agentpocket.app.ui.components.SectionLabel
@@ -94,6 +96,27 @@ fun SettingsScreen(
                     Spacer(Modifier.height(10.dp))
                     InfoRow("地址", aggregateHost.wssUrl, mono = true)
                     InfoRow("状态", aggregateHost.lastSeen)
+                }
+            }
+
+            item(key = "agents", contentType = "card") {
+                SettingsCard {
+                    SectionLabel("编程 Agent")
+                    Spacer(Modifier.height(8.dp))
+                    AgentRegistry.all.forEachIndexed { index, agent ->
+                        if (index > 0) HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(agent.displayName, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    agent.capabilities,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            AgentBadge(agent)
+                        }
+                    }
                 }
             }
 
@@ -249,7 +272,7 @@ fun SettingsScreen(
                     Spacer(Modifier.height(8.dp))
                     InfoRow("版本", BuildConfig.VERSION_NAME)
                     Text(
-                        "Agent Pocket · 多电脑 Codex 私有移动控制台",
+                        "Agent Pocket · 多电脑、多 Agent 远程编程控制台",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

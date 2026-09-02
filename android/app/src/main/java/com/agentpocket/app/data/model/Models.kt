@@ -14,6 +14,16 @@ data class Host(
     val encryptionPublicKey: String = "",
 )
 
+enum class DesktopRuntimeState { Ready, Starting, Closed, Unavailable }
+
+data class HostRuntime(
+    val hostId: String,
+    val desktopState: DesktopRuntimeState = DesktopRuntimeState.Unavailable,
+    val attachReady: Boolean = false,
+    val processRunning: Boolean = false,
+    val canWake: Boolean = false,
+)
+
 data class Device(
     val id: String,
     val name: String,

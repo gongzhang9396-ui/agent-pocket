@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,6 +25,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -35,10 +37,12 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -59,12 +63,15 @@ import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadSummary
 import com.agentpocket.app.data.threadSections
+import com.agentpocket.app.ui.components.AgentBadge
+import com.agentpocket.app.ui.components.AgentRegistry
 import com.agentpocket.app.ui.components.ConnectionPill
+import com.agentpocket.app.ui.components.HostRuntimeCard
 import com.agentpocket.app.ui.components.ThreadStatusChip
 import com.agentpocket.app.ui.theme.AgentPocketTheme
 import com.agentpocket.app.ui.theme.StatusColors
 
-/** 会话收件箱：默认落地页。区分运行中 / 待处理 / 已完成 / 空闲 / 桌面端运行中。 */
+/** 多电脑、多 Agent 的任务收件箱。当前线程来源均为 Codex。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun InboxScreen(
@@ -75,6 +82,7 @@ fun InboxScreen(
 ) {
     val host by repo.host.collectAsState()
     val hosts by repo.hosts.collectAsState()
+    val hostRuntimes by repo.hostRuntimes.collectAsState()
     val selectedHostId by repo.selectedHostId.collectAsState()
     val threads by repo.threads.collectAsState()
     val projects by repo.projects.collectAsState()
@@ -84,8 +92,17 @@ fun InboxScreen(
         threadSections(threads, showHost = selectedHostId == null, projects = projects)
     }
     var collapsedSections by rememberSaveable { mutableStateOf(arrayListOf<String>()) }
+    var agentFilter by rememberSaveable { mutableStateOf("all") }
     val desktopCount = threads.count { it.status == ThreadStatus.DesktopOwned }
     val externalCount = threads.count { it.status == ThreadStatus.ExternalBusy }
+    val runningCount = threads.count { it.status == ThreadStatus.Active }
+    val attentionCount = threads.count { it.status == ThreadStatus.NeedsAttention }
+    val unreadCount = threads.sumOf { it.unreadCount }
+    val selectedHost = hosts.firstOrNull { it.id == selectedHostId }
+
+    LaunchedEffect(selectedHostId, selectedHost?.connectionState) {
+        if (selectedHost?.connectionState == ConnectionState.Connected) repo.refreshHostRuntime(selectedHost.id)
+    }
 
     Scaffold(
         topBar = {
@@ -147,6 +164,49 @@ fun InboxScreen(
                     ),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
+                    selectedHost?.let { item ->
+                        item(key = "runtime:${item.id}", contentType = "dashboard") {
+                            HostRuntimeCard(
+                                hostName = item.name,
+                                hostOnline = item.connectionState == ConnectionState.Connected,
+                                runtime = hostRuntimes[item.id],
+                                onRefresh = { repo.refreshHostRuntime(item.id) },
+                                onLaunch = { repo.launchDesktop(item.id) },
+                            )
+                        }
+                    }
+                    if (threads.isNotEmpty()) {
+                        item(key = "stats", contentType = "dashboard") {
+                            StatsRow(runningCount, attentionCount, unreadCount)
+                        }
+                    }
+                    item(key = "agent-filter", contentType = "filter") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            FilterChip(
+                                selected = agentFilter == "all",
+                                onClick = { agentFilter = "all" },
+                                label = { Text("全部 Agent") },
+                            )
+                            AgentRegistry.all.forEach { agent ->
+                                FilterChip(
+                                    selected = agentFilter == agent.kind.id,
+                                    onClick = { if (agent.available) agentFilter = agent.kind.id },
+                                    enabled = agent.available,
+                                    label = {
+                                        Text(
+                                            if (agent.available) agent.displayName else "${agent.displayName} · 即将接入",
+                                            maxLines = 1,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                    }
                     item(key = "host-filter", contentType = "filter") {
                         Row(
                             modifier = Modifier
@@ -174,13 +234,16 @@ fun InboxScreen(
                         }
                     }
                     if (desktopCount > 0) {
-                        item(key = "desktop-attached", contentType = "banner") {
-                            DesktopAttachedBanner(desktopCount)
+                        item(key = "desktop-attached", contentType = "notice") {
+                            SlimNotice("$desktopCount 个任务由 Codex Desktop 持有，可从手机续写；中断与审批仍在电脑端处理。")
                         }
                     }
                     if (externalCount > 0) {
-                        item(key = "external-warning", contentType = "banner") {
-                            ExternalBusyBanner(externalCount)
+                        item(key = "external-warning", contentType = "notice") {
+                            SlimNotice(
+                                "$externalCount 个会话被桌面端进程占用，未通过 Desktop Attach 确认，移动端仅可查看。",
+                                warning = true,
+                            )
                         }
                     }
                     if (threads.isEmpty()) {
@@ -219,6 +282,52 @@ fun InboxScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun StatsRow(running: Int, attention: Int, unread: Int) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        StatPill("运行中 $running", StatusColors.running, Modifier.weight(1f))
+        StatPill("待处理 $attention", StatusColors.attention, Modifier.weight(1f))
+        StatPill("未读 $unread", MaterialTheme.colorScheme.primary, Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun StatPill(label: String, color: androidx.compose.ui.graphics.Color, modifier: Modifier = Modifier) {
+    Surface(modifier = modifier, shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surface) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = color,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+        )
+    }
+}
+
+@Composable
+private fun SlimNotice(text: String, warning: Boolean = false) {
+    val color = if (warning) StatusColors.external else MaterialTheme.colorScheme.onSurfaceVariant
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = StatusColors.external.copy(alpha = if (warning) 0.10f else 0.06f),
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                if (warning) Icons.Filled.WarningAmber else Icons.Filled.DesktopWindows,
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(text, style = MaterialTheme.typography.labelSmall, color = color)
         }
     }
 }
@@ -280,57 +389,12 @@ private fun ProjectHeader(section: ThreadSection, collapsed: Boolean, onToggle: 
 }
 
 @Composable
-private fun DesktopAttachedBanner(count: Int) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = StatusColors.external.copy(alpha = 0.10f)),
-        shape = RoundedCornerShape(12.dp),
-    ) {
-        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Filled.DesktopWindows, contentDescription = null, tint = StatusColors.external, modifier = Modifier.width(18.dp))
-            Spacer(Modifier.width(10.dp))
-            Column {
-                Text("已附着 $count 个 Codex Desktop 任务", style = MaterialTheme.typography.labelMedium, color = StatusColors.external)
-                Text("可从手机继续发送；中断与审批暂时仍在电脑端处理。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ExternalBusyBanner(count: Int) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = StatusColors.external.copy(alpha = 0.10f)),
-        shape = RoundedCornerShape(12.dp),
-    ) {
-        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                Icons.Filled.DesktopWindows,
-                contentDescription = null,
-                tint = StatusColors.external,
-                modifier = Modifier.width(18.dp),
-            )
-            Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
-                    "有 $count 个会话正在桌面端 Codex 中运行",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = StatusColors.external,
-                )
-                Text(
-                    "该任务未通过 Desktop Attach 确认，无法从移动端发送或强制接管。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun ThreadCard(thread: ThreadSummary, showHost: Boolean, onClick: () -> Unit) {
     Card(onClick = onClick, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                AgentBadge(AgentRegistry.codex)
+                Spacer(Modifier.width(6.dp))
                 ThreadStatusChip(thread.status)
                 Spacer(Modifier.weight(1f))
                 Text(

@@ -1,5 +1,6 @@
 package com.agentpocket.app.data
 
+import android.net.Uri
 import com.agentpocket.app.data.model.ApprovalDecision
 import com.agentpocket.app.data.model.CommandStatus
 import com.agentpocket.app.data.model.ConnectionState
@@ -10,6 +11,8 @@ import com.agentpocket.app.data.model.DiffHunk
 import com.agentpocket.app.data.model.DiffLine
 import com.agentpocket.app.data.model.DiffLineKind
 import com.agentpocket.app.data.model.Host
+import com.agentpocket.app.data.model.HostRuntime
+import com.agentpocket.app.data.model.DesktopRuntimeState
 import com.agentpocket.app.data.model.MessageStatus
 import com.agentpocket.app.data.model.ModelOption
 import com.agentpocket.app.data.model.PlanStatus
@@ -45,6 +48,17 @@ object MockPocketRepository : PocketRepository {
     )
     override val host: StateFlow<Host> = _host.asStateFlow()
     override val hosts: StateFlow<List<Host>> = MutableStateFlow(listOf(_host.value)).asStateFlow()
+    override val hostRuntimes: StateFlow<Map<String, HostRuntime>> = MutableStateFlow(
+        mapOf(
+            _host.value.id to HostRuntime(
+                hostId = _host.value.id,
+                desktopState = DesktopRuntimeState.Ready,
+                attachReady = true,
+                processRunning = true,
+                canWake = false,
+            ),
+        ),
+    ).asStateFlow()
     override val selectedHostId: StateFlow<String?> = MutableStateFlow<String?>(_host.value.id).asStateFlow()
 
     private val _device = MutableStateFlow(
@@ -557,6 +571,9 @@ object MockPocketRepository : PocketRepository {
     private var createdCount = 0
 
     override fun refreshProjects() = Unit
+    override fun refreshHostRuntime(hostId: String) = Unit
+    override fun launchDesktop(hostId: String) = Unit
+    override fun hostSupports(capability: String, hostId: String?): Boolean = true
     override fun refreshAll() = Unit
     override fun refreshThread(threadId: String) = Unit
     override fun setActiveThread(threadId: String?) = Unit
@@ -573,6 +590,9 @@ object MockPocketRepository : PocketRepository {
         prompt: String,
         target: String,
         planMode: Boolean,
+        goal: String?,
+        images: List<Uri>,
+        files: List<Uri>,
         onCreated: (String) -> Unit,
     ) {
         createdCount += 1
@@ -625,7 +645,7 @@ object MockPocketRepository : PocketRepository {
         onCreated(id)
     }
 
-    override fun sendSteer(threadId: String, text: String) {
+    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>) {
         updateDetail(threadId) { detail ->
             val n = detail.items.size
             detail.copy(

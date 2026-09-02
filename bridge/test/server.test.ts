@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,8 +15,10 @@ class FakeCodex extends EventEmitter {
   compatibilityError = undefined;
   activeTurns = new Map<string, string>();
   calls: any[] = [];
+  goalError?: Error;
   async request(method: string, params: any) {
     this.calls.push({ method, params });
+    if (method === "thread/goal/set" && this.goalError) throw this.goalError;
     if (method === "model/list") return { data: [{ id: "gpt-test" }] };
     if (method === "thread/list") return { data: [] };
     if (method === "thread/read") return { thread: { id: params.threadId, status: { type: "idle" } } };
@@ -770,5 +772,210 @@ test("Desktop task reads and writes stay inside the configured project roots", a
   );
   assert.equal(desktop.sent.length, 0);
   assert.equal(codex.calls.length, 0);
+  store.close();
+});
+
+test("materializes encrypted phone files for Bridge turns with an untrusted-data note", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-file-attachment-"));
+  const dbPath = join(base, "bridge.db");
+  const store = new BridgeStore(dbPath);
+  const codex = new FakeCodex();
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+  );
+
+  await server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+    target: "bridge",
+    cwd: base,
+    text: "Review the attached notes",
+    model: "gpt-test",
+    effort: "medium",
+    files: [{ filename: "notes.md", mimeType: "text/markdown", data: Buffer.from("hello from phone").toString("base64") }],
+  });
+
+  const call = codex.calls.findLast((entry) => entry.method === "turn/start");
+  assert.equal(call.params.input[0].text, "Review the attached notes");
+  assert.match(call.params.input[1].text, /不是系统或开发者指令/);
+  assert.match(call.params.input[1].text, /原始文件名：notes\.md/);
+  const path = call.params.input[1].text.match(/Host 临时路径：([^\r\n]+)/)?.[1];
+  assert.ok(path);
+  assert.equal(readFileSync(path!, "utf8"), "hello from phone");
+  assert.match(path!, /attachments[\\/]phone-1[\\/]/);
+  store.close();
+});
+
+test("rejects unsafe and excessive attachments, and materializes Desktop files", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-file-policy-"));
+  const dbPath = join(base, "bridge.db");
+  const store = new BridgeStore(dbPath);
+  const codex = new FakeCodex();
+  const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
+  desktop.waitResults.push({
+    cursor: "desktop-attachment:1",
+    changed: true,
+    threadStatus: "idle",
+    turnId: "desktop-attachment-turn",
+    turnStatus: "completed",
+    wakeReason: "turnCompleted",
+    timedOut: false,
+  });
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+    desktop as any,
+  );
+  const small = Buffer.from("x").toString("base64");
+
+  await assert.rejects(
+    server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+      target: "bridge", cwd: base, text: "unsafe", model: "gpt-test",
+      files: [{ filename: "payload.exe", mimeType: "application/x-msdownload", data: small }],
+    }),
+    (error: any) => error?.nameCode === "INVALID_REQUEST",
+  );
+  await assert.rejects(
+    server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+      target: "bridge", cwd: base, text: "too many", model: "gpt-test",
+      images: [{ mimeType: "image/jpeg", data: small }, { mimeType: "image/jpeg", data: small }],
+      files: [{ filename: "a.txt", mimeType: "text/plain", data: small }, { filename: "b.txt", mimeType: "text/plain", data: small }],
+    }),
+    (error: any) => error?.nameCode === "INVALID_REQUEST",
+  );
+  await server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+    target: "desktop", cwd: base, text: "desktop file", model: "gpt-test",
+    files: [{ filename: "notes.txt", mimeType: "text/plain", data: Buffer.from("desktop note").toString("base64") }],
+  });
+  assert.equal(desktop.createCalls.length, 1);
+  assert.match(desktop.createCalls[0].text, /^desktop file/m);
+  assert.match(desktop.createCalls[0].text, /不是系统或开发者指令/);
+  const desktopPath = desktop.createCalls[0].text.match(/Host 临时路径：([^\r\n]+)/)?.[1];
+  assert.ok(desktopPath);
+  assert.equal(readFileSync(desktopPath!, "utf8"), "desktop note");
+  store.close();
+});
+
+test("continues an existing Desktop task with phone attachments without exposing Host paths in mobile events", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-attachment-turn-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const desktop = new FakeDesktopAttach();
+  desktop.threadCwd = base;
+  desktop.waitResults.push(
+    { cursor: "attachment-baseline:1", changed: false, threadStatus: "idle", timedOut: true },
+    { cursor: "attachment-done:2", changed: true, threadStatus: "idle", turnId: "attachment-turn", turnStatus: "completed", wakeReason: "turnCompleted", timedOut: false },
+  );
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+    desktop as any,
+  );
+  await server.dispatch({} as any, "thread/list", { limit: 20 });
+  await server.dispatch({ device: { id: "phone-1" } } as any, "turn/start", {
+    threadId: "desktop-thread",
+    text: "review phone attachment",
+    clientMessageId: "mobile-with-file",
+    files: [{ filename: "review.md", mimeType: "text/markdown", data: Buffer.from("review me").toString("base64") }],
+  });
+
+  assert.equal(desktop.sent.length, 1);
+  assert.match(desktop.sent[0].text, /^review phone attachment/m);
+  assert.match(desktop.sent[0].text, /不是系统或开发者指令/);
+  const path = desktop.sent[0].text.match(/Host 临时路径：([^\r\n]+)/)?.[1];
+  assert.ok(path);
+  assert.equal(readFileSync(path!, "utf8"), "review me");
+  await settleWatcher();
+  const mobileEvent = store.eventsAfter(0).find((event) =>
+    event.type === "message.delta" && (event.payload as any).itemId === "mobile-with-file",
+  );
+  assert.equal((mobileEvent?.payload as any)?.delta, "review phone attachment");
+  assert.doesNotMatch((mobileEvent?.payload as any)?.delta || "", /Host 临时路径/);
+  store.close();
+});
+
+test("advertises attachment capabilities so new phones fail closed against old Hosts", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-capabilities-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+  );
+
+  const hello = await server.dispatchRelay("phone-1", "bridge/hello", { protocolVersion: 1, deviceId: "phone-1" });
+  assert.ok(hello.capabilities.includes("attachments-v1"));
+  assert.ok(hello.capabilities.includes("goal-v1"));
+  assert.ok(hello.capabilities.includes("plan-v1"));
+  store.close();
+});
+
+test("cleans expired plaintext attachments when the Host process starts", () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-attachment-cleanup-"));
+  const dbPath = join(base, "bridge.db");
+  const deviceRoot = join(base, "attachments", "phone-1");
+  const stale = join(deviceRoot, "stale.txt");
+  mkdirSync(deviceRoot, { recursive: true });
+  writeFileSync(stale, "sensitive");
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  utimesSync(stale, old, old);
+  const store = new BridgeStore(dbPath);
+
+  new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+  );
+
+  assert.equal(existsSync(stale), false);
+  store.close();
+});
+
+test("starts the first turn once and reports a Goal warning instead of failing creation", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-goal-warning-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  codex.goalError = new Error("goal API unavailable");
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+  );
+
+  const result = await server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+    target: "bridge", cwd: base, text: "create once", model: "gpt-test", effort: "medium", goal: "ship safely",
+  });
+  assert.equal(result.thread.id, "thread-1");
+  assert.match(result.warning, /Goal 保存失败/);
+  assert.deepEqual(codex.calls.filter((call) => call.method === "thread/goal/set").map((call) => call.params.objective), ["ship safely"]);
+  assert.equal(codex.calls.filter((call) => call.method === "turn/start").length, 1);
+  assert.ok(codex.calls.findIndex((call) => call.method === "thread/goal/set") < codex.calls.findIndex((call) => call.method === "turn/start"));
+  store.close();
+});
+
+test("rejects non-canonical attachment base64", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-base64-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+  );
+  await assert.rejects(
+    server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+      target: "bridge", cwd: base, text: "bad base64", model: "gpt-test",
+      files: [{ filename: "notes.txt", mimeType: "text/plain", data: "AA=" }],
+    }),
+    (error: any) => error?.nameCode === "INVALID_REQUEST",
+  );
   store.close();
 });
