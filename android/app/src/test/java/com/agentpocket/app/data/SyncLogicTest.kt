@@ -7,7 +7,10 @@ import com.agentpocket.app.data.model.PlanStep
 import com.agentpocket.app.data.model.Role
 import com.agentpocket.app.data.model.StepStatus
 import com.agentpocket.app.data.model.TimelineItem
+import java.net.SocketTimeoutException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SyncLogicTest {
@@ -31,6 +34,24 @@ class SyncLogicTest {
     @Test
     fun missingEventReportsGapWithoutRewind() {
         assertEquals(EventSeqDecision.Gap, eventSeqDecision(lastSeq = 5, seq = 7))
+    }
+
+    @Test
+    fun archiveMarkersAreFilteredDefensively() {
+        assertEquals(true, isArchivedThread(archived = true, isArchived = null, archivedAtPresent = false))
+        assertEquals(true, isArchivedThread(archived = null, isArchived = true, archivedAtPresent = false))
+        assertEquals(true, isArchivedThread(archived = false, isArchived = false, archivedAtPresent = true))
+        assertEquals(false, isArchivedThread(archived = false, isArchived = false, archivedAtPresent = false))
+    }
+
+    @Test
+    fun transportAndChannelFailuresAreTransient() {
+        assertTrue(isTransientConnectionFailure(SocketTimeoutException("pong timeout")))
+        assertTrue(isTransientConnectionFailure(BridgeRpcException("closed", CONNECTION_LOST_CODE)))
+        assertTrue(isTransientConnectionFailure(BridgeRpcException("channel closed", CHANNEL_CLOSED_CODE)))
+        assertTrue(isTransientConnectionFailure(BridgeRpcException("channel timeout", CHANNEL_TIMEOUT_CODE)))
+        assertTrue(isTransientConnectionFailure(BridgeRpcException("hello required", HELLO_REQUIRED_CODE)))
+        assertFalse(isTransientConnectionFailure(BridgeRpcException("bad request", "INVALID_PARAMS")))
     }
 
     @Test
@@ -73,5 +94,13 @@ class SyncLogicTest {
         val merged = mergeTimelineItems(server, existing)
         assertEquals(1, merged.size)
         assertEquals("服务器版本", (merged.single() as TimelineItem.Message).text)
+    }
+
+    @Test
+    fun completedEventArrivingDuringRefreshIsNotOverwritten() {
+        val live = TimelineItem.Message("m2", Role.Assistant, "刚完成的回复", MessageStatus.Done)
+        val stale = TimelineItem.Message("m2", Role.Assistant, "较旧回复", MessageStatus.Done)
+        val merged = mergeTimelineItems(server = listOf(stale), existing = listOf(live), baseline = emptyList())
+        assertEquals(listOf(live), merged)
     }
 }

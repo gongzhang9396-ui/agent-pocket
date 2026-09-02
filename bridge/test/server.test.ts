@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 import { WebSocket } from "ws";
 import { BridgeServer } from "../src/server.ts";
@@ -554,7 +554,7 @@ test("creates new tasks through Codex Desktop without app-server fallback", asyn
   store.close();
 });
 
-test("Desktop watcher falls back to one targeted sync event when wait fails", async () => {
+test("Desktop watcher requests one correction and recovers after a transient wait failure", async () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-desktop-wait-fallback-"));
   const store = new BridgeStore(join(base, "bridge.db"));
   const desktop = new FakeDesktopAttach();
@@ -562,6 +562,7 @@ test("Desktop watcher falls back to one targeted sync event when wait fails", as
   desktop.waitResults.push(
     { cursor: "baseline:1", changed: false, threadStatus: "idle", timedOut: true },
     new Error("wait schema changed and included secret text"),
+    { cursor: "done:2", changed: true, threadStatus: "idle", turnId: "turn-2", turnStatus: "completed", wakeReason: "turnCompleted", timedOut: false },
   );
   const server = new BridgeServer(
     { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
@@ -576,9 +577,10 @@ test("Desktop watcher falls back to one targeted sync event when wait fails", as
   assert.equal(result.liveSync, true);
   await settleWatcher();
   const events = store.eventsAfter(0).filter((event) => event.type === "sync.required");
-  assert.equal(events.length, 1);
-  assert.equal((events[0].payload as any).reason, "desktop-wait-fallback");
-  assert.equal(JSON.stringify(events[0]).includes("secret text"), false);
+  assert.equal(events.length, 2);
+  assert.equal(events.filter((event) => (event.payload as any).reason === "desktop-wait-fallback").length, 1);
+  assert.equal(events.some((event) => (event.payload as any).reason === "desktop-wait"), true);
+  assert.equal(JSON.stringify(events).includes("secret text"), false);
   assert.equal(server.desktopWatchers.size, 0);
   store.close();
 });
@@ -778,10 +780,11 @@ test("Desktop task reads and writes stay inside the configured project roots", a
 test("materializes encrypted phone files for Bridge turns with an untrusted-data note", async () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-file-attachment-"));
   const dbPath = join(base, "bridge.db");
+  const attachmentsPath = join(base, "custom-attachments");
   const store = new BridgeStore(dbPath);
   const codex = new FakeCodex();
   const server = new BridgeServer(
-    { bindHost: "127.0.0.1", port: 0, dbPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    { bindHost: "127.0.0.1", port: 0, dbPath, attachmentsPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
     store,
     codex as any,
     { send: async () => {} } as any,
@@ -803,7 +806,7 @@ test("materializes encrypted phone files for Bridge turns with an untrusted-data
   const path = call.params.input[1].text.match(/Host 临时路径：([^\r\n]+)/)?.[1];
   assert.ok(path);
   assert.equal(readFileSync(path!, "utf8"), "hello from phone");
-  assert.match(path!, /attachments[\\/]phone-1[\\/]/);
+  assert.equal(path!.startsWith(join(attachmentsPath, "phone-1") + sep), true);
   store.close();
 });
 
@@ -919,8 +922,9 @@ test("advertises attachment capabilities so new phones fail closed against old H
 test("cleans expired plaintext attachments when the Host process starts", () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-attachment-cleanup-"));
   const dbPath = join(base, "bridge.db");
-  const deviceRoot = join(base, "attachments", "phone-1");
-  const stale = join(deviceRoot, "stale.txt");
+  const attachmentsPath = join(base, "custom-attachments");
+  const deviceRoot = join(attachmentsPath, "phone-1");
+  const stale = join(deviceRoot, "00000000-0000-4000-8000-000000000001.txt");
   mkdirSync(deviceRoot, { recursive: true });
   writeFileSync(stale, "sensitive");
   const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
@@ -928,7 +932,7 @@ test("cleans expired plaintext attachments when the Host process starts", () => 
   const store = new BridgeStore(dbPath);
 
   new BridgeServer(
-    { bindHost: "127.0.0.1", port: 0, dbPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    { bindHost: "127.0.0.1", port: 0, dbPath, attachmentsPath, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
     store,
     new FakeCodex() as any,
     { send: async () => {} } as any,
@@ -936,6 +940,45 @@ test("cleans expired plaintext attachments when the Host process starts", () => 
 
   assert.equal(existsSync(stale), false);
   store.close();
+});
+
+test("refuses shared or linked attachment directories without deleting user files", () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-attachment-boundary-"));
+  const shared = join(base, "shared");
+  const personalFile = join(shared, "keep.txt");
+  mkdirSync(shared);
+  writeFileSync(personalFile, "keep me");
+  const sharedStore = new BridgeStore(join(base, "shared.db"));
+  const sharedServer = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "shared.db"), attachmentsPath: shared, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    sharedStore,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+  );
+  assert.throws(
+    () => sharedServer.materializeAttachments("phone-1", [{ mimeType: "image/jpeg", bytes: Buffer.from("image") }], []),
+    (error: any) => error?.nameCode === "PATH_DENIED",
+  );
+  assert.equal(readFileSync(personalFile, "utf8"), "keep me");
+  sharedStore.close();
+
+  const outside = join(base, "outside");
+  const linked = join(base, "linked");
+  mkdirSync(outside);
+  symlinkSync(outside, linked, process.platform === "win32" ? "junction" : "dir");
+  const linkedStore = new BridgeStore(join(base, "linked.db"));
+  const linkedServer = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "linked.db"), attachmentsPath: linked, codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    linkedStore,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+  );
+  assert.throws(
+    () => linkedServer.materializeAttachments("phone-1", [{ mimeType: "image/jpeg", bytes: Buffer.from("image") }], []),
+    (error: any) => error?.nameCode === "PATH_DENIED",
+  );
+  assert.deepEqual(readdirSync(outside), []);
+  linkedStore.close();
 });
 
 test("starts the first turn once and reports a Goal warning instead of failing creation", async () => {
@@ -958,6 +1001,79 @@ test("starts the first turn once and reports a Goal warning instead of failing c
   assert.deepEqual(codex.calls.filter((call) => call.method === "thread/goal/set").map((call) => call.params.objective), ["ship safely"]);
   assert.equal(codex.calls.filter((call) => call.method === "turn/start").length, 1);
   assert.ok(codex.calls.findIndex((call) => call.method === "thread/goal/set") < codex.calls.findIndex((call) => call.method === "turn/start"));
+  store.close();
+});
+
+test("uses the selected model and full collaboration mode for Plan tasks", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-plan-create-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+  );
+
+  await server.dispatch({ device: { id: "phone-1" } } as any, "thread/start", {
+    target: "bridge", cwd: base, text: "make a careful plan", model: "gpt-5.6-luna", effort: "high", mode: "plan",
+  });
+
+  assert.deepEqual(codex.calls.find((call) => call.method === "thread/start")?.params, {
+    cwd: base,
+    model: "gpt-5.6-luna",
+    approvalPolicy: "on-request",
+  });
+  assert.deepEqual(codex.calls.find((call) => call.method === "turn/start")?.params, {
+    threadId: "thread-1",
+    input: [{ type: "text", text: "make a careful plan" }],
+    model: "gpt-5.6-luna",
+    effort: "high",
+    collaborationMode: {
+      mode: "plan",
+      settings: {
+        model: "gpt-5.6-luna",
+        reasoning_effort: "high",
+        developer_instructions: null,
+      },
+    },
+  });
+  store.close();
+});
+
+test("requests only unarchived app-server tasks", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-active-list-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const codex = new FakeCodex();
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    codex as any,
+    { send: async () => {} } as any,
+  );
+
+  await server.dispatch({} as any, "thread/list", { limit: 25 });
+  assert.equal(codex.calls.find((call) => call.method === "thread/list")?.params.archived, false);
+  store.close();
+});
+
+test("requests a fresh Host snapshot when archive membership changes", () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-archive-event-"));
+  const store = new BridgeStore(join(base, "bridge.db"));
+  const server = new BridgeServer(
+    { bindHost: "127.0.0.1", port: 0, dbPath: join(base, "bridge.db"), codexHome: base, codexCommand: "fake", minCodexVersion: "1", projectRoots: [base], hostName: "h" },
+    store,
+    new FakeCodex() as any,
+    { send: async () => {} } as any,
+  );
+
+  server.onCodexNotification({ method: "thread/archived", params: { threadId: "thread-1" } });
+  server.onCodexNotification({ method: "thread/unarchived", params: { threadId: "thread-2" } });
+  const events = store.eventsAfter(0).filter((event) => event.type === "sync.required");
+  assert.deepEqual(events.map((event) => event.payload), [
+    { reason: "thread-list-changed", change: "archived" },
+    { reason: "thread-list-changed", change: "unarchived" },
+  ]);
   store.close();
 });
 

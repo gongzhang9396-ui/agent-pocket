@@ -40,6 +40,10 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+const SNAPSHOT_DEBOUNCE_MS = 1_000;
+const SNAPSHOT_RETRY_MS = 15_000;
+const SNAPSHOT_REFRESH_MS = 60_000;
+
 function eventType(event: BridgeEvent): "attention" | "completed" | "status" {
   if (event.type === "approval.request" || event.type === "question.request") return "attention";
   if (event.type === "turn.status" && (event.payload as any)?.status === "completed") return "completed";
@@ -59,6 +63,7 @@ export class RelayConnector extends EventEmitter {
   private unsubscribeEvents?: () => void;
   private backoffTimer?: NodeJS.Timeout;
   private wakeBackoff?: () => void;
+  private snapshotTimer?: NodeJS.Timeout;
   readonly relayUrl: string;
   readonly identityPath: string;
   readonly identity: HostIdentity;
@@ -93,6 +98,8 @@ export class RelayConnector extends EventEmitter {
     this.stopped = true;
     this.unsubscribeEvents?.();
     this.unsubscribeEvents = undefined;
+    if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = undefined;
     this.socket?.close(1000, "Host stopping");
     this.connectingSocket?.terminate();
     this.wakeBackoff?.();
@@ -159,6 +166,8 @@ export class RelayConnector extends EventEmitter {
       await closed;
     } finally {
       clearInterval(heartbeat);
+      if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+      this.snapshotTimer = undefined;
       this.connected = false;
       this.channels.clear();
       if (this.socket === socket) this.socket = undefined;
@@ -270,9 +279,29 @@ export class RelayConnector extends EventEmitter {
 
   private enqueueEvent(event: BridgeEvent & { seq: number }) {
     if (!this.connected || event.seq <= this.identity.lastBridgeSeq) return;
+    this.scheduleSnapshot(SNAPSHOT_DEBOUNCE_MS);
     this.outbound = this.outbound.then(() => this.publishEvent(event)).catch((error) => {
       console.error("Relay event upload:", error instanceof Error ? error.message : error);
     });
+  }
+
+  /**
+   * Keep the Relay snapshot fresh even when Desktop Attach was not ready during
+   * the first upload. Event-driven refreshes are debounced; failures retry with
+   * a bounded delay, and the periodic refresh also catches archive changes that
+   * do not produce an app-server notification on older Codex versions.
+   */
+  private scheduleSnapshot(delayMs: number) {
+    if (this.stopped || !this.connected) return;
+    if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = setTimeout(() => {
+      this.snapshotTimer = undefined;
+      if (this.stopped || !this.connected) return;
+      this.outbound = this.outbound.then(() => this.sendSnapshot()).catch((error) => {
+        console.error("Relay snapshot queue:", error instanceof Error ? error.message : error);
+      });
+    }, delayMs);
+    this.snapshotTimer.unref?.();
   }
 
   private async syncBacklog() {
@@ -348,8 +377,10 @@ export class RelayConnector extends EventEmitter {
       this.identity.pendingSnapshot = { envelope };
       saveHostIdentity(this.identityPath, this.identity);
       await this.flushPendingSnapshot();
+      this.scheduleSnapshot(SNAPSHOT_REFRESH_MS);
     } catch (error) {
       console.error("Relay snapshot upload:", error instanceof Error ? error.message : error);
+      this.scheduleSnapshot(SNAPSHOT_RETRY_MS);
     }
   }
 }

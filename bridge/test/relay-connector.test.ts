@@ -70,6 +70,7 @@ test("Relay outbox reuses identical event and snapshot ciphertext after lost ack
     await (second as any).sendSnapshot();
     assert.equal(afterEventRestart.snapshotCounter, -1);
     assert.ok(afterEventRestart.pendingSnapshot);
+    assert.ok((second as any).snapshotTimer, "failed snapshots must schedule a retry");
 
     const afterSnapshotRestart = loadHostIdentity(identityPath)!;
     const third = new RelayConnector(identity.relayUrl, identityPath, afterSnapshotRestart, bridge, store);
@@ -83,6 +84,7 @@ test("Relay outbox reuses identical event and snapshot ciphertext after lost ack
     assert.deepEqual(secondSnapshotAttempts[0], firstSnapshotAttempts[0]);
     assert.equal(afterSnapshotRestart.snapshotCounter, 0);
     assert.equal(afterSnapshotRestart.pendingSnapshot, undefined);
+    clearTimeout((second as any).snapshotTimer);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

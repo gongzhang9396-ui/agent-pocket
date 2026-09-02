@@ -82,6 +82,7 @@ export function normalizeDesktopThreadList(response: any, search?: string) {
   const seen = new Set<string>();
   const data = rows.flatMap((thread: any) => {
     if (!thread || typeof thread !== "object" || thread.kind !== "codex") return [];
+    if (thread.archived === true || thread.isArchived === true || thread.archivedAt != null) return [];
     const id = typeof thread.id === "string" ? thread.id.trim() : "";
     if (!id || seen.has(id)) return [];
     seen.add(id);

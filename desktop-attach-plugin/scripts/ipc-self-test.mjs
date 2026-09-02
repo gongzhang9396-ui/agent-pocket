@@ -180,7 +180,7 @@ const child = spawn(process.execPath, [join(pluginRoot, "server.mjs")], {
     CODEX_APP_TOOLS_PIPE_PATH: desktopPipe,
     AGENT_POCKET_DESKTOP_HOST_PIPE: bridgeHostPipe,
     AGENT_POCKET_CODEX_QUEUE_DISABLED: "1",
-    CODEX_THREAD_ID: "",
+    CODEX_THREAD_ID: "caller-thread",
     CODEX_SESSION_ID: "",
   },
   stdio: ["pipe", "pipe", "pipe"],
@@ -221,17 +221,17 @@ let registration;
 let ordinaryChildStopped = false;
 try {
   await mcpRequest("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "self-test", version: "1" } });
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(existsSync(registrationPath), false);
+  registration = await waitForRegistration();
+  assert.equal(registration.hostMode, true);
+  assert.equal(registration.pipeName, bridgeHostPipe);
+  assert.notEqual(registration.pid, child.pid);
   const callerMeta = { "openai/threadId": "caller-thread" };
   const probe = await mcpRequest("tools/call", { name: "desktop_attach_probe", arguments: {}, _meta: callerMeta });
   const probeText = probe.content?.find((item) => item.type === "text")?.text;
   assert.equal(JSON.parse(probeText).ipcAvailable, true);
   await mcpRequest("tools/call", { name: "desktop_attach_list_tasks", arguments: { limit: 10 }, _meta: callerMeta });
-  registration = await waitForRegistration();
-  assert.equal(registration.hostMode, true);
-  assert.equal(registration.pipeName, bridgeHostPipe);
-  assert.notEqual(registration.pid, child.pid);
+  const registrationAfterProbe = await waitForRegistration();
+  assert.equal(registrationAfterProbe.instanceId, registration.instanceId);
 
   const firstBridge = await connectBridge(registration.pipeName);
   const firstBridgeRequest = bridgeRpc(firstBridge);
@@ -282,11 +282,14 @@ try {
     text: "preparing Desktop task",
     workspaceMode: "local",
   }), /still preparing/);
-  await assert.rejects(bridgeRequest("thread/create", {
+  const failedBootstrap = await bridgeRequest("thread/create", {
     cwd: desktopProjectPath,
     text: "failing Desktop task",
     workspaceMode: "local",
-  }), /created the task but failed to initialize it: synthetic Desktop startup failure/);
+  });
+  assert.equal(failedBootstrap.source, "desktop");
+  assert.equal(failedBootstrap.thread.id, "failed-created-thread");
+  assert.match(failedBootstrap.warning, /Desktop bootstrap turn failed/);
   await assert.rejects(bridgeRequest("thread/send", {
     threadId: "example-thread",
     text: "http websocket regression",
@@ -323,13 +326,14 @@ try {
   assert.equal(desktopCreateCount, 3);
   assert.equal(desktopReadCount, 2);
   assert.equal(desktopSendCount, 3);
-  assert.equal(desktopWaitCount, 5);
+  assert.equal(desktopWaitCount, 6);
   bridge.destroy();
   bridge = undefined;
   console.log(JSON.stringify({
     ok: true,
     detachedHostPid: registration.pid,
     ordinaryMcpPid: child.pid,
+    startedDuringInitialize: true,
     persistedAfterMcpExit: true,
     desktopCreateCount,
     desktopReadCount,

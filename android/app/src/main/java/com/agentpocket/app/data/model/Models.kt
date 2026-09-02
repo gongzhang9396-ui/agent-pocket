@@ -82,6 +82,8 @@ data class ThreadSummary(
     val hostName: String = "",
     /** Raw epoch seconds used for ordering; [updatedAt] is display-only. */
     val updatedAtEpoch: Long = 0,
+    /** Defensive marker for older Hosts or cached snapshots that include archived rows. */
+    val archived: Boolean = false,
 )
 
 enum class Role { User, Assistant, System }
@@ -158,6 +160,9 @@ data class ThreadDetail(
     val status: ThreadStatus,
     val items: List<TimelineItem>,
     val activeTurnId: String?,
+    val preview: String = "",
+    val loading: Boolean = false,
+    val loadError: String? = null,
 )
 
 enum class DiffFileStatus { Added, Modified, Deleted, Renamed }

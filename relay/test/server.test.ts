@@ -147,26 +147,33 @@ test("a stale Host close cannot evict its replacement connection", async () => {
   try {
     await request(oldHost, 1, "relay/hello", { protocolVersion: 2 });
     await request(phone, 1, "relay/hello", { protocolVersion: 2 });
+    const envelope = (channelId: string) => ({
+      accountId: owner.id,
+      hostId: ownedHost.host.id,
+      deviceId: ownerDevice.id,
+      channelId,
+      counter: 0,
+      kind: "channel.open",
+      ciphertext: `cipher-${channelId}`,
+    });
+    const deliveredToOldHost = nextNotification(oldHost, "channel/open");
+    await request(phone, 2, "channel/open", { envelope: envelope("stale-host-channel") });
+    await deliveredToOldHost;
     const oldClosed = new Promise<void>((resolve) => oldHost.once("close", () => resolve()));
     newHost = await opened(`${url}/ws/host`, ownedHost.hostToken);
     await request(newHost, 1, "relay/hello", { protocolVersion: 2 });
     await oldClosed;
 
-    const listed = await request(phone, 2, "host/list", {});
+    const listed = await request(phone, 3, "host/list", {});
     assert.equal(listed.find((item: any) => item.id === ownedHost.host.id)?.online, true);
-    const delivered = nextNotification(newHost, "channel/open");
-    await request(phone, 3, "channel/open", {
-      envelope: {
-        accountId: owner.id,
-        hostId: ownedHost.host.id,
-        deviceId: ownerDevice.id,
-        channelId: "replacement-channel",
-        counter: 0,
-        kind: "channel.open",
-        ciphertext: "replacement-handshake",
-      },
-    });
-    assert.equal((await delivered).envelope.channelId, "replacement-channel");
+    // All eight replacement channels fit only if the stale Host channel was
+    // removed during the swap; otherwise the final open hits the quota.
+    for (let index = 0; index < 8; index += 1) {
+      const channelId = `replacement-channel-${index}`;
+      const delivered = nextNotification(newHost, "channel/open");
+      await request(phone, 4 + index, "channel/open", { envelope: envelope(channelId) });
+      assert.equal((await delivered).envelope.channelId, channelId);
+    }
   } finally {
     oldHost.close();
     newHost?.close();

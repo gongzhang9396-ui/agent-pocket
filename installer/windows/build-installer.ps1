@@ -53,7 +53,18 @@ $archiveName = "node-v$NodeVersion-win-x64.zip"
 $archive = Join-Path $cache $archiveName
 $checksums = Join-Path $cache "SHASUMS256-$NodeVersion.txt"
 $base = "https://nodejs.org/dist/v$NodeVersion"
-Invoke-WebRequest -UseBasicParsing "$base/SHASUMS256.txt" -OutFile $checksums
+try {
+    Invoke-WebRequest -UseBasicParsing "$base/SHASUMS256.txt" -OutFile $checksums
+}
+catch {
+    # Some managed Windows networks terminate the legacy PowerShell HTTP stack
+    # mid-TLS while the system curl client remains usable. Keep the same HTTPS
+    # source and fail closed if neither client can download the checksum list.
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $curl) { throw }
+    & $curl.Source --fail --location --silent --show-error --retry 3 --output $checksums "$base/SHASUMS256.txt"
+    if ($LASTEXITCODE -ne 0) { throw "Downloading the Node.js checksum manifest failed with curl exit code $LASTEXITCODE." }
+}
 if (-not (Test-Path -LiteralPath $archive)) { Invoke-WebRequest -UseBasicParsing "$base/$archiveName" -OutFile $archive }
 $expected = (Get-Content -LiteralPath $checksums | Where-Object { $_ -match "\s+$([regex]::Escape($archiveName))$" } | Select-Object -First 1).Split(' ')[0]
 if (-not $expected) { throw 'Node.js checksum is missing from the official manifest.' }
@@ -101,6 +112,7 @@ New-Item -ItemType Directory -Force -Path $pluginStage | Out-Null
 Copy-AllowlistedFiles (Join-Path $repoRoot 'desktop-attach-plugin') $pluginStage @(
     '.codex-plugin\plugin.json',
     '.mcp.json',
+    'hooks\hooks.json',
     'server.mjs'
 )
 $scriptsStage = Join-Path $payload 'scripts'

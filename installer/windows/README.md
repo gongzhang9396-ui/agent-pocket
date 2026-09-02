@@ -18,9 +18,10 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 1. Relay 的完整 `https://` 地址；
 2. 一个或多个项目白名单根目录；
-3. 当前 Windows 用户已安装并登录 Codex Desktop。
+3. 手机附件在 Host 上的临时存储目录；
+4. 当前 Windows 用户已安装并登录 Codex Desktop。
 
-配置写入 `%LOCALAPPDATA%\AgentPocket\host-config.json`。Relay Host 身份、Bridge SQLite 和 Codex 历史也保存在该状态目录，卸载默认保留它们。
+配置写入 `%LOCALAPPDATA%\AgentPocket\host-config.json`。`attachmentsPath` 可以指向空间充足的其他本地磁盘；缺少该字段的旧配置仍使用 `%LOCALAPPDATA%\AgentPocket\attachments`。也可以直接为 Bridge 设置 `AGENT_POCKET_ATTACHMENTS_DIR`。附件是一小时有效的临时副本。Relay Host 身份、Bridge SQLite 和 Codex 历史仍保存在原状态目录，卸载默认保留它们。
 
 安装完成后，从开始菜单运行“绑定这台 Windows 电脑”，用已登录的 Android v2 扫描五分钟二维码并确认 Host 名称。绑定成功后 Host 任务会重启以加载新身份。
 

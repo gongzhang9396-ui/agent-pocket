@@ -146,6 +146,8 @@ test("normalizes Desktop task inbox without exposing non-Codex chats", () => {
         threads: [
           { id: "p1", kind: "codex", title: "Duplicate", summary: "ignored", cwd: "C:\\Projects", updatedAt: 9, status: "idle" },
           { id: "t1", kind: "codex", title: "Desktop task", summary: "latest", cwd: "C:\\Projects\\demo", updatedAt: 11, status: "active" },
+          { id: "a1", kind: "codex", title: "Archived", summary: "hidden", cwd: "C:\\Projects", updatedAt: 13, status: "idle", archived: true },
+          { id: "a2", kind: "codex", title: "Also archived", summary: "hidden", cwd: "C:\\Projects", updatedAt: 14, status: "idle", archivedAt: "2026-09-02T00:00:00Z" },
           { id: "c1", kind: "chatgpt", title: "Chat", summary: "not Codex", cwd: "", updatedAt: 12, status: "idle" },
         ],
       }),

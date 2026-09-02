@@ -1,6 +1,7 @@
 package com.agentpocket.app.data
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
@@ -19,9 +20,17 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 
-internal class BridgeRpcException(message: String, val nameCode: String? = null) : Exception(message)
+internal class BridgeRpcException(
+    message: String,
+    val nameCode: String? = null,
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
 private const val RPC_TIMEOUT_MS = 30_000L
+internal const val CONNECTION_LOST_CODE = "CONNECTION_LOST"
+internal const val CHANNEL_CLOSED_CODE = "CHANNEL_CLOSED"
+internal const val CHANNEL_TIMEOUT_CODE = "CHANNEL_TIMEOUT"
+internal const val HELLO_REQUIRED_CODE = "HELLO_REQUIRED"
 
 internal class BridgeRpcClient(
     private val http: OkHttpClient,
@@ -34,6 +43,7 @@ internal class BridgeRpcClient(
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<JsonElement>>()
     private val opened = CompletableDeferred<Unit>()
     private val closed = CompletableDeferred<Unit>()
+    private val finished = AtomicBoolean(false)
     private var socket: WebSocket? = null
 
     fun connect() {
@@ -52,11 +62,20 @@ internal class BridgeRpcClient(
         return try {
             withTimeout(RPC_TIMEOUT_MS) {
                 awaitOpen()
+                if (finished.get()) {
+                    throw BridgeRpcException("Bridge 连接已中断，正在自动恢复", CONNECTION_LOST_CODE)
+                }
                 val id = nextId.getAndIncrement()
                 val deferred = CompletableDeferred<JsonElement>()
                 requestId = id
                 response = deferred
                 pending[id] = deferred
+                // finish() sets the gate before draining pending. Recheck after
+                // registration so a call racing with disconnect cannot be orphaned.
+                if (finished.get()) {
+                    pending.remove(id, deferred)
+                    throw BridgeRpcException("Bridge 连接已中断，正在自动恢复", CONNECTION_LOST_CODE)
+                }
                 val message = buildJsonObject {
                     put("jsonrpc", "2.0")
                     put("id", id)
@@ -64,7 +83,7 @@ internal class BridgeRpcClient(
                     put("params", params)
                 }
                 if (socket?.send(message.toString()) != true) {
-                    throw BridgeRpcException("Bridge 连接已关闭")
+                    throw BridgeRpcException("Bridge 连接已中断，正在自动恢复", CONNECTION_LOST_CODE)
                 }
                 deferred.await()
             }
@@ -79,7 +98,7 @@ internal class BridgeRpcClient(
 
     fun close() {
         socket?.close(1000, "client closing")
-        finish(BridgeRpcException("Bridge 连接已关闭"))
+        finish(BridgeRpcException("Bridge 连接已中断，正在自动恢复", CONNECTION_LOST_CODE))
     }
 
     override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -126,10 +145,19 @@ internal class BridgeRpcClient(
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = finish(t)
 
     private fun finish(cause: Throwable?) {
-        val error = cause ?: BridgeRpcException("Bridge 连接已关闭")
+        if (!finished.compareAndSet(false, true)) return
+        // Transport failures (including OkHttp's ping timeout) are useful in
+        // diagnostics, but pending UI requests should receive a stable error
+        // code so the repository can retry them after reconnecting.
+        val error = when (cause) {
+            is BridgeRpcException -> cause
+            null -> BridgeRpcException("Bridge 连接已中断，正在自动恢复", CONNECTION_LOST_CODE)
+            else -> BridgeRpcException("Bridge 连接已中断，正在自动恢复", CONNECTION_LOST_CODE, cause)
+        }
         if (!opened.isCompleted) opened.completeExceptionally(error)
-        pending.values.forEach { it.completeExceptionally(error) }
+        val disconnectedCalls = pending.values.toList()
         pending.clear()
+        disconnectedCalls.forEach { it.completeExceptionally(error) }
         if (cause == null) closed.complete(Unit) else closed.completeExceptionally(cause)
     }
 }

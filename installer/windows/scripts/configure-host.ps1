@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallDir,
     [Parameter(Mandatory = $true)][string]$RelayUrl,
     [Parameter(Mandatory = $true)][string]$ProjectRoots,
+    [string]$AttachmentsPath = "$env:LOCALAPPDATA\AgentPocket\attachments",
     [string]$HostName = $env:COMPUTERNAME
 )
 $ErrorActionPreference = 'Stop'
@@ -15,13 +16,19 @@ $roots = @($ProjectRoots -split [IO.Path]::PathSeparator | Where-Object { $_ } |
     $resolved
 })
 if ($roots.Count -eq 0) { throw '至少需要一个项目根目录。' }
+if ([string]::IsNullOrWhiteSpace($AttachmentsPath) -or -not [IO.Path]::IsPathRooted($AttachmentsPath)) {
+    throw '附件临时目录必须是绝对路径。'
+}
+$attachmentsPath = [IO.Path]::GetFullPath($AttachmentsPath)
 $codex = Get-Command codex -ErrorAction SilentlyContinue
 if (-not $codex) { throw '没有找到 Codex CLI。请先安装并登录 Codex Desktop。' }
 $stateDir = Join-Path $env:LOCALAPPDATA 'AgentPocket'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+New-Item -ItemType Directory -Force -Path $attachmentsPath | Out-Null
 @{
     relayUrl = $uri.AbsoluteUri.TrimEnd('/')
     projectRoots = $roots
+    attachmentsPath = $attachmentsPath
     hostName = $HostName
     codexCommand = $codex.Source
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stateDir 'host-config.json') -Encoding UTF8

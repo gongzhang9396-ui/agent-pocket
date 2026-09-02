@@ -1,12 +1,13 @@
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
-import { basename, delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RpcError, ErrorName } from "./protocol.ts";
 
 export type BridgeConfig = {
   bindHost: string;
   port: number;
   dbPath: string;
+  attachmentsPath?: string;
   codexHome: string;
   codexCommand: string;
   minCodexVersion: string;
@@ -38,10 +39,15 @@ export function loadConfig(
   if (requireProjectRoots && roots.length === 0) {
     throw new Error("AGENT_POCKET_PROJECT_ROOTS 至少需要包含一个项目根目录");
   }
+  const dbPath = resolve(env.AGENT_POCKET_DB || join(local, "AgentPocket", "bridge.db"));
+  const attachmentsPath = resolve(
+    env.AGENT_POCKET_ATTACHMENTS_DIR?.trim() || join(dirname(dbPath), "attachments"),
+  );
   return {
     bindHost: "127.0.0.1",
     port: Number(env.AGENT_POCKET_PORT || 8787),
-    dbPath: resolve(env.AGENT_POCKET_DB || join(local, "AgentPocket", "bridge.db")),
+    dbPath,
+    attachmentsPath,
     codexHome: resolve(env.CODEX_HOME || join(homedir(), ".codex")),
     codexCommand: env.AGENT_POCKET_CODEX || "codex",
     minCodexVersion: env.AGENT_POCKET_MIN_CODEX || "0.150.0-alpha.8",

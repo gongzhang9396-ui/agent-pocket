@@ -30,6 +30,7 @@ const DEFAULT_BRIDGE_HOST_PIPE = "\\\\.\\pipe\\agent-pocket-desktop-attach-host"
 const BRIDGE_HOST_START_TIMEOUT_MS = 5_000;
 const BRIDGE_HOST_RPC_TIMEOUT_MS = 2_000;
 const IPC_PROTOCOL_VERSION = 1;
+const PLUGIN_VERSION = "0.1.8";
 const BRIDGE_HOST_MODE = process.argv.includes("--bridge-host");
 const SERVER_PATH = fileURLToPath(import.meta.url);
 const BRIDGE_CAPABILITIES = ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/wait"];
@@ -83,13 +84,14 @@ async function handleLine(line) {
   try {
     switch (message.method) {
       case "initialize":
+        startAutomaticBridgeHost();
         return writeResult(message.id, {
           protocolVersion: message.params?.protocolVersion || "2025-06-18",
           capabilities: { tools: {} },
           serverInfo: {
             name: "agent-pocket-desktop-attach",
             title: "Agent Pocket Desktop Attach",
-            version: "0.1.5",
+            version: PLUGIN_VERSION,
           },
           instructions: "Local Agent Pocket adapter. Its user-facing MCP tools are read-only; authenticated local Bridge IPC may list projects and create, read, or continue Codex Desktop tasks.",
         });
@@ -152,7 +154,9 @@ async function callTool(message) {
   const args = message.params?.arguments || {};
   const context = requestContext(message);
   if (context.threadId) {
-    if (!desktopHostThreadId) desktopHostThreadId = context.threadId;
+    // Request metadata carries the actual Codex task id. Prefer it over the
+    // legacy CODEX_SESSION_ID fallback before starting or reusing the host.
+    desktopHostThreadId = context.threadId;
     await ensureBridgeHost();
   }
 
@@ -601,6 +605,14 @@ function shutdown(exitCode = 0) {
   stopBridgeIpc();
   host?.close();
   process.exit(exitCode);
+}
+
+function startAutomaticBridgeHost() {
+  if (BRIDGE_HOST_MODE || !process.env[PIPE_ENV]?.trim() || !process.env.CODEX_THREAD_ID?.trim()) return;
+  // SessionStart can race MCP startup. Initialization is an independent,
+  // best-effort trigger only when Desktop supplied a real task id; a later
+  // hook or explicit probe remains the retry path.
+  void ensureBridgeHost().catch(() => undefined);
 }
 
 function ensureBridgeHost() {

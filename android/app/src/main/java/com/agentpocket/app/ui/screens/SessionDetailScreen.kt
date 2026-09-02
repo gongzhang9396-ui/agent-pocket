@@ -277,6 +277,43 @@ fun SessionDetailScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
             state = listState,
         ) {
+            if (detail.items.isEmpty()) {
+                item(key = "__agent_pocket_thread_empty__", contentType = "empty") {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text(
+                                if (detail.loading || refreshing) "正在读取任务内容…" else "暂时没有可显示的任务内容",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            detail.preview.takeIf { it.isNotBlank() }?.let { preview ->
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    preview,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            detail.loadError?.let { error ->
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                            if (!detail.loading && !refreshing) {
+                                TextButton(onClick = { repo.refreshThread(threadId) }) {
+                                    Text("重新加载")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             itemsIndexed(
                 detail.items,
                 key = { index, item ->

@@ -48,6 +48,8 @@ function request(method, params = {}) {
 
 try {
   await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "non-desktop-test", version: "1" } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(existsSync(registrationPath), false);
   const result = await request("tools/call", { name: "desktop_attach_probe", arguments: {} });
   const text = result.content.find((item) => item.type === "text")?.text;
   const payload = JSON.parse(text);

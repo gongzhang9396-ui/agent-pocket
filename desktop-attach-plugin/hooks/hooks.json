@@ -1,0 +1,20 @@
+{
+  "description": "Start Agent Pocket Desktop Attach when a Codex Desktop task starts or resumes.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume|clear)$",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "agent_pocket_desktop_attach",
+            "tool": "desktop_attach_probe",
+            "input": {},
+              "timeout": 12,
+            "statusMessage": "Connecting Agent Pocket to Codex Desktop"
+          }
+        ]
+      }
+    ]
+  }
+}

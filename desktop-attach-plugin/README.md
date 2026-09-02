@@ -6,7 +6,7 @@ This directory is the public source distribution. Runtime registration files, pi
 
 ## Development installation
 
-This experimental plugin is currently distributed as source rather than as a public one-click Marketplace package. Open the cloned Agent Pocket repository in Codex Desktop and ask Codex to use its built-in `plugin-creator` to install this directory as `agent-pocket-desktop-attach` in the local personal marketplace. Do not edit `marketplace.json` by hand. Verify the result with `codex plugin list`, then start a new task so Codex Desktop loads the installed version. See the [official Codex plugin commands](https://developers.openai.com/codex/developer-commands#plugins).
+This experimental plugin is currently distributed as source rather than as a public one-click Marketplace package. Open the cloned Agent Pocket repository in Codex Desktop and ask Codex to use its built-in `plugin-creator` to install this directory as `agent-pocket-desktop-attach` in the local personal marketplace. Do not edit `marketplace.json` by hand. Verify the result with `codex plugin list`, then start a new task so Codex Desktop loads the installed version. Review and trust the bundled hook once in the Codex hook browser when prompted. See the [official Codex plugin commands](https://developers.openai.com/codex/developer-commands#plugins).
 
 The plugin intentionally exposes only three MCP tools:
 
@@ -18,7 +18,7 @@ These user-facing MCP tools remain read-only. They do not send prompts, interrup
 
 The manifest's `Interactive` capability describes the authenticated local Bridge IPC path documented below; it does not make the three user-facing MCP tools writable.
 
-For the Agent Pocket Bridge, the first successful Desktop probe starts a hidden, detached local host. That host keeps its own connection to the same Codex Desktop task channel, listens on the fixed local Windows named pipe `\\.\pipe\agent-pocket-desktop-attach-host`, and writes its registration to `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`. The registration contains a fresh random 32-byte token and is inherited from the current Windows profile ACL. The pipe accepts only:
+For the Agent Pocket Bridge, Codex Desktop initialization now makes a best-effort attempt to start a hidden, detached local host as soon as a task supplies both the Desktop tools pipe and a real task ID. The bundled `SessionStart` hook repeats the read-only `desktop_attach_probe` on task startup, resume, or clear. Codex may emit `SessionStart` before its MCP server is ready, so an explicit probe remains the observable retry path. The detached host keeps its own connection to the same Codex Desktop task channel, listens on the fixed local Windows named pipe `\\.\pipe\agent-pocket-desktop-attach-host`, and writes its registration to `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`. The registration contains a fresh random 32-byte token and is inherited from the current Windows profile ACL. The pipe accepts only:
 
 - `attach/probe`
 - `project/list`

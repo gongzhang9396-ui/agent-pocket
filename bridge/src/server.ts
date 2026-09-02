@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { WebSocket, WebSocketServer } from "ws";
 import { assertAllowedCwd, listProjects, type BridgeConfig } from "./config.ts";
@@ -44,6 +44,16 @@ const MAINTENANCE_BLOCKED_METHODS = new Set([
 const execFileAsync = promisify(execFile);
 const CODEX_DESKTOP_APP_ID = "OpenAI.Codex_2p2nqsd0c76g0!App";
 const BRIDGE_CAPABILITIES = ["attachments-v1", "goal-v1", "plan-v1", "desktop-wake-v1"] as const;
+const ATTACHMENT_ROOT_MARKER = ".agent-pocket-attachments-v1";
+const ATTACHMENT_ROOT_MARKER_CONTENT = "agent-pocket-attachments-v1\n";
+const SAFE_ATTACHMENT_DEVICE = /^[A-Za-z0-9_-]{1,64}$/;
+const SAFE_ATTACHMENT_FILE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[a-z0-9]{1,16}$/i;
+
+function sameLocalPath(left: string, right: string) {
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
 
 function stringParam(value: unknown, name: string, max: number, required = true) {
   if (value === undefined || value === null) {
@@ -368,7 +378,7 @@ export class BridgeServer {
         }
         return this.codex.request("thread/list", {
           cursor, searchTerm: search, limit,
-          sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true,
+          sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true, archived: false,
         });
       }
       case "thread/read": return this.readThread(params);
@@ -593,12 +603,73 @@ export class BridgeServer {
     });
   }
 
+  attachmentRootPath() {
+    return resolve(this.config.attachmentsPath || join(dirname(this.config.dbPath), "attachments"));
+  }
+
+  validatedAttachmentDeviceRoot(root: string, deviceId: string) {
+    if (!SAFE_ATTACHMENT_DEVICE.test(deviceId)) throw new RpcError(ErrorName.PATH_DENIED, "附件设备目录名称无效");
+    const deviceRoot = join(root, deviceId);
+    const stat = lstatSync(deviceRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new RpcError(ErrorName.PATH_DENIED, "附件设备目录不能是链接或普通文件");
+    }
+    if (!sameLocalPath(realpathSync.native(deviceRoot), resolve(deviceRoot))) {
+      throw new RpcError(ErrorName.PATH_DENIED, "附件设备目录不能经过链接或重解析点");
+    }
+    return deviceRoot;
+  }
+
+  ensureAttachmentRoot(create: boolean) {
+    const root = this.attachmentRootPath();
+    if (dirname(root) === root) throw new RpcError(ErrorName.PATH_DENIED, "附件临时目录不能是磁盘根目录");
+    if (!existsSync(root)) {
+      if (!create) return undefined;
+      mkdirSync(root, { recursive: true });
+    }
+    const rootStat = lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new RpcError(ErrorName.PATH_DENIED, "附件临时目录不能是链接或普通文件");
+    }
+    if (!sameLocalPath(realpathSync.native(root), root)) {
+      throw new RpcError(ErrorName.PATH_DENIED, "附件临时目录不能经过链接或重解析点");
+    }
+
+    const marker = join(root, ATTACHMENT_ROOT_MARKER);
+    if (existsSync(marker)) {
+      const markerStat = lstatSync(marker);
+      if (!markerStat.isFile() || markerStat.isSymbolicLink()
+        || readFileSync(marker, "utf8") !== ATTACHMENT_ROOT_MARKER_CONTENT) {
+        throw new RpcError(ErrorName.PATH_DENIED, "附件临时目录的 Agent Pocket 标记无效");
+      }
+      return root;
+    }
+
+    // Adopt an empty directory or the exact layout produced by older Hosts.
+    // Refuse arbitrary existing contents before any cleanup can remove data.
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !SAFE_ATTACHMENT_DEVICE.test(entry.name)) {
+        throw new RpcError(ErrorName.PATH_DENIED, "附件临时目录必须为空或仅包含旧版 Agent Pocket 附件");
+      }
+      const deviceRoot = this.validatedAttachmentDeviceRoot(root, entry.name);
+      for (const file of readdirSync(deviceRoot, { withFileTypes: true })) {
+        if (!file.isFile() || !SAFE_ATTACHMENT_FILE.test(file.name)) {
+          throw new RpcError(ErrorName.PATH_DENIED, "附件临时目录包含非 Agent Pocket 文件");
+        }
+      }
+    }
+    writeFileSync(marker, ATTACHMENT_ROOT_MARKER_CONTENT, { flag: "wx", mode: 0o600 });
+    return root;
+  }
+
   materializeAttachments(deviceId: string, images: ImagePayload[], files: FilePayload[]) {
     if (images.length === 0 && files.length === 0) return [] as any[];
     this.cleanupExpiredAttachments();
-    const safeDeviceId = /^[A-Za-z0-9_-]{1,64}$/.test(deviceId) ? deviceId : "unknown-device";
-    const root = join(dirname(this.config.dbPath), "attachments", safeDeviceId);
-    mkdirSync(root, { recursive: true });
+    const safeDeviceId = SAFE_ATTACHMENT_DEVICE.test(deviceId) ? deviceId : "unknown-device";
+    const attachmentRoot = this.ensureAttachmentRoot(true)!;
+    const candidateRoot = join(attachmentRoot, safeDeviceId);
+    if (!existsSync(candidateRoot)) mkdirSync(candidateRoot);
+    const root = this.validatedAttachmentDeviceRoot(attachmentRoot, safeDeviceId);
     const imageInput = images.map(({ mimeType, bytes }) => {
       const extension = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
       const path = join(root, `${randomUUID()}.${extension}`);
@@ -648,17 +719,22 @@ export class BridgeServer {
   }
 
   cleanupExpiredAttachments(now = Date.now()) {
-    const root = join(dirname(this.config.dbPath), "attachments");
-    if (!existsSync(root)) return;
+    let root: string | undefined;
+    try { root = this.ensureAttachmentRoot(false); } catch { return; }
+    if (!root) return;
     const expiresBefore = now - 60 * 60 * 1000;
     try {
       for (const device of readdirSync(root, { withFileTypes: true })) {
-        if (!device.isDirectory()) continue;
-        const deviceRoot = join(root, device.name);
+        if (!device.isDirectory() || !SAFE_ATTACHMENT_DEVICE.test(device.name)) continue;
+        let deviceRoot: string;
+        try { deviceRoot = this.validatedAttachmentDeviceRoot(root, device.name); } catch { continue; }
         for (const attachment of readdirSync(deviceRoot, { withFileTypes: true })) {
-          if (!attachment.isFile()) continue;
+          if (!attachment.isFile() || !SAFE_ATTACHMENT_FILE.test(attachment.name)) continue;
           const path = join(deviceRoot, attachment.name);
-          try { if (statSync(path).mtimeMs < expiresBefore) rmSync(path, { force: true }); } catch {}
+          try {
+            const stat = lstatSync(path);
+            if (stat.isFile() && !stat.isSymbolicLink() && stat.mtimeMs < expiresBefore) rmSync(path, { force: true });
+          } catch {}
         }
       }
     } catch {}
@@ -835,67 +911,80 @@ export class BridgeServer {
 
   async runDesktopWatcher(threadId: string, watcher: DesktopWatcher) {
     if (!this.desktop) return;
-    try {
-      while (!watcher.stopped) {
-        const generationAtWait = watcher.generation;
-        const result = await this.desktop.waitThread(threadId, watcher.cursor, 8_000);
+    let waitFailures = 0;
+    while (!watcher.stopped) {
+      const generationAtWait = watcher.generation;
+      let result: DesktopWaitSummary;
+      try {
+        result = await this.desktop.waitThread(threadId, watcher.cursor, 8_000);
+        waitFailures = 0;
+      } catch {
         if (watcher.stopped) return;
-        if (result.cursor) watcher.cursor = result.cursor;
-        if (result.changed) {
-          const terminal = this.desktopWaitIsTerminal(result);
-          if (typeof result.assistantText === "string" && result.assistantText) {
-            this.publishDesktopMessage(
-              threadId,
-              `desktop-agent-${result.turnId || result.cursor || "current"}`,
-              "assistant",
-              result.assistantText,
-              {
-                turnId: result.turnId,
-                complete: terminal,
-                truncated: result.assistantTextTruncated,
-              },
-            );
-          }
-          const eventKey = this.desktopWaitEventKey(result);
-          if (eventKey !== watcher.lastPublishedKey) {
-            watcher.lastPublishedKey = eventKey;
-            this.publish(newEvent("sync.required", {
-              threadId,
-              turnId: result.turnId,
-              reason: "desktop-wait",
-              status: result.threadStatus,
-              turnStatus: result.turnStatus,
-              wakeReason: result.wakeReason,
-            }));
-          }
-          const bootstrapDied = result.turnStatus === "failed" || result.threadStatus === "systemError";
-          if (bootstrapDied && watcher.recoveryText) {
-            // The first turn died after creation (typical on third-party HTTP
-            // model channels, where Desktop's stateful bootstrap needs the
-            // official Responses WebSocket v2). Re-deliver the prompt once via
-            // the stateless queue path and keep watching for the recovery turn.
-            const recoveryText = watcher.recoveryText;
-            watcher.recoveryText = undefined;
-            try {
-              await this.desktop.sendMessage(threadId, recoveryText);
-              watcher.generation += 1;
-              this.publish(newEvent("sync.required", { threadId, reason: "bootstrap-requeue" }));
-              continue;
-            } catch (error) {
-              console.error("Desktop bootstrap requeue:", error instanceof Error ? error.message : error);
-            }
-          }
-          if (generationAtWait === watcher.generation && terminal) return;
-        } else {
-          await new Promise((resolve) => setTimeout(resolve, 250));
+        if (waitFailures === 0) {
+          // Emit one correction request for the outage, then keep the watcher
+          // alive. A transient Desktop Attach failure must not permanently stop
+          // later task updates from reaching the phone.
+          this.publish(newEvent("sync.required", {
+            threadId,
+            reason: "desktop-wait-fallback",
+          }));
         }
+        waitFailures += 1;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 250 * 2 ** Math.min(waitFailures - 1, 5))));
+        continue;
       }
-    } catch {
-      if (!watcher.stopped) {
-        this.publish(newEvent("sync.required", {
-          threadId,
-          reason: "desktop-wait-fallback",
-        }));
+      if (watcher.stopped) return;
+      if (result.cursor) watcher.cursor = result.cursor;
+      if (result.changed) {
+        const terminal = this.desktopWaitIsTerminal(result);
+        if (typeof result.assistantText === "string" && result.assistantText) {
+          this.publishDesktopMessage(
+            threadId,
+            `desktop-agent-${result.turnId || result.cursor || "current"}`,
+            "assistant",
+            result.assistantText,
+            {
+              turnId: result.turnId,
+              complete: terminal,
+              truncated: result.assistantTextTruncated,
+            },
+          );
+        }
+        const eventKey = this.desktopWaitEventKey(result);
+        if (eventKey !== watcher.lastPublishedKey) {
+          watcher.lastPublishedKey = eventKey;
+          this.publish(newEvent("sync.required", {
+            threadId,
+            turnId: result.turnId,
+            reason: "desktop-wait",
+            status: result.threadStatus,
+            turnStatus: result.turnStatus,
+            wakeReason: result.wakeReason,
+          }));
+        }
+        const bootstrapDied = result.turnStatus === "failed" || result.threadStatus === "systemError";
+        if (bootstrapDied && watcher.recoveryText) {
+          // The first turn died after creation (typical on third-party HTTP
+          // model channels, where Desktop's stateful bootstrap needs the
+          // official Responses WebSocket v2). Re-deliver the prompt once via
+          // the stateless queue path and keep watching for the recovery turn.
+          const recoveryText = watcher.recoveryText;
+          try {
+            await this.desktop.sendMessage(threadId, recoveryText);
+            watcher.recoveryText = undefined;
+            watcher.generation += 1;
+            this.publish(newEvent("sync.required", { threadId, reason: "bootstrap-requeue" }));
+            continue;
+          } catch (error) {
+            // Keep recoveryText so a later fresh terminal observation can retry
+            // without blindly duplicating a write after an ambiguous timeout.
+            console.error("Desktop bootstrap requeue:", error instanceof Error ? error.message : error);
+          }
+        }
+        if (terminal && !bootstrapDied) watcher.recoveryText = undefined;
+        if (generationAtWait === watcher.generation && terminal && !watcher.recoveryText) return;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 250));
       }
     }
   }
@@ -1012,6 +1101,12 @@ export class BridgeServer {
         this.publish(newEvent("turn.status", { ...p, turnId: p.turn?.id, status: "completed" })); break;
       case "thread/status/changed":
         this.publish(newEvent("turn.status", { ...p })); break;
+      case "thread/archived":
+      case "thread/unarchived":
+        this.publish(newEvent("sync.required", {
+          reason: "thread-list-changed",
+          change: message.method === "thread/archived" ? "archived" : "unarchived",
+        })); break;
     }
   }
 

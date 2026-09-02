@@ -31,6 +31,25 @@ test("relay-only Hosts may request an ephemeral loopback port", () => {
   assert.equal(config.port, 0);
 });
 
+test("attachment storage can be moved independently and otherwise follows the database", () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-attachment-config-"));
+  const dbPath = join(base, "state", "bridge.db");
+  const defaultConfig = loadConfig({
+    AGENT_POCKET_PROJECT_ROOTS: tmpdir(),
+    AGENT_POCKET_DB: dbPath,
+  });
+  assert.equal(defaultConfig.attachmentsPath, join(base, "state", "attachments"));
+
+  const configuredPath = join(base, "large-disk", "attachments");
+  const configured = loadConfig({
+    AGENT_POCKET_PROJECT_ROOTS: tmpdir(),
+    AGENT_POCKET_DB: dbPath,
+    AGENT_POCKET_ATTACHMENTS_DIR: configuredPath,
+  });
+  assert.equal(configured.attachmentsPath, configuredPath);
+  assert.equal(configured.dbPath, dbPath);
+});
+
 test("cwd must stay inside a canonical project root", () => {
   const base = mkdtempSync(join(tmpdir(), "agent-pocket-path-"));
   const root = join(base, "allowed");

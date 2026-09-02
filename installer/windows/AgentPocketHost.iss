@@ -40,6 +40,7 @@ Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -Win
 var
   RelayPage: TInputQueryWizardPage;
   RootsPage: TInputQueryWizardPage;
+  AttachmentsPage: TInputQueryWizardPage;
   ExistingConfig: Boolean;
 
 procedure InitializeWizard;
@@ -51,6 +52,9 @@ begin
   RootsPage := CreateInputQueryPage(RelayPage.ID, '项目白名单', '允许手机访问的项目根目录', '多个目录使用 Windows 分号分隔。');
   RootsPage.Add('项目根目录：', False);
   RootsPage.Values[0] := ExpandConstant('{userdocs}');
+  AttachmentsPage := CreateInputQueryPage(RootsPage.ID, '附件临时目录', '选择手机附件在 Host 上的临时存储位置', '建议使用空间充足的本地磁盘；附件默认在一小时后清理。');
+  AttachmentsPage.Add('附件临时目录：', False);
+  AttachmentsPage.Values[0] := ExpandConstant('{localappdata}\AgentPocket\attachments');
 end;
 
 function IsFirstInstall: Boolean;
@@ -60,7 +64,7 @@ end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := ExistingConfig and ((PageID = RelayPage.ID) or (PageID = RootsPage.ID));
+  Result := ExistingConfig and ((PageID = RelayPage.ID) or (PageID = RootsPage.ID) or (PageID = AttachmentsPage.ID));
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -70,6 +74,8 @@ begin
     Result := Pos('https://', Lowercase(Trim(RelayPage.Values[0]))) = 1;
   if CurPageID = RootsPage.ID then
     Result := Trim(RootsPage.Values[0]) <> '';
+  if CurPageID = AttachmentsPage.ID then
+    Result := Trim(AttachmentsPage.Values[0]) <> '';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -89,9 +95,9 @@ begin
     end;
     Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\configure-host.ps1') +
       '" -InstallDir "' + ExpandConstant('{app}') + '" -RelayUrl "' + RelayPage.Values[0] +
-      '" -ProjectRoots "' + RootsPage.Values[0] + '"';
+      '" -ProjectRoots "' + RootsPage.Values[0] + '" -AttachmentsPath "' + AttachmentsPage.Values[0] + '"';
     if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-      RaiseException('Agent Pocket Host 配置失败。请检查 Relay 地址、项目目录和 Codex CLI。');
+      RaiseException('Agent Pocket Host 配置失败。请检查 Relay 地址、项目目录、附件目录和 Codex CLI。');
   end;
 end;
 

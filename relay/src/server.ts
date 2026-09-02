@@ -274,7 +274,13 @@ export class RelayServer {
 
   private onHostConnected(socket: WebSocket, _request: IncomingMessage, session: HostSocket) {
     const previous = this.hosts.get(session.hostId);
-    if (previous) previous.socket.close(4001, "Host reconnected");
+    if (previous) {
+      // Channel crypto state belongs to the old Host connection. Its close
+      // callback cannot clean these after the replacement occupies hosts[],
+      // so drain them before swapping sessions to avoid exhausting quotas.
+      this.closeChannelsForHost(session.hostId);
+      previous.socket.close(4001, "Host reconnected");
+    }
     this.hosts.set(session.hostId, session);
     this.store.touchHost(session.accountId, session.hostId);
     socket.on("message", (data) => void this.onHostMessage(session, data));
