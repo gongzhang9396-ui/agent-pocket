@@ -135,6 +135,7 @@ Copy-AllowlistedFiles (Join-Path $scriptRoot 'scripts') $scriptsStage @(
     'check-host-update.ps1',
     'configure-host.ps1',
     'enroll-host.ps1',
+    'install-desktop-plugin.ps1',
     'pairing-assistant.ps1',
     'register-host-tasks.ps1',
     'run-host.ps1',

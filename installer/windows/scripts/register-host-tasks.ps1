@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$InstallDir,
-    [switch]$OnlyIfMissing
+    [switch]$OnlyIfMissing,
+    [switch]$StartHost
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'task-names.ps1')
@@ -29,4 +30,9 @@ $existingUpdateTask = Get-ScheduledTask -TaskName $AgentPocketUpdateTaskName -Er
 $updateTaskMatches = $existingUpdateTask -and ([string]$existingUpdateTask.Actions.Arguments).IndexOf($updater, [StringComparison]::OrdinalIgnoreCase) -ge 0
 if (-not $OnlyIfMissing -or -not $updateTaskMatches) {
     Register-ScheduledTask -TaskName $AgentPocketUpdateTaskName -Action $updateAction -Trigger $updateTrigger -Settings $updateSettings -Description 'Agent Pocket Host signed update check' -Force | Out-Null
+}
+
+if ($StartHost) {
+    Stop-ScheduledTask -TaskName $AgentPocketHostTaskName -ErrorAction SilentlyContinue
+    Start-ScheduledTask -TaskName $AgentPocketHostTaskName -ErrorAction Stop
 }

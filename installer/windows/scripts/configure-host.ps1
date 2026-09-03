@@ -33,13 +33,7 @@ New-Item -ItemType Directory -Force -Path $attachmentsPath | Out-Null
     codexCommand = $codex.Source
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stateDir 'host-config.json') -Encoding UTF8
 
-$marketplace = Join-Path $InstallDir 'marketplace'
-$marketplaceResult = & $codex.Source plugin marketplace add $marketplace --json 2>&1
-if ($LASTEXITCODE -ne 0) { throw "注册本地 Codex Marketplace 失败：$marketplaceResult" }
-$marketplaceName = (($marketplaceResult | Out-String) | ConvertFrom-Json).marketplaceName
-if (-not $marketplaceName) { $marketplaceName = 'agent-pocket-host' }
-$pluginResult = & $codex.Source plugin add "agent-pocket-desktop-attach@$marketplaceName" --json 2>&1
-if ($LASTEXITCODE -ne 0) { throw "安装 Desktop Attach 插件失败：$pluginResult" }
+& (Join-Path $InstallDir 'scripts\install-desktop-plugin.ps1') -InstallDir $InstallDir
 
 & (Join-Path $InstallDir 'scripts\register-host-tasks.ps1') -InstallDir $InstallDir
 if ($LASTEXITCODE -ne 0) { throw '注册 Agent Pocket Host 计划任务失败。' }

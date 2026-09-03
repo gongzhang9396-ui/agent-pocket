@@ -45,6 +45,26 @@ var
   RootsPage: TInputQueryWizardPage;
   AttachmentsPage: TInputQueryWizardPage;
   ExistingConfig: Boolean;
+  HostStoppedForUpgrade: Boolean;
+  InstallCompleted: Boolean;
+
+function StopExistingHostTasks: Boolean;
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $names = @((''Agent Pocket Host v2 '' + $sid), (''Agent Pocket Host Update '' + $sid), ''Agent Pocket Host v2''); $tasks = @($names | ForEach-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue }); $tasks | Stop-ScheduledTask -ErrorAction SilentlyContinue; $deadline = (Get-Date).AddSeconds(15); do { $running = @($names | ForEach-Object { Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue } | Where-Object State -eq ''Running''); if ($running.Count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline); exit 1"';
+  Result := Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+procedure StartExistingHostTask;
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = ''Stop''; $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $task = Get-ScheduledTask -TaskName (''Agent Pocket Host v2 '' + $sid) -ErrorAction SilentlyContinue; if (-not $task) { $task = Get-ScheduledTask -TaskName ''Agent Pocket Host v2'' -ErrorAction SilentlyContinue }; if ($task) { Start-ScheduledTask -InputObject $task }"';
+  Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
 
 procedure InitializeWizard;
 begin
@@ -86,12 +106,18 @@ var
   ResultCode: Integer;
   Params: String;
 begin
+  if CurStep = ssDone then
+    InstallCompleted := True;
   if CurStep = ssPostInstall then
   begin
     if ExistingConfig then
     begin
+      Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\install-desktop-plugin.ps1') +
+        '" -InstallDir "' + ExpandConstant('{app}') + '"';
+      if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+        RaiseException('Desktop Attach 插件升级失败。请确认 Codex Desktop 已安装。');
       Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\register-host-tasks.ps1') +
-        '" -InstallDir "' + ExpandConstant('{app}') + '" -OnlyIfMissing';
+        '" -InstallDir "' + ExpandConstant('{app}') + '" -OnlyIfMissing -StartHost';
       if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
         RaiseException('Agent Pocket Host 计划任务升级失败。');
       exit;
@@ -107,6 +133,21 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  if ExistingConfig then
+  begin
+    if not StopExistingHostTasks then
+    begin
+      Result := '无法停止正在运行的 Agent Pocket Host，请稍后重试。';
+      exit;
+    end;
+    HostStoppedForUpgrade := True;
+  end;
   if WizardSilent and (not ExistingConfig) then
     Result := '首次安装不能静默运行；请打开安装向导配置 Relay 和项目白名单。';
+end;
+
+procedure DeinitializeSetup;
+begin
+  if HostStoppedForUpgrade and (not InstallCompleted) then
+    StartExistingHostTask;
 end;

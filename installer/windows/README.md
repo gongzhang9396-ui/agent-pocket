@@ -25,7 +25,7 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 安装完成后会自动打开“Agent Pocket 配对助手”；开始菜单也保留重复打开入口。助手只显示二维码文件、五分钟倒计时、刷新和连接结果，不把 enrollment secret 写入日志。Android 可以在未登录状态先扫码，登录或首次激活成功后会自动继续 Host inspect/approve；绑定成功后 Host 任务重启以加载新身份。
 
-覆盖升级检测到现有 `host-config.json` 后会跳过 Relay/白名单页面，不重写配置、不删除 Host 身份，也不重复注册 Desktop Attach 插件。首次安装禁止静默模式，避免用示例配置误装。
+覆盖升级检测到现有 `host-config.json` 后会跳过 Relay/白名单页面，不重写配置、不删除 Host 身份；安装器会重新安装随版本附带的 Desktop Attach 插件，避免 Codex 继续加载旧版插件。首次安装禁止静默模式，避免用示例配置误装。
 
 ## 构建签名安装包
 
