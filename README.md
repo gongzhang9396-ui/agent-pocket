@@ -126,6 +126,8 @@ node dist/cli.js bootstrap
 
 安装器会注册 Host 登录启动任务和 Desktop Attach 插件。Codex Desktop 新建或恢复任务时，插件的 `SessionStart` Hook 会自动探测并建立 Attach 通道；它仍依赖 Codex Desktop 已打开且由同一 Windows 用户运行，不会绕过 Desktop 的 writer 所有权。
 
+Windows“已安装的应用”和开始菜单都提供卸载入口。默认卸载只删除程序、计划任务和 Desktop Attach 注册，保留这台电脑的本地账号与绑定数据以便重装；也可以在卸载确认中选择删除 `%LOCALAPPDATA%\AgentPocket`，让本机退出并在下次安装时重新绑定。这个选项不会删除 Relay 云端账号、手机、其他电脑，也不会删除配置在其他磁盘的外置附件目录。
+
 源码开发：
 
 ```powershell

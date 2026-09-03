@@ -12,6 +12,7 @@ AppId={{5B7113C5-B584-45A2-8478-E24C17E63D26}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+UninstallDisplayName={#MyAppName}
 DefaultDirName={localappdata}\Programs\Agent Pocket Host
 DefaultGroupName=Agent Pocket
 PrivilegesRequired=lowest
@@ -32,12 +33,17 @@ Source: "payload\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs creat
 [Icons]
 Name: "{group}\Agent Pocket 配对助手"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\pairing-assistant.ps1"""
 Name: "{group}\检查 Agent Pocket Host 更新"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\check-host-update.ps1"" -InstallDir ""{app}"" -Interactive"
+Name: "{group}\卸载 Agent Pocket Host"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\pairing-assistant.ps1"""; Description: "打开 Agent Pocket 配对助手"; Flags: postinstall skipifsilent nowait; Check: IsFirstInstall
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-host.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "AgentPocketHostUninstall"
+Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-host.ps1"" -InstallDir ""{app}"""; Flags: runhidden waituntilterminated; RunOnceId: "AgentPocketHostUninstallKeep"; Check: ShouldKeepLocalAccountOnUninstall
+Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-host.ps1"" -InstallDir ""{app}"" -RemoveUserData"; Flags: runhidden waituntilterminated; RunOnceId: "AgentPocketHostUninstallRemove"; Check: ShouldRemoveLocalAccountOnUninstall
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\marketplace"
 
 [Code]
 var
@@ -47,6 +53,32 @@ var
   ExistingConfig: Boolean;
   HostStoppedForUpgrade: Boolean;
   InstallCompleted: Boolean;
+  RemoveLocalAccountOnUninstall: Boolean;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  RemoveLocalAccountOnUninstall := False;
+  if UninstallSilent then
+    exit;
+
+  RemoveLocalAccountOnUninstall :=
+    MsgBox(
+      '是否同时删除这台电脑上的本地账号与绑定数据？' + #13#10 + #13#10 +
+      '选择“否”（推荐）：只卸载程序，保留本机绑定、任务数据库和默认附件，重装后可继续使用。' + #13#10 + #13#10 +
+      '选择“是”：删除 %LOCALAPPDATA%\AgentPocket 中的本地身份、配置、数据库、日志和默认附件。Relay 云端账号、手机和其他电脑不会被删除；外置附件目录需自行处理。',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+end;
+
+function ShouldKeepLocalAccountOnUninstall(): Boolean;
+begin
+  Result := not RemoveLocalAccountOnUninstall;
+end;
+
+function ShouldRemoveLocalAccountOnUninstall(): Boolean;
+begin
+  Result := RemoveLocalAccountOnUninstall;
+end;
 
 function StopExistingHostTasks: Boolean;
 var

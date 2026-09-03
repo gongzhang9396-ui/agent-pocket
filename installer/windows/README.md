@@ -21,11 +21,22 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 3. 手机附件在 Host 上的临时存储目录；
 4. 当前 Windows 用户已安装并登录 Codex Desktop。
 
-配置写入 `%LOCALAPPDATA%\AgentPocket\host-config.json`。`attachmentsPath` 可以指向空间充足的其他本地磁盘；缺少该字段的旧配置仍使用 `%LOCALAPPDATA%\AgentPocket\attachments`。也可以直接为 Bridge 设置 `AGENT_POCKET_ATTACHMENTS_DIR`。附件是一小时有效的临时副本。Relay Host 身份、Bridge SQLite 和 Codex 历史仍保存在原状态目录，卸载默认保留它们。
+配置写入 `%LOCALAPPDATA%\AgentPocket\host-config.json`。`attachmentsPath` 可以指向空间充足的其他本地磁盘；缺少该字段的旧配置仍使用 `%LOCALAPPDATA%\AgentPocket\attachments`。也可以直接为 Bridge 设置 `AGENT_POCKET_ATTACHMENTS_DIR`。附件是一小时有效的临时副本。Relay Host 身份、Bridge SQLite 和 Codex 历史仍保存在原状态目录。
 
 安装完成后会自动打开“Agent Pocket 配对助手”；开始菜单也保留重复打开入口。助手只显示二维码文件、五分钟倒计时、刷新和连接结果，不把 enrollment secret 写入日志。Android 可以在未登录状态先扫码，登录或首次激活成功后会自动继续 Host inspect/approve；绑定成功后 Host 任务重启以加载新身份。
 
 覆盖升级检测到现有 `host-config.json` 后会跳过 Relay/白名单页面，不重写配置、不删除 Host 身份；安装器会重新安装随版本附带的 Desktop Attach 插件，避免 Codex 继续加载旧版插件。首次安装禁止静默模式，避免用示例配置误装。
+
+## 卸载与重装
+
+可从 Windows“设置 → 应用 → 已安装的应用”或开始菜单“Agent Pocket → 卸载 Agent Pocket Host”启动卸载。卸载器会停止并删除当前 Windows 用户的 Host/更新计划任务，终止经过安装路径校验的 Host 与 Desktop Attach 进程，并移除该安装目录注册的 Desktop Attach 插件和本地 Marketplace；不会影响其他 Node.js 或 Codex 插件。
+
+交互卸载时可以选择是否删除这台电脑上的本地账号与绑定数据：
+
+- 选择“否”（默认、推荐）只卸载程序，保留 `%LOCALAPPDATA%\AgentPocket` 中的 Host 身份、配置、Bridge 数据库和默认附件，之后用同一 Windows 用户重装即可继续原绑定；
+- 选择“是”会删除上述本地状态，相当于让这台电脑退出 Agent Pocket。Relay 云端账号、手机和其他 Host 不会被删除，下次安装必须重新扫码绑定；配置到其他磁盘的外置附件目录不会自动删除。
+
+静默卸载始终采用安全默认值并保留本地账号数据。卸载日志写入 `%TEMP%\AgentPocket-uninstall.log`。如果要删除 Relay 上的整个用户账号，必须在 Relay 管理端单独处理，不能由一台 Windows Host 的卸载器代替。
 
 ## 构建签名安装包
 
