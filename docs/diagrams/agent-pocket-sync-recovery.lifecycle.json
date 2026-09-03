@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Agent Pocket 同步与失败恢复生命周期",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [980, 566]
+  },
+  "lanes": [
+    { "id": "main", "label": "连接与同步主线" },
+    { "id": "recovery", "label": "异常恢复" }
+  ],
+  "states": [
+    { "id": "offline", "type": "start", "label": "未连接", "sublabel": "等待网络或凭据", "lane": "main", "col": 0, "step": "01" },
+    { "id": "connecting", "type": "active", "label": "连接 Relay", "sublabel": "WebSocket 打开", "lane": "main", "col": 1, "step": "02" },
+    { "id": "fullsync", "type": "active", "label": "完整同步", "sublabel": "snapshot/get + event/replay", "lane": "main", "col": 2, "step": "03" },
+    { "id": "refresh", "type": "active", "label": "待刷新补读", "sublabel": "thread/list + thread/read", "lane": "main", "col": 3, "step": "04" },
+    { "id": "ready", "type": "success", "label": "实时就绪", "sublabel": "事件推送 + 防抖校正", "lane": "main", "col": 4, "step": "05" },
+    { "id": "failure", "type": "failure", "label": "临时连接失败", "sublabel": "断线 / 超时 / 关闭", "lane": "recovery", "col": 0, "width": 110, "tag": "可恢复" },
+    { "id": "backoff", "type": "waiting", "label": "等待重试", "sublabel": "1s → 30s", "lane": "recovery", "col": 1, "width": 110, "tag": "保留待刷新任务" },
+    { "id": "retry", "type": "active", "label": "重建连接", "sublabel": "清理旧通道与 RPC", "lane": "recovery", "col": 2, "width": 110, "tag": "自动恢复" }
+  ],
+  "transitions": [
+    { "id": "begin-connect", "from": "offline", "to": "connecting" },
+    { "id": "hello-sync", "from": "connecting", "to": "fullsync", "label": "relay/hello", "labelAt": [388, 218] },
+    { "id": "sync-refresh", "from": "fullsync", "to": "refresh" },
+    { "id": "refresh-ready", "from": "refresh", "to": "ready", "variant": "emphasis" },
+    { "id": "connect-failed", "from": "connecting", "to": "failure", "label": "连接超时", "variant": "security", "labelAt": [375, 238] },
+    { "id": "refresh-failed", "from": "refresh", "to": "backoff", "label": "读取失败", "variant": "security", "labelAt": [556, 202] },
+    { "id": "ready-disconnected", "from": "ready", "to": "retry", "label": "通道关闭", "variant": "security", "labelAt": [710, 202] },
+    { "id": "failure-backoff", "from": "failure", "to": "backoff", "variant": "emphasis" },
+    { "id": "backoff-retry", "from": "backoff", "to": "retry", "variant": "emphasis" },
+    { "id": "retry-connect", "from": "retry", "to": "connecting", "label": "重建 WSS", "variant": "emphasis", "route": "bottom-channel" }
+  ]
+}

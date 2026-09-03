@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Agent Pocket 新建、续写与 writer 冲突时序",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1500, 780]
+  },
+  "participants": [
+    { "id": "android", "type": "frontend", "label": "Android App" },
+    { "id": "relay", "type": "messagebus", "label": "Relay" },
+    { "id": "host", "type": "backend", "label": "Windows Host" },
+    { "id": "attach", "type": "security", "label": "Desktop Attach" },
+    { "id": "desktop", "type": "external", "label": "Codex Desktop" },
+    { "id": "appserver", "type": "backend", "label": "codex app-server" }
+  ],
+  "segments": [
+    { "from": 150, "to": 312, "label": "创建任务" },
+    { "from": 326, "to": 426, "label": "按 owner 二选一续写" },
+    { "from": 438, "to": 542, "label": "writer 冲突：fail-closed" },
+    { "from": 556, "to": 704, "label": "异步回复与校正" }
+  ],
+  "messages": [
+    { "id": "create-request", "from": "android", "to": "relay", "y": 170, "label": "channel/data：thread/start（E2E 密文）", "variant": "security" },
+    { "id": "create-route", "from": "relay", "to": "host", "y": 196, "label": "按 hostId 路由密文", "variant": "security" },
+    { "id": "desktop-create", "from": "host", "to": "attach", "y": 222, "label": "target=desktop：thread/create", "variant": "emphasis" },
+    { "id": "desktop-tool-create", "from": "attach", "to": "desktop", "y": 248, "label": "create_thread + wait_threads 核验", "variant": "emphasis" },
+    { "id": "bridge-create", "from": "host", "to": "appserver", "y": 276, "label": "target=bridge：thread/start + turn/start（Plan 可选）", "variant": "emphasis" },
+    { "id": "create-receipt", "from": "host", "to": "android", "y": 302, "label": "经 Relay 返回 thread / turn 回执", "variant": "return", "note": "target 只走一条创建路径；Host 将 thread owner 持久化为 desktop 或 bridge，首次 claim 不被另一 writer 覆盖。" },
+    { "id": "continue-request", "from": "android", "to": "host", "y": 336, "label": "经 Relay：turn/start 或 turn/steer", "variant": "security", "note": "Host 先读 thread_owners：desktop 只走 Desktop Attach；bridge 只走独立 app-server。两边任务可见，但 writer 不共享。" },
+    { "id": "desktop-send", "from": "host", "to": "attach", "y": 362, "label": "Desktop owner：thread/send", "variant": "emphasis" },
+    { "id": "desktop-queue", "from": "attach", "to": "desktop", "y": 388, "label": "codex queue --thread ... --message ...", "variant": "emphasis" },
+    { "id": "bridge-send", "from": "host", "to": "appserver", "y": 416, "label": "Bridge owner：thread/resume + turn/start/steer", "variant": "emphasis" },
+    { "id": "desktop-not-ready", "from": "attach", "to": "host", "y": 448, "label": "pipe/工具不可用或 not-desktop-host", "variant": "return", "note": "Desktop-owned 任务 fail-closed：不回退到 app-server。" },
+    { "id": "bridge-busy", "from": "appserver", "to": "host", "y": 476, "label": "writer / lock / already active", "variant": "return", "note": "active turn 不属于 Bridge 时视为外部 writer 冲突。" },
+    { "id": "write-rejected", "from": "host", "to": "android", "y": 504, "label": "THREAD_BUSY_EXTERNAL：不删锁、不换 owner、不启第二 writer", "variant": "security" },
+    { "id": "desktop-control-limit", "from": "host", "to": "android", "y": 532, "label": "Desktop 中断/审批需回 Codex Desktop 处理", "variant": "return" },
+    { "id": "watch-desktop", "from": "host", "to": "attach", "y": 566, "label": "thread/wait（单次最多 8 秒）", "variant": "dashed" },
+    { "id": "wait-desktop", "from": "attach", "to": "desktop", "y": 592, "label": "wait_threads / rollout 兜底", "variant": "dashed" },
+    { "id": "desktop-result", "from": "attach", "to": "host", "y": 618, "label": "assistantText + cursor + 状态", "variant": "return" },
+    { "id": "bridge-delta", "from": "appserver", "to": "host", "y": 646, "label": "message delta / diff / status", "variant": "return" },
+    { "id": "event-append", "from": "host", "to": "relay", "y": 670, "label": "event.append：密文事件 + 持久 outbox", "variant": "security" },
+    { "id": "event-delivery", "from": "relay", "to": "android", "y": 696, "label": "relay/event；sync.required 后 thread/read 校正", "variant": "security" }
+  ],
+  "activations": [
+    { "participant": "host", "from": 192, "to": 308, "type": "backend" },
+    { "participant": "attach", "from": 218, "to": 254, "type": "security" },
+    { "participant": "appserver", "from": 272, "to": 306, "type": "backend" },
+    { "participant": "host", "from": 332, "to": 678, "type": "backend" },
+    { "participant": "attach", "from": 358, "to": 624, "type": "security" },
+    { "participant": "appserver", "from": 412, "to": 652, "type": "backend" }
+  ]
+}

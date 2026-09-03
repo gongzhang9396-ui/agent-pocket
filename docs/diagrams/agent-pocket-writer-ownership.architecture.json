@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Agent Pocket Desktop / app-server 写入边界",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/gongzhang9396-ui/agent-pocket",
+      "revision": "175beb7e503eb33c24fa69ba5690e2b7f7e677d4"
+    },
+    "views": [
+      {
+        "id": "two-guards",
+        "label": "两层写保护",
+        "focus": ["host", "owners", "writerlock", "task"],
+        "note": "thread_owners 决定路由；Codex writer lock 决定当前能否执行。"
+      },
+      {
+        "id": "desktop-path",
+        "label": "Desktop-owned",
+        "focus": ["host", "owners", "attach", "desktop", "writerlock", "task"],
+        "note": "手机写入回到 Codex Desktop，不启动第二个 app-server。"
+      },
+      {
+        "id": "bridge-path",
+        "label": "Bridge-owned",
+        "focus": ["host", "owners", "appserver", "writerlock", "task"],
+        "note": "只有 Bridge-owned 任务由独立 codex app-server 写入。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [28, 58],
+    "cols": 6,
+    "gapX": 44,
+    "gapY": 26,
+    "cellW": 132,
+    "cellH": 64
+  },
+  "components": [
+    {
+      "id": "android",
+      "type": "frontend",
+      "label": "Android App",
+      "sublabel": "新建 / 续写 / steer",
+      "row": 1,
+      "col": 0,
+      "sources": [
+        { "path": "bridge/src/server.ts", "line": 384, "end_line": 394, "label": "手机 RPC 分发" }
+      ]
+    },
+    {
+      "id": "host",
+      "type": "backend",
+      "label": "Windows Host",
+      "sublabel": "按 owner 路由写入",
+      "tag": "不跨 owner",
+      "row": 1,
+      "col": 1,
+      "sources": [
+        { "path": "bridge/src/server.ts", "line": 555, "end_line": 603, "label": "续写 owner 分流" },
+        { "path": "bridge/src/server.ts", "line": 743, "end_line": 758, "label": "中断能力边界" }
+      ]
+    },
+    {
+      "id": "owners",
+      "type": "database",
+      "label": "thread_owners",
+      "sublabel": "desktop | bridge",
+      "tag": "持久路由守卫 ≠ Codex 锁",
+      "row": 3,
+      "col": 1,
+      "sources": [
+        { "path": "bridge/src/store.ts", "line": 56, "end_line": 59, "label": "owner 表约束" },
+        { "path": "bridge/src/store.ts", "line": 186, "end_line": 200, "label": "首次 claim 不覆盖" }
+      ]
+    },
+    {
+      "id": "attach",
+      "type": "security",
+      "label": "Desktop Attach",
+      "sublabel": "named pipe + token",
+      "tag": "Desktop-owned 通道",
+      "row": 0,
+      "col": 2,
+      "sources": [
+        { "path": "desktop-attach-plugin/README.md", "line": 21, "end_line": 37, "label": "Desktop 任务工具" },
+        { "path": "bridge/src/desktop-attach.ts", "line": 288, "end_line": 326, "label": "认证与写能力" }
+      ]
+    },
+    {
+      "id": "desktop",
+      "type": "external",
+      "label": "Codex Desktop",
+      "sublabel": "Desktop 唯一 writer",
+      "tag": "真实 Desktop task host",
+      "row": 0,
+      "col": 3,
+      "sources": [
+        { "path": "desktop-attach-plugin/README.md", "line": 33, "end_line": 43, "label": "写入与 fail-closed" }
+      ]
+    },
+    {
+      "id": "appserver",
+      "type": "backend",
+      "label": "codex app-server",
+      "sublabel": "独立 Bridge writer",
+      "tag": "仅 Bridge-owned",
+      "row": 2,
+      "col": 3,
+      "sources": [
+        { "path": "bridge/src/codex.ts", "line": 22, "end_line": 73, "label": "app-server 子进程" },
+        { "path": "bridge/src/server.ts", "line": 475, "end_line": 500, "label": "Bridge 创建并认领" }
+      ]
+    },
+    {
+      "id": "writerlock",
+      "type": "security",
+      "label": "Writer Guard",
+      "sublabel": "active turn / 单 writer",
+      "tag": "冲突 → THREAD_BUSY_EXTERNAL",
+      "row": 1,
+      "col": 4,
+      "sources": [
+        { "path": "bridge/src/codex.ts", "line": 129, "end_line": 165, "label": "active turn 与锁错误" },
+        { "path": "desktop-attach-plugin/server.mjs", "line": 494, "end_line": 503, "label": "Desktop writer 冲突" }
+      ]
+    },
+    {
+      "id": "task",
+      "type": "database",
+      "label": "Codex task",
+      "sublabel": "任务可见，写入互斥",
+      "tag": "拒绝时保持 owner",
+      "row": 1,
+      "col": 5,
+      "sources": [
+        { "path": "docs/USAGE.md", "line": 253, "end_line": 272, "label": "运行方式与 writer 边界" }
+      ]
+    }
+  ],
+  "boundaries": [
+    { "kind": "security-group", "label": "同一 Windows 用户会话：共享任务可见性，不共享 writer", "wraps": ["host", "owners", "attach", "desktop", "appserver", "writerlock", "task"], "pad": 22 }
+  ],
+  "connections": [
+    { "id": "mobile-write", "from": "android", "to": "host", "label": "写请求", "variant": "emphasis" },
+    { "id": "owner-lookup", "from": "host", "to": "owners", "label": "read / claim owner", "variant": "security", "labelAt": [264, 222] },
+    { "id": "route-desktop", "from": "host", "to": "attach", "label": "owner=desktop", "variant": "security", "labelAt": [352, 132] },
+    { "id": "attach-desktop", "from": "attach", "to": "desktop", "variant": "emphasis" },
+    { "id": "route-bridge", "from": "host", "to": "appserver", "label": "owner=bridge", "variant": "security" },
+    { "id": "desktop-lock", "from": "desktop", "to": "writerlock", "variant": "emphasis" },
+    { "id": "bridge-lock", "from": "appserver", "to": "writerlock", "variant": "emphasis" },
+    { "id": "lock-task", "from": "writerlock", "to": "task", "label": "接受一个；冲突拒绝", "variant": "security", "labelAt": [880, 222] }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "第一层：Agent Pocket owner",
+      "items": [
+        "thread_owners 是持久写路由，不是 Codex 锁",
+        "Desktop 与 Bridge 首次 claim 不互相覆盖"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "第二层：Codex writer lock",
+      "items": [
+        "active turn 或另一 writer 占用时拒绝",
+        "错误统一为 THREAD_BUSY_EXTERNAL"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "Fail-closed",
+      "items": [
+        "Desktop Attach 不可用时不回退 app-server",
+        "不删锁、不换 owner、不启动第二 writer"
+      ]
+    }
+  ]
+}

@@ -4,16 +4,21 @@ Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码�
 
 当前 v2 是邀请制、多用户、多主机架构，适合个人、家庭或小团队自托管。项目仍处于实验阶段：Desktop Attach 依赖 Codex Desktop 的内部本地能力，Desktop 更新后可能需要适配。
 
+当前稳定版为 **v0.3.1**。Android App、Windows Host、Bridge、Relay 与 Desktop Attach 已统一版本号。
+
 完整的部署、绑定、日常使用、恢复、更新和脱敏说明见 [使用说明](docs/USAGE.md)。
 
 ## 直接安装
 
-在 [GitHub Releases](https://github.com/gongzhang9396-ui/agent-pocket/releases/latest) 下载两个文件（Android 与 Host 版本号可能不同，Android 迭代更快，均以 latest 页面为准）：
+在 [GitHub Releases](https://github.com/gongzhang9396-ui/agent-pocket/releases/latest) 下载 v0.3.1 安装文件：
 
-- `Agent-Pocket-<版本>-release.apk`：安装到 Android 手机；
-- `AgentPocketHost-<版本>-windows-x64.exe`：安装到每台需要远程控制的 Windows 电脑。
+- `Agent-Pocket-0.3.1-release.apk`：安装到 Android 手机；
+- `AgentPocketHost-0.3.1-windows-x64.exe`：安装到每台需要远程控制的 Windows 电脑；
+- `Agent-Pocket-0.3.1-bundle.zip`：给测试用户准备的 Android、Windows Host、校验文件和中文说明合集。
 
-Relay 管理员先在后台创建用户邀请。用户通过邀请在 Android 登录后，在 Windows 安装器中填写 Relay 地址和项目白名单，再从开始菜单打开“绑定这台 Windows 电脑”，用 Android 扫描二维码即可。安装器不要求管理员权限；当前未购买 Authenticode 证书，Windows 首次安装可能显示 SmartScreen 提示，请同时核对 Release 中的 SHA-256 文件。
+Relay 管理员先在后台创建用户邀请。用户通过邀请在 Android 登录后，在 Windows 安装器中确认可编辑的 Relay 地址、项目白名单和附件临时目录，再从开始菜单打开“绑定这台 Windows 电脑”，用 Android 扫描二维码即可。安装器不要求管理员权限；当前未购买 Authenticode 证书，Windows 首次安装可能显示 SmartScreen 提示，请同时核对 Release 中的 `.sha256` 或 `SHA256SUMS.txt`。
+
+第一次给朋友安装时，建议直接按 [中文快速安装说明](docs/FRIEND-QUICKSTART-zh-CN.md) 操作。
 
 ## 能力
 
@@ -32,22 +37,38 @@ Android v0.3 的界面方向和附件交互见 [视觉原型](docs/prototypes/ag
 
 ## 架构
 
-当前实现的组件职责、加密边界、Desktop/Bridge 两条任务路径和完整消息时序，见 [v0.2.9 架构与信息流](docs/ARCHITECTURE-v0.2.9.md)。
+下面的图由 [Archify](https://github.com/tt-a1i/archify) 根据 v0.3.1 代码证据生成。PNG 可直接预览；交互版 HTML 下载后用本地浏览器打开，支持搜索、缩放、主题切换和源码证据入口。
 
-```text
-Android App (用户/设备密钥)
-        │  HTTPS + WSS / Relay protocol v2
-        │  X25519 signed channel + XChaCha20-Poly1305 secretstream
-        ▼
-Self-hosted Relay / Caddy / TCP 443
-        │  只见 accountId/hostId/deviceId/channelId/counter/kind + 密文
-        │  SQLite WAL：账户、设备、Host、密文快照、近期密文事件、审计
-        ▼
-Windows Host Connector (主动 WSS 出站)
-        │
-        ├─ Desktop Attach plugin → 真实 Codex Desktop 任务
-        └─ codex app-server --stdio → Bridge 自建任务
-```
+[![Agent Pocket v0.3.1 系统架构](docs/diagrams/agent-pocket-system.architecture.visual-check.1440x900.light.png)](docs/diagrams/agent-pocket-system.architecture.html)
+
+### Desktop、app-server 与 writer lock
+
+Codex Desktop 与 Host 启动的 `codex app-server --stdio` 是两个独立的 task host / writer。它们的任务可以出现在同一份 Codex Desktop 列表里，但不能同时写同一个 thread：
+
+| 任务 owner | 唯一 writer | 手机写入路径 | 能力边界 |
+|---|---|---|---|
+| `desktop` | Codex Desktop | Host → Desktop Attach → Desktop 自己的 task tools / queue | 可续写和等待；硬中断、审批与结构化问题仍回 Desktop 处理 |
+| `bridge` | 独立 `codex app-server` | Host → JSON-RPC stdio | 支持续写、steer、中断、审批、问题与 Plan；任务虽可在 Desktop 查看，但不要从 Desktop 续写 |
+
+写保护分两层，不能混为一谈：
+
+1. Host SQLite 的 `thread_owners(thread_id, owner)` 是 Agent Pocket 的持久路由守卫，不是 Codex 锁。首次认领为 `desktop` 或 `bridge` 后，所有手机写请求都只进入对应路径，不自动换 owner。
+2. Codex 的 active turn / writer lock 是运行时互斥。任务正由另一个 writer 执行时，Host 返回 `THREAD_BUSY_EXTERNAL`；Desktop Attach 未就绪或检测到 `not-desktop-host` 时也 fail-closed。
+
+Desktop Attach 插件对用户暴露的三个 MCP 工具仍是只读工具；Host 的远程写入走另一条带随机 token 的本地 named pipe，再委托给 Desktop 自己的任务工具。任何失败都不会删除锁、启动第二个 writer，或把 Desktop-owned 任务回退给 app-server。
+
+[![Desktop、app-server 与 writer lock](docs/diagrams/agent-pocket-writer-ownership.architecture.visual-check.1440x900.light.png)](docs/diagrams/agent-pocket-writer-ownership.architecture.html)
+
+[交互版](docs/diagrams/agent-pocket-writer-ownership.architecture.html) · [PNG 预览](docs/diagrams/agent-pocket-writer-ownership.architecture.visual-check.1440x900.light.png) · [JSON 源规范](docs/diagrams/agent-pocket-writer-ownership.architecture.json)
+
+更多图：
+
+- [新建、续写与 writer 冲突时序（交互版）](docs/diagrams/agent-pocket-task-roundtrip.sequence.html) · [PNG 预览](docs/diagrams/agent-pocket-task-roundtrip.sequence.visual-check.1440x900.light.png) · [JSON 源规范](docs/diagrams/agent-pocket-task-roundtrip.sequence.json)
+- [附件端到端数据流（交互版）](docs/diagrams/agent-pocket-attachments.dataflow.html) · [PNG 预览](docs/diagrams/agent-pocket-attachments.dataflow.visual-check.1440x900.light.png) · [JSON 源规范](docs/diagrams/agent-pocket-attachments.dataflow.json)
+- [同步与失败恢复生命周期（交互版）](docs/diagrams/agent-pocket-sync-recovery.lifecycle.html) · [PNG 预览](docs/diagrams/agent-pocket-sync-recovery.lifecycle.visual-check.1440x900.light.png) · [JSON 源规范](docs/diagrams/agent-pocket-sync-recovery.lifecycle.json)
+- [图表索引、生成方法与校验收据](docs/diagrams/README.md)
+
+旧的 [v0.2.9 架构与信息流](docs/ARCHITECTURE-v0.2.9.md) 保留作历史基线，其中部分默认路径、同步策略和版本状态已经被 v0.3.1 取代。
 
 Relay 只监听 `127.0.0.1:8790`，由独立子域名的 Caddy 站点暴露。Windows Host 主动连接 Relay，不需要 SSH 反向隧道、Windows 入站端口或公网防火墙规则。
 
@@ -66,13 +87,13 @@ Relay 只监听 `127.0.0.1:8790`，由独立子域名的 Caddy 站点暴露。Wi
 
 ## 组件与技术
 
-| 组件 | 技术 |
-|---|---|
-| Android | Kotlin、Jetpack Compose Material 3、OkHttp、kotlinx.serialization、CameraX/ML Kit、Firebase Messaging、libsodium |
-| Windows Host | Node.js 24、TypeScript、`ws`、Node 内置 SQLite、libsodium、PowerShell、Task Scheduler、Inno Setup |
-| Desktop Attach | Codex 插件、Windows named pipe、随机本地令牌、Codex Desktop 任务工具 |
-| Relay | Node.js 24、TypeScript、`ws`、Node 内置 SQLite WAL、firebase-admin、libsodium |
-| 管理后台 | React、TypeScript、Vite、Lucide；HttpOnly/Secure/SameSite=Strict Cookie 与 CSRF |
+| 组件 | 版本 | 技术 |
+|---|---:|---|
+| Android | 0.3.1 | Kotlin、Jetpack Compose Material 3、OkHttp、kotlinx.serialization、CameraX/ML Kit、Firebase Messaging、libsodium |
+| Windows Host / Bridge | 0.3.1 | Node.js 24、TypeScript、`ws`、Node 内置 SQLite、libsodium、PowerShell、Task Scheduler、Inno Setup |
+| Desktop Attach | 0.3.1 | Codex 插件、Windows named pipe、随机本地令牌、Codex Desktop 任务工具 |
+| Relay | 0.3.1 | Node.js 24、TypeScript、`ws`、Node 内置 SQLite WAL、firebase-admin、libsodium |
+| 管理后台 | 0.3.1 | React、TypeScript、Vite、Lucide；HttpOnly/Secure/SameSite=Strict Cookie 与 CSRF |
 
 Android 要求 Android 8.0 或更高版本，`minSdk 26`、`compileSdk/targetSdk 36`。Windows Host 是每 Windows 用户安装；同一电脑的不同 Windows 用户会显示为不同 Host。
 
@@ -97,7 +118,9 @@ node dist/cli.js bootstrap
 
 ### 2. Windows Host
 
-推荐使用每用户 Inno Setup 安装器。首次安装填写 Relay HTTPS 地址和项目白名单，再用已登录 Android 扫描五分钟 Host 二维码。Codex Desktop 必须由同一 Windows 用户自行登录。
+推荐使用每用户 Inno Setup 安装器。首次安装确认 Relay HTTPS 地址、项目白名单和附件临时目录，再用已登录 Android 扫描五分钟 Host 二维码。附件目录可以放到空间充足的其他本地磁盘；缺少新配置的旧安装仍回退到 `%LOCALAPPDATA%\AgentPocket\attachments`。Codex Desktop 必须由同一 Windows 用户自行登录。
+
+安装器会注册 Host 登录启动任务和 Desktop Attach 插件。Codex Desktop 新建或恢复任务时，插件的 `SessionStart` Hook 会自动探测并建立 Attach 通道；它仍依赖 Codex Desktop 已打开且由同一 Windows 用户运行，不会绕过 Desktop 的 writer 所有权。
 
 源码开发：
 
@@ -127,6 +150,22 @@ cd android
 ```
 
 已有用户保存在 Android Keystore/加密偏好中的 Relay 地址优先，不会被构建默认值覆盖。
+
+Windows Host 安装器同样支持通过 `-DefaultRelayUrl` 或 `AGENT_POCKET_DEFAULT_RELAY_URL` 注入可编辑初始值；覆盖升级不会重写现有 `host-config.json`。
+
+## v0.3.1 更新与验证
+
+这一版集中修复了近期手机实测中最影响使用的几条路径：
+
+- 同步失败过的任务会进入待刷新队列，Host 恢复后自动重新读取；
+- 选择模型后可以正常创建 Bridge 任务和 Plan 任务；
+- Android 任务列表过滤已归档任务；
+- 任务详情改为分页读取并与实时事件合并，避免旧结果覆盖新消息；
+- Host 同步使用 single-flight 合并重复触发，较重 JSON 解析移出主线程，减少同步卡顿；
+- Desktop Attach 随 Host 安装并在 Codex Desktop 任务启动或恢复时自动探测；
+- Windows Host 支持独立附件临时目录，Android 与 Host 构建都支持预填可编辑 Relay 地址。
+
+发布前验证结果：Android JVM 29/29、Bridge 65/65、Relay 18/18；Android 签名 Release、R8、lintVital、APK v2 签名，Desktop Attach 三组自检，以及 Windows Host SHA-256/Ed25519 更新签名均通过。
 
 ## v1 迁移
 

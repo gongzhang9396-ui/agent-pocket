@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Agent Pocket v0.3.1 系统架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/gongzhang9396-ui/agent-pocket",
+      "revision": "175beb7e503eb33c24fa69ba5690e2b7f7e677d4"
+    }
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [28, 40],
+    "cols": 5,
+    "gapX": 48,
+    "gapY": 16,
+    "cellW": 125,
+    "cellH": 60
+  },
+  "components": [
+    {
+      "id": "android",
+      "type": "frontend",
+      "label": "Android App",
+      "sublabel": "Compose / Repository",
+      "tag": "设备与账户密钥",
+      "row": 2,
+      "col": 0,
+      "sources": [
+        { "path": "android/app/src/main/java/com/agentpocket/app/data/RpcPocketRepository.kt", "line": 764, "end_line": 823, "label": "连接与重连" },
+        { "path": "android/app/src/main/java/com/agentpocket/app/data/RpcPocketRepository.kt", "line": 1234, "end_line": 1238, "label": "通道加密 RPC" }
+      ]
+    },
+    {
+      "id": "relay",
+      "type": "cloud",
+      "label": "Caddy + Relay",
+      "sublabel": "HTTPS 443 / loopback 8790",
+      "tag": "Relay protocol v2",
+      "row": 2,
+      "col": 1,
+      "sources": [
+        { "path": "relay/src/config.ts", "line": 21, "end_line": 35, "label": "HTTPS 与 loopback" },
+        { "path": "relay/src/server.ts", "line": 176, "end_line": 192, "label": "Device / Host WebSocket" }
+      ]
+    },
+    {
+      "id": "relaydb",
+      "type": "database",
+      "label": "Relay SQLite WAL",
+      "sublabel": "密文事件与快照",
+      "tag": "路由元数据",
+      "row": 4,
+      "col": 1,
+      "sources": [
+        { "path": "relay/src/store.ts", "line": 1, "label": "Relay 数据存储" }
+      ]
+    },
+    {
+      "id": "connector",
+      "type": "security",
+      "label": "Relay Connector",
+      "sublabel": "WSS + E2E 通道",
+      "tag": "Host 主动出站",
+      "row": 2,
+      "col": 2,
+      "sources": [
+        { "path": "bridge/src/relay-connector.ts", "line": 20, "end_line": 34, "label": "HTTPS → WSS" },
+        { "path": "bridge/src/relay-crypto.ts", "line": 275, "end_line": 359, "label": "通道加密" }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "Windows Host",
+      "sublabel": "owner 路由 + 事件同步",
+      "tag": "只写正确 owner",
+      "row": 2,
+      "col": 3,
+      "sources": [
+        { "path": "bridge/src/server.ts", "line": 429, "end_line": 500, "label": "任务创建分流" },
+        { "path": "bridge/src/server.ts", "line": 879, "end_line": 990, "label": "Desktop watcher" }
+      ]
+    },
+    {
+      "id": "bridgedb",
+      "type": "database",
+      "label": "thread_owners",
+      "sublabel": "desktop | bridge / 事件 / 游标",
+      "tag": "持久路由依据",
+      "row": 4,
+      "col": 3,
+      "sources": [
+        { "path": "bridge/src/store.ts", "line": 56, "end_line": 59, "label": "owner 表约束" },
+        { "path": "bridge/src/store.ts", "line": 186, "end_line": 200, "label": "查询与 claim owner" }
+      ]
+    },
+    {
+      "id": "attach",
+      "type": "backend",
+      "label": "Desktop Attach",
+      "sublabel": "Desktop tools pipe + token",
+      "tag": "Desktop 写入通道",
+      "row": 0,
+      "col": 3,
+      "sources": [
+        { "path": "desktop-attach-plugin/server.mjs", "line": 27, "end_line": 36, "label": "IPC 与能力" },
+        { "path": "desktop-attach-plugin/server.mjs", "line": 903, "end_line": 919, "label": "本地令牌认证" }
+      ]
+    },
+    {
+      "id": "desktop",
+      "type": "external",
+      "label": "Codex Desktop",
+      "sublabel": "Desktop-owned 唯一 writer",
+      "tag": "active turn / writer lock",
+      "row": 0,
+      "col": 4,
+      "sources": [
+        { "path": "desktop-attach-plugin/README.md", "line": 21, "end_line": 41, "label": "Desktop 接入边界" }
+      ]
+    },
+    {
+      "id": "appserver",
+      "type": "backend",
+      "label": "codex app-server",
+      "sublabel": "独立 JSON-RPC writer",
+      "tag": "仅 Bridge-owned",
+      "row": 2,
+      "col": 4,
+      "sources": [
+        { "path": "bridge/src/codex.ts", "line": 25, "end_line": 67, "label": "app-server 子进程" }
+      ]
+    },
+    {
+      "id": "attachments",
+      "type": "database",
+      "label": "附件临时目录",
+      "sublabel": "可配置 / 1 小时",
+      "tag": "其他本地磁盘",
+      "row": 4,
+      "col": 4,
+      "sources": [
+        { "path": "bridge/src/config.ts", "line": 42, "end_line": 50, "label": "目录配置" },
+        { "path": "bridge/src/server.ts", "line": 665, "end_line": 699, "label": "文件生命周期" }
+      ]
+    }
+  ],
+  "boundaries": [
+    { "kind": "security-group", "label": "Android 受信任端", "wraps": ["android"], "pad": 18 },
+    { "kind": "region", "label": "公网 Relay", "wraps": ["relay", "relaydb"], "pad": 20 },
+    { "kind": "security-group", "label": "同一 Windows 用户会话（任务可见，writer 互斥）", "wraps": ["connector", "bridge", "bridgedb", "attach", "desktop", "appserver", "attachments"], "pad": 22 }
+  ],
+  "connections": [
+    { "id": "app-to-relay", "from": "android", "to": "relay", "label": "WSS 密文", "variant": "security", "labelAt": [174, 144] },
+    { "id": "relay-to-store", "from": "relay", "to": "relaydb", "label": "密文缓存", "variant": "dashed", "labelAt": [261, 298] },
+    { "id": "relay-to-connector", "from": "relay", "to": "connector", "label": "Host 主动 WSS", "variant": "security", "labelAt": [347, 144] },
+    { "id": "connector-to-bridge", "from": "connector", "to": "bridge", "label": "解密 RPC" },
+    { "id": "bridge-to-store", "from": "bridge", "to": "bridgedb", "label": "查 / claim owner", "labelAt": [607, 298] },
+    { "id": "bridge-to-attach", "from": "bridge", "to": "attach", "label": "Desktop owner：named pipe", "variant": "security", "labelAt": [607, 146] },
+    { "id": "attach-to-desktop", "from": "attach", "to": "desktop", "label": "Desktop 内排队", "variant": "emphasis", "labelAt": [693, 120] },
+    { "id": "bridge-to-appserver", "from": "bridge", "to": "appserver", "label": "仅 Bridge owner", "variant": "emphasis", "labelAt": [693, 178] },
+    { "id": "bridge-to-attachments", "from": "bridge", "to": "attachments", "label": "临时落盘", "variant": "dashed" }
+  ]
+}

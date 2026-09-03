@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Agent Pocket 附件端到端数据流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1068, 620]
+  },
+  "stages": [
+    { "label": "手机来源" },
+    { "label": "附件编码" },
+    { "label": "Relay 路由" },
+    { "label": "Host 处理" },
+    { "label": "Codex 消费" }
+  ],
+  "nodes": [
+    { "id": "picker", "type": "frontend", "label": "图片 / 小文件", "sublabel": "Android URI", "stage": 0, "row": 0, "tag": "用户选择" },
+    { "id": "devicekey", "type": "security", "label": "账户内容密钥", "sublabel": "Android Keystore", "stage": 0, "row": 2, "tag": "仅受信任端持有" },
+    { "id": "encoder", "type": "backend", "label": "Base64 编码", "sublabel": "images + files payload", "stage": 1, "row": 1, "tag": "最多 3 个附件" },
+    { "id": "relay", "type": "messagebus", "label": "Relay", "sublabel": "channel/data 路由", "stage": 2, "row": 1, "tag": "只见元数据 + 密文" },
+    { "id": "hostintake", "type": "security", "label": "Host 解密与校验", "sublabel": "类型、数量、大小白名单", "stage": 3, "row": 1, "tag": "总量 ≤ 800 KiB" },
+    { "id": "temproot", "type": "database", "label": "附件临时目录", "sublabel": "可配置到其他本地磁盘", "stage": 3, "row": 2, "tag": "UUID / 0600 / 1 小时" },
+    { "id": "desktop", "type": "external", "label": "Desktop 任务", "sublabel": "提示词注入 Host 路径", "stage": 4, "row": 0, "tag": "Desktop owner" },
+    { "id": "appserver", "type": "backend", "label": "Bridge 任务", "sublabel": "localImage / 文件", "stage": 4, "row": 2, "tag": "Bridge owner" }
+  ],
+  "flows": [
+    { "id": "pick-to-encode", "from": "picker", "to": "encoder", "label": "读取附件字节", "classification": "用户数据", "variant": "emphasis" },
+    { "id": "key-to-encode", "from": "devicekey", "to": "encoder", "label": "E2E 通道密钥", "classification": "敏感", "variant": "security" },
+    { "id": "encode-to-relay", "from": "encoder", "to": "relay", "label": "images/files 密文", "classification": "E2E", "variant": "security" },
+    { "id": "relay-to-host", "from": "relay", "to": "hostintake", "label": "按 hostId 路由", "classification": "密文", "variant": "security" },
+    { "id": "host-to-store", "from": "hostintake", "to": "temproot", "label": "校验通过后落盘", "classification": "短期用户数据", "variant": "emphasis", "labelAt": [745, 328] },
+    { "id": "store-to-desktop", "from": "temproot", "to": "desktop", "label": "Host 临时路径", "classification": "本机路径", "variant": "default" },
+    { "id": "store-to-appserver", "from": "temproot", "to": "appserver", "label": "localImage / 文件", "classification": "本机输入", "variant": "default", "route": "bottom-channel" }
+  ]
+}
