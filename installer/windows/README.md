@@ -33,7 +33,8 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 ```powershell
 .\build-installer.ps1 `
-  -AppVersion 0.2.0 `
+  -AppVersion 0.3.1 `
+  -DefaultRelayUrl https://relay.example.com `
   -SigningKeyFile C:\secure\agent-pocket-host-update-ed25519-private.pem
 ```
 
@@ -41,7 +42,7 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 ```powershell
 $env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY = Get-Content -Raw C:\secure\agent-pocket-host-update-ed25519-private.pem
-try { .\build-installer.ps1 -AppVersion 0.2.0 }
+try { .\build-installer.ps1 -AppVersion 0.3.1 -DefaultRelayUrl https://relay.example.com }
 finally { Remove-Item Env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY }
 ```
 
@@ -56,6 +57,8 @@ finally { Remove-Item Env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY }
 7. 把公开的 `update-policy.json` 复制到输出目录。
 
 私钥文件、PEM 环境值和任何真实 Relay 配置都不会写入 payload。没有签名私钥时构建会直接失败。
+
+`-DefaultRelayUrl` 只把一个可编辑的初始值编译进首次安装向导，不会包含账号、密码或 Host 身份。省略时仍使用公开占位值 `https://relay.example.com`；正式分发可通过参数或当前进程的 `AGENT_POCKET_DEFAULT_RELAY_URL` 注入实际 HTTPS 地址，避免把私人部署地址提交到 Git。
 
 发布到同一个 GitHub Release 的三个 Host 资产必须精确命名：
 

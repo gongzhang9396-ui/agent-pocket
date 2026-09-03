@@ -1,7 +1,8 @@
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$AppVersion = '0.2.0',
+    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$AppVersion = '0.3.1',
     [string]$NodeVersion = '24.12.0',
     [string]$UpdateApiUrl = 'https://api.github.com/repos/gongzhang9396-ui/agent-pocket/releases/latest',
+    [string]$DefaultRelayUrl = $env:AGENT_POCKET_DEFAULT_RELAY_URL,
     [string]$SigningKeyFile = $env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY_FILE,
     [string]$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 )
@@ -9,6 +10,14 @@ $ErrorActionPreference = 'Stop'
 $updateUri = [Uri]$UpdateApiUrl
 if ($updateUri.Scheme -ne 'https' -or -not $updateUri.Host -or $updateUri.UserInfo -or $updateUri.Fragment) {
     throw 'UpdateApiUrl must be a credential-free HTTPS URL.'
+}
+if ([string]::IsNullOrWhiteSpace($DefaultRelayUrl)) { $DefaultRelayUrl = 'https://relay.example.com' }
+$DefaultRelayUrl = $DefaultRelayUrl.Trim().TrimEnd('/')
+try { $defaultRelayUri = [Uri]$DefaultRelayUrl } catch { throw 'DefaultRelayUrl must be a valid HTTPS URL.' }
+if (-not $defaultRelayUri.IsAbsoluteUri -or $defaultRelayUri.Scheme -ne 'https' -or
+    -not $defaultRelayUri.Host -or $defaultRelayUri.UserInfo -or $defaultRelayUri.Query -or
+    $defaultRelayUri.Fragment -or $DefaultRelayUrl.Contains("'") -or $DefaultRelayUrl.Contains('"')) {
+    throw 'DefaultRelayUrl must be a credential-free HTTPS URL without query, fragment, or quote characters.'
 }
 if (-not $SigningKeyFile -and -not $env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY) {
     throw 'Set AGENT_POCKET_HOST_UPDATE_SIGNING_KEY, AGENT_POCKET_HOST_UPDATE_SIGNING_KEY_FILE, or -SigningKeyFile.'
@@ -142,7 +151,7 @@ foreach ($script in Get-ChildItem -LiteralPath $scriptsStage -Filter '*.ps1' -Fi
 }
 
 if (-not (Test-Path -LiteralPath $InnoCompiler -PathType Leaf)) { throw "Inno Setup compiler not found: $InnoCompiler" }
-& $InnoCompiler "/DMyAppVersion=$AppVersion" (Join-Path $scriptRoot 'AgentPocketHost.iss')
+& $InnoCompiler "/DMyAppVersion=$AppVersion" "/DMyDefaultRelayUrl=$DefaultRelayUrl" (Join-Path $scriptRoot 'AgentPocketHost.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 $installerPath = Join-Path $scriptRoot "output\AgentPocketHost-$AppVersion-windows-x64.exe"
 if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) { throw 'Inno Setup did not produce the expected installer.' }

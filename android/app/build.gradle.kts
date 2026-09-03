@@ -1,3 +1,4 @@
+import java.net.URI
 import java.util.Properties
 
 plugins {
@@ -19,6 +20,24 @@ val signingProperties = signingPropertiesFile.takeIf { it.exists() }?.let { file
 }
 val signingStorePassword = System.getenv("AGENT_POCKET_STORE_PASSWORD")
 val signingKeyPassword = System.getenv("AGENT_POCKET_KEY_PASSWORD")
+val defaultRelayUrl = providers.gradleProperty("agentPocketDefaultRelayUrl")
+    .orNull
+    ?.trim()
+    ?.trimEnd('/')
+    .orEmpty()
+if (defaultRelayUrl.isNotEmpty()) {
+    val relayUri = runCatching { URI(defaultRelayUrl) }.getOrElse {
+        throw GradleException("agentPocketDefaultRelayUrl must be a valid HTTPS URL.")
+    }
+    if (relayUri.scheme != "https" || relayUri.host.isNullOrBlank() || relayUri.userInfo != null ||
+        relayUri.query != null || relayUri.fragment != null || defaultRelayUrl.any { it.isISOControl() }
+    ) {
+        throw GradleException("agentPocketDefaultRelayUrl must be a credential-free HTTPS URL without query or fragment.")
+    }
+}
+val defaultRelayUrlLiteral = defaultRelayUrl
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 if (releaseRequested && (signingProperties == null || signingStorePassword.isNullOrEmpty() || signingKeyPassword.isNullOrEmpty())) {
     throw GradleException("Release signing is required. Run android/scripts/build-release.ps1.")
 }
@@ -33,8 +52,13 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "com.agentpocket.app.data.ReleaseNativeCryptoInstrumentation"
-        versionCode = 29
-        versionName = "0.3.0"
+        versionCode = 30
+        versionName = "0.3.1"
+        buildConfigField(
+            "String",
+            "DEFAULT_RELAY_URL",
+            "\"$defaultRelayUrlLiteral\"",
+        )
         buildConfigField(
             "String",
             "UPDATE_API_URL",

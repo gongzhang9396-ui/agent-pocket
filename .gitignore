@@ -9,6 +9,8 @@ relay/admin/dist/
 installer/windows/payload/
 installer/windows/output/
 installer/windows/.cache/
+output/
+tmp/
 bridge/bridge.env.ps1
 bridge/.tmp-real-codex/
 *.jks

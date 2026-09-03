@@ -1,6 +1,9 @@
 #define MyAppName "Agent Pocket Host"
 #ifndef MyAppVersion
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.3.1"
+#endif
+#ifndef MyDefaultRelayUrl
+#define MyDefaultRelayUrl "https://relay.example.com"
 #endif
 #define MyAppPublisher "Agent Pocket Contributors"
 
@@ -48,7 +51,7 @@ begin
   ExistingConfig := FileExists(ExpandConstant('{localappdata}\AgentPocket\host-config.json'));
   RelayPage := CreateInputQueryPage(wpSelectDir, 'Relay', '连接到你的 Agent Pocket Relay', '输入独立 Relay 子域名。');
   RelayPage.Add('Relay 地址：', False);
-  RelayPage.Values[0] := 'https://relay.example.com';
+  RelayPage.Values[0] := '{#MyDefaultRelayUrl}';
   RootsPage := CreateInputQueryPage(RelayPage.ID, '项目白名单', '允许手机访问的项目根目录', '多个目录使用 Windows 分号分隔。');
   RootsPage.Add('项目根目录：', False);
   RootsPage.Values[0] := ExpandConstant('{userdocs}');

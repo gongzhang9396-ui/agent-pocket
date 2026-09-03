@@ -22,13 +22,13 @@ Relay 必须只监听 `127.0.0.1:8790`，并使用独立 HTTPS 子域名经 Cadd
 npm ci
 npm test
 npm run build
-tar -czf agent-pocket-relay-0.2.0.tar.gz \
+tar -czf agent-pocket-relay-0.3.1.tar.gz \
   dist admin/dist package.json package-lock.json deploy
-sha256sum agent-pocket-relay-0.2.0.tar.gz
+sha256sum agent-pocket-relay-0.3.1.tar.gz
 openssl pkeyutl -sign -rawin \
   -inkey /offline/path/relay-release-ed25519-private.pem \
-  -in agent-pocket-relay-0.2.0.tar.gz \
-  -out agent-pocket-relay-0.2.0.tar.gz.sig
+  -in agent-pocket-relay-0.3.1.tar.gz \
+  -out agent-pocket-relay-0.3.1.tar.gz.sig
 ```
 
 发布私钥不得进入服务器或 Git。服务器只需要对应的 Ed25519 公钥。
@@ -37,10 +37,10 @@ openssl pkeyutl -sign -rawin \
 
 ```bash
 sudo ./deploy/deploy-release.sh \
-  ./agent-pocket-relay-0.2.0.tar.gz \
-  0.2.0 \
+  ./agent-pocket-relay-0.3.1.tar.gz \
+  0.3.1 \
   <sha256> \
-  ./agent-pocket-relay-0.2.0.tar.gz.sig \
+  ./agent-pocket-relay-0.3.1.tar.gz.sig \
   ./relay-release-ed25519-public.pem
 ```
 

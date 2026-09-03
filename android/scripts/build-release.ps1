@@ -1,8 +1,21 @@
+param(
+    [string]$DefaultRelayUrl = $env:AGENT_POCKET_DEFAULT_RELAY_URL
+)
 $ErrorActionPreference = "Stop"
 $AndroidRoot = Split-Path -Parent $PSScriptRoot
 $PasswordFile = Join-Path $env:LOCALAPPDATA "AgentPocket\signing\release-password.clixml"
 $PropertiesFile = Join-Path $AndroidRoot "keystore.properties"
 $ConfigurationCache = Join-Path $AndroidRoot ".gradle\configuration-cache"
+
+if (-not [string]::IsNullOrWhiteSpace($DefaultRelayUrl)) {
+    $DefaultRelayUrl = $DefaultRelayUrl.Trim().TrimEnd('/')
+    try { $DefaultRelayUri = [Uri]$DefaultRelayUrl } catch { throw "DefaultRelayUrl must be a valid HTTPS URL." }
+    if (-not $DefaultRelayUri.IsAbsoluteUri -or $DefaultRelayUri.Scheme -ne 'https' -or
+        -not $DefaultRelayUri.Host -or $DefaultRelayUri.UserInfo -or $DefaultRelayUri.Query -or
+        $DefaultRelayUri.Fragment) {
+        throw "DefaultRelayUrl must be a credential-free HTTPS URL without query or fragment."
+    }
+}
 
 if (-not (Test-Path -LiteralPath $PasswordFile) -or -not (Test-Path -LiteralPath $PropertiesFile)) {
     & (Join-Path $PSScriptRoot "create-release-key.ps1")
@@ -15,7 +28,10 @@ try {
     $env:AGENT_POCKET_STORE_PASSWORD = $PlainPassword
     $env:AGENT_POCKET_KEY_PASSWORD = $PlainPassword
     Push-Location $AndroidRoot
-    try { & .\gradlew.bat --no-daemon --no-configuration-cache :app:assembleRelease } finally { Pop-Location }
+    $GradleArgs = @('--no-daemon', '--no-configuration-cache')
+    if ($DefaultRelayUrl) { $GradleArgs += "-PagentPocketDefaultRelayUrl=$DefaultRelayUrl" }
+    $GradleArgs += ':app:assembleRelease'
+    try { & .\gradlew.bat @GradleArgs } finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { throw "Gradle release build failed." }
 
     $ReleaseDirectory = Join-Path $AndroidRoot "app\build\outputs\apk\release"

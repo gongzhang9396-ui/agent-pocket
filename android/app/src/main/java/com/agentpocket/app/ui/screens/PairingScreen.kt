@@ -42,6 +42,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.agentpocket.app.BuildConfig
 import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.ui.theme.AgentPocketTheme
@@ -59,7 +60,9 @@ fun PairingScreen(
     val paired by repo.isPaired.collectAsState()
     val authStatus by repo.authStatus.collectAsState()
     var mode by rememberSaveable { mutableStateOf(0) }
-    var relayUrl by rememberSaveable { mutableStateOf(host.wssUrl) }
+    var relayUrl by rememberSaveable {
+        mutableStateOf(initialRelayUrl(host.wssUrl, BuildConfig.DEFAULT_RELAY_URL))
+    }
     var username by rememberSaveable { mutableStateOf("") }
     var displayName by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
@@ -211,6 +214,9 @@ fun PairingScreen(
         }
     }
 }
+
+internal fun initialRelayUrl(savedRelayUrl: String, defaultRelayUrl: String): String =
+    savedRelayUrl.ifBlank { defaultRelayUrl }
 
 @Composable
 private fun SecurityPoint(text: String) {

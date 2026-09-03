@@ -331,7 +331,7 @@ private fun SettingsScreenPreview() {
             repo = MockPocketRepository,
             onBack = {},
             onReenterPairing = {},
-            updateState = AppUpdateState.Available("0.2.0", 24L * 1024 * 1024),
+            updateState = AppUpdateState.Available("0.3.2", 24L * 1024 * 1024),
             onCheckForUpdates = {},
             onDownloadUpdate = {},
             onInstallUpdate = {},

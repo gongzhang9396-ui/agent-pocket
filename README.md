@@ -120,6 +120,14 @@ cd android
 
 正式 APK 使用仓库外 keystore 构建。手机只登录 Relay 账号；模型请求仍由 Windows 上已登录的 Codex 发起。
 
+给固定 Relay 的测试用户分发时，可以在构建阶段预填一个仍可编辑的 HTTPS 地址，而不把真实地址写进源码：
+
+```powershell
+.\android\scripts\build-release.ps1 -DefaultRelayUrl https://relay.example.com
+```
+
+已有用户保存在 Android Keystore/加密偏好中的 Relay 地址优先，不会被构建默认值覆盖。
+
 ## v1 迁移
 
 1. 备份旧 Bridge 数据和 Relay/Caddy 配置。
