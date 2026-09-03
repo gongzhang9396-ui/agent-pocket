@@ -210,6 +210,8 @@ export class RelayServer {
   private readonly updateVerificationsInFlight = new Map<string, Promise<string>>();
   private updateReleaseTimer?: NodeJS.Timeout;
   private readonly knownUpdateVersions = new Map<UpdatePlatform, string>();
+  private stopping = false;
+  private stopPromise?: Promise<void>;
 
   constructor(
     readonly config: RelayConfig,
@@ -226,6 +228,7 @@ export class RelayServer {
   }
 
   async start() {
+    if (this.stopping) throw new Error("RelayServer instances cannot be restarted after stop");
     await new Promise<void>((resolve, reject) => {
       this.http.once("error", reject);
       this.http.listen(this.config.port, this.config.bindHost, () => {
@@ -247,17 +250,57 @@ export class RelayServer {
     return { host: address.address, port: address.port };
   }
 
-  async stop() {
+  stop() {
+    this.stopPromise ||= this.stopOnce();
+    return this.stopPromise;
+  }
+
+  private async stopOnce() {
+    this.stopping = true;
     if (this.updateReleaseTimer) clearInterval(this.updateReleaseTimer);
     this.updateReleaseTimer = undefined;
     for (const sessions of this.devices.values()) for (const session of sessions) session.socket.close(1001, "Relay stopping");
     for (const session of this.hosts.values()) session.socket.close(1001, "Relay stopping");
-    await new Promise<void>((resolve) => this.http.close(() => resolve()));
-    this.deviceWss.close();
-    this.hostWss.close();
+    const websocketServersClosed = Promise.all([
+      new Promise<void>((resolve) => this.deviceWss.close(() => resolve())),
+      new Promise<void>((resolve) => this.hostWss.close(() => resolve())),
+    ]);
+
+    const terminateConnections = () => {
+      for (const socket of this.deviceWss.clients) socket.terminate();
+      for (const socket of this.hostWss.clients) socket.terminate();
+      this.http.closeIdleConnections();
+      this.http.closeAllConnections();
+    };
+    const httpClosed = new Promise<void>((resolve, reject) => {
+      this.http.close((error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+        else resolve();
+      });
+    });
+    const forceTimer = setTimeout(terminateConnections, 1_000);
+    forceTimer.unref();
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      deadlineTimer = setTimeout(() => {
+        terminateConnections();
+        resolve();
+      }, 5_000);
+    });
+    try {
+      await Promise.race([Promise.all([httpClosed, websocketServersClosed]), deadline]);
+    } finally {
+      clearTimeout(forceTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      terminateConnections();
+    }
   }
 
   private onUpgrade(req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) {
+    if (this.stopping) {
+      socket.destroy();
+      return;
+    }
     try {
       this.consumeWebSocketAttempt(req);
       const pathname = new URL(req.url || "/", this.config.publicUrl).pathname;

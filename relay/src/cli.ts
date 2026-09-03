@@ -39,15 +39,26 @@ async function main() {
   const server = new RelayServer(config, store);
   await server.start();
   console.log(`Agent Pocket Relay v2 listening on ${config.bindHost}:${config.port}`);
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    await server.stop();
-    store.close();
+  let stopPromise: Promise<void> | undefined;
+  const stop = () => {
+    stopPromise ||= (async () => {
+      try {
+        await server.stop();
+      } finally {
+        store.close();
+      }
+    })();
+    return stopPromise;
   };
-  process.once("SIGINT", () => void stop().then(() => process.exit(0)));
-  process.once("SIGTERM", () => void stop().then(() => process.exit(0)));
+  const shutdown = () => void stop().then(
+    () => process.exit(0),
+    (error) => {
+      console.error(error);
+      process.exit(1);
+    },
+  );
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
 
 main().catch((error) => {

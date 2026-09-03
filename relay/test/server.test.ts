@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -14,6 +15,39 @@ function opened(url: string, token: string) {
     const socket = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
     socket.once("open", () => resolve(socket));
     socket.once("error", reject);
+  });
+}
+
+function rawWebSocket(port: number, token: string) {
+  return new Promise<Socket>((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1");
+    let response = Buffer.alloc(0);
+    socket.once("error", reject);
+    socket.once("connect", () => {
+      socket.write([
+        "GET /ws/device HTTP/1.1",
+        `Host: 127.0.0.1:${port}`,
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}`,
+        "Sec-WebSocket-Version: 13",
+        `Authorization: Bearer ${token}`,
+        "",
+        "",
+      ].join("\r\n"));
+    });
+    socket.on("data", (data) => {
+      response = Buffer.concat([response, data]);
+      if (!response.includes("\r\n\r\n")) return;
+      try {
+        assert.match(response.toString("ascii"), /^HTTP\/1\.1 101 /);
+        socket.removeListener("error", reject);
+        socket.on("error", () => {});
+        resolve(socket);
+      } catch (error) {
+        reject(error);
+      }
+    });
   });
 }
 
@@ -75,6 +109,30 @@ test("admin CSP permits only WebAssembly evaluation required by libsodium", asyn
     await relay.stop();
     context.close();
     rmSync(adminDir, { recursive: true, force: true });
+  }
+});
+
+test("shutdown terminates a WebSocket client that does not complete the close handshake", async () => {
+  const context = tempStore();
+  const owner = account(context.store, "shutdown-owner");
+  const phone = device(context.store, owner.id, "shutdown-phone");
+  const session = context.store.createSession(owner.id, "device", phone.id);
+  const relay = new RelayServer(relayConfig(), context.store);
+  await relay.start();
+  const socket = await rawWebSocket(relay.address()!.port, session.accessToken);
+  try {
+    const socketClosed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    const startedAt = Date.now();
+    const firstStop = relay.stop();
+    assert.equal(relay.stop(), firstStop);
+    await firstStop;
+    await socketClosed;
+    assert.ok(Date.now() - startedAt < 6_000);
+    assert.equal(socket.destroyed, true);
+  } finally {
+    socket.destroy();
+    await relay.stop();
+    context.close();
   }
 });
 
