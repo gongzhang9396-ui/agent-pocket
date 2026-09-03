@@ -27,6 +27,7 @@ interface PocketRepository {
     val accountDevices: StateFlow<List<Device>>
     val isPaired: StateFlow<Boolean>
     val authStatus: StateFlow<String>
+    val pendingHostRelay: StateFlow<String?>
     val threads: StateFlow<List<ThreadSummary>>
 
     val projects: StateFlow<List<Project>>
@@ -103,7 +104,10 @@ interface PocketRepository {
     fun pairFromQr(payload: String)
     fun login(relayUrl: String, username: String, password: String)
     fun claimInvite(inviteUrl: String, relayUrl: String, username: String, displayName: String, password: String)
+    fun prepareHostFromQr(payload: String)
+    fun cancelPendingHostEnrollment()
     fun approveHostFromQr(payload: String, name: String? = null)
+    fun changePassword(currentPassword: String, newPassword: String)
     fun approveDevice(deviceId: String)
     fun revokeAccountDevice(deviceId: String)
     fun resetPairing()

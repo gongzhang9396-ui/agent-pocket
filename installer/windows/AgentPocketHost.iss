@@ -1,6 +1,6 @@
 #define MyAppName "Agent Pocket Host"
 #ifndef MyAppVersion
-#define MyAppVersion "0.3.1"
+#define MyAppVersion "0.3.2"
 #endif
 #ifndef MyDefaultRelayUrl
 #define MyDefaultRelayUrl "https://relay.example.com"
@@ -30,11 +30,11 @@ VersionInfoVersion={#MyAppVersion}
 Source: "payload\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\绑定这台 Windows 电脑"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\enroll-host.ps1"""
-Name: "{group}\检查 Agent Pocket Host 更新"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\check-host-update.ps1"" -InstallDir ""{app}"""
+Name: "{group}\Agent Pocket 配对助手"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\pairing-assistant.ps1"""
+Name: "{group}\检查 Agent Pocket Host 更新"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\check-host-update.ps1"" -InstallDir ""{app}"" -Interactive"
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\enroll-host.ps1"""; Description: "现在绑定这台电脑"; Flags: postinstall skipifsilent nowait; Check: IsFirstInstall
+Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\pairing-assistant.ps1"""; Description: "打开 Agent Pocket 配对助手"; Flags: postinstall skipifsilent nowait; Check: IsFirstInstall
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-host.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "AgentPocketHostUninstall"

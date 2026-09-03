@@ -10,6 +10,7 @@ import android.provider.OpenableColumns
 import android.util.Base64
 import android.webkit.MimeTypeMap
 import com.agentpocket.app.BridgeSyncService
+import com.agentpocket.app.PocketApplication
 import com.agentpocket.app.data.model.ApprovalDecision
 import com.agentpocket.app.data.model.CommandStatus
 import com.agentpocket.app.data.model.ConnectionState
@@ -36,6 +37,7 @@ import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadSummary
 import com.agentpocket.app.data.model.TimelineItem
 import java.net.URI
+import java.net.URLDecoder
 import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.time.ZoneId
@@ -86,6 +88,7 @@ private const val INNER_RPC_TIMEOUT_MS = 30_000L
 private const val MAX_ATTACHMENT_COUNT = 3
 private const val MAX_ATTACHMENT_TOTAL_BYTES = 800 * 1024
 private const val MAX_FILE_ATTACHMENT_BYTES = 512 * 1024
+private const val HOST_ENROLLMENT_TTL_MS = 5 * 60 * 1_000L
 
 private val SAFE_FILE_EXTENSIONS = setOf(
     "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml", "log",
@@ -114,6 +117,22 @@ internal fun shouldMarkSendFailed(currentStatus: MessageStatus?): Boolean =
 internal fun resolveThreadRef(value: String, fallbackHostId: String?): ThreadRef? =
     runCatching { ThreadRef.parse(value) }.getOrNull()
         ?: fallbackHostId?.takeIf { it.isNotBlank() }?.let { ThreadRef(it, value) }
+
+internal fun parseHostEnrollmentQr(payload: String, capturedAt: Long = System.currentTimeMillis()): PendingHostEnrollment? = runCatching {
+    val uri = URI(payload.trim())
+    if (!uri.scheme.equals("agentpocket", true) || !uri.host.equals("relay-host", true)) return null
+    val query = uri.rawQuery.orEmpty().split('&').mapNotNull { part ->
+        val pieces = part.split('=', limit = 2)
+        if (pieces.size != 2) null else URLDecoder.decode(pieces[0], Charsets.UTF_8) to URLDecoder.decode(pieces[1], Charsets.UTF_8)
+    }.toMap()
+    val endpoint = query["relay"]?.trimEnd('/') ?: return null
+    val relay = URI(endpoint)
+    if (!relay.scheme.equals("https", true) || relay.host.isNullOrBlank() || relay.userInfo != null || relay.query != null || relay.fragment != null) return null
+    val enrollmentId = query["enrollmentId"].orEmpty()
+    val secret = query["secret"].orEmpty()
+    if (enrollmentId.isBlank() || secret.isBlank()) return null
+    PendingHostEnrollment(endpoint, enrollmentId, secret, capturedAt)
+}.getOrNull()
 
 private data class ChannelState(
     val crypto: PhoneChannel,
@@ -158,6 +177,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private var relayReady: CompletableDeferred<Unit>? = null
     private var connectionJob: Job? = null
     private var pendingApprovalJob: Job? = null
+    private var hostEnrollmentJob: Job? = null
     private var fullSyncJob: Job? = null
     private var fullSyncRerun = false
     private var fcmToken: String? = null
@@ -179,6 +199,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     override val isPaired: StateFlow<Boolean> = _isPaired.asStateFlow()
     private val _authStatus = MutableStateFlow(if (secure.load()?.deviceStatus == "pending") "等待已有设备批准" else "")
     override val authStatus: StateFlow<String> = _authStatus.asStateFlow()
+    private val _pendingHostRelay = MutableStateFlow(secure.loadPendingHostEnrollment()?.endpoint)
+    override val pendingHostRelay: StateFlow<String?> = _pendingHostRelay.asStateFlow()
     private val _threads = MutableStateFlow<List<ThreadSummary>>(emptyList())
     override val threads: StateFlow<List<ThreadSummary>> = _threads.asStateFlow()
     private val _projects = MutableStateFlow<List<Project>>(emptyList())
@@ -246,19 +268,42 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             runCatching {
                 val existing = secure.load()?.takeIf { sameEndpoint(it.endpoint, relayUrl) && it.username.equals(username, true) }
                 val deviceKeys = existing?.deviceKeys() ?: RelayCrypto.generateDevice()
-                val result = apiPost(
-                    relayUrl,
-                    "/api/auth/login",
-                    obj(
-                        "username" to username,
-                        "password" to password,
-                        "deviceId" to existing?.deviceId,
-                        "deviceName" to Build.MODEL,
-                        "deviceSigningPublicKey" to deviceKeys.signingPublicKey,
-                        "deviceEncryptionPublicKey" to deviceKeys.encryptionPublicKey,
-                    ),
-                ).requireObject("登录")
-                credentialsFromLogin(relayUrl, username.lowercase(), deviceKeys, result, existing)
+                try {
+                    val result = apiPost(
+                        relayUrl,
+                        "/api/auth/login",
+                        obj(
+                            "username" to username,
+                            "password" to password,
+                            "deviceId" to existing?.deviceId,
+                            "deviceName" to Build.MODEL,
+                            "deviceSigningPublicKey" to deviceKeys.signingPublicKey,
+                            "deviceEncryptionPublicKey" to deviceKeys.encryptionPublicKey,
+                        ),
+                    ).requireObject("登录")
+                    credentialsFromLogin(relayUrl, username.lowercase(), deviceKeys, result, existing)
+                } catch (error: BridgeRpcException) {
+                    if (error.nameCode != "ACCOUNT_ACTIVATION_REQUIRED") throw error
+                    val publicConfig = apiGet(relayUrl, "/api/public/config").requireObject("Relay 配置")
+                    val recoveryPublicKey = publicConfig.string("recoveryPublicKey") ?: error("Relay 尚未完成管理员初始化")
+                    val material = withContext(Dispatchers.Default) { RelayCrypto.createRegistration(recoveryPublicKey) }
+                    val result = apiPost(
+                        relayUrl,
+                        "/api/auth/activate",
+                        obj(
+                            "username" to username,
+                            "password" to password,
+                            "deviceName" to Build.MODEL,
+                            "accountSigningPublicKey" to material.accountSigningPublicKey,
+                            "accountEncryptionPublicKey" to material.accountEncryptionPublicKey,
+                            "deviceSigningPublicKey" to material.device.signingPublicKey,
+                            "deviceEncryptionPublicKey" to material.device.encryptionPublicKey,
+                            "escrowCiphertext" to material.escrowCiphertext,
+                            "keyPackage" to material.keyPackage,
+                        ),
+                    ).requireObject("激活账号")
+                    credentialsFromRegistration(relayUrl, username.lowercase(), material, result)
+                }
             }.onSuccess { credentials ->
                 secure.save(credentials)
                 _device.value = deviceModel(credentials)
@@ -267,6 +312,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                     _authStatus.value = "已登录"
                     BridgeSyncService.start(context)
                     reconnect()
+                    (context.applicationContext as? PocketApplication)?.updater?.checkForUpdates()
                 } else {
                     _isPaired.value = false
                     _authStatus.value = "新设备等待已有手机批准"
@@ -319,39 +365,53 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         }
     }
 
-    override fun approveHostFromQr(payload: String, name: String?) {
-        val credentials = secure.load()?.takeIf { it.approved } ?: return
-        val uri = runCatching { Uri.parse(payload) }.getOrNull()
-        if (uri?.scheme != "agentpocket" || uri.host != "relay-host") {
-            _actionError.value = "二维码不是 Agent Pocket Relay Host 绑定码"
+    override fun prepareHostFromQr(payload: String) {
+        val enrollment = parseHostEnrollmentQr(payload)
+        if (enrollment == null) {
+            _actionError.value = "二维码不是有效的 Agent Pocket 电脑绑定码"
             return
         }
-        val relay = uri.getQueryParameter("relay").orEmpty()
-        val enrollmentId = uri.getQueryParameter("enrollmentId").orEmpty()
-        val secret = uri.getQueryParameter("secret").orEmpty()
-        if (!sameEndpoint(credentials.endpoint, relay) || enrollmentId.isBlank() || secret.isBlank()) {
-            _actionError.value = "Host 绑定码不属于当前 Relay 或已经损坏"
+        secure.savePendingHostEnrollment(enrollment)
+        _pendingHostRelay.value = enrollment.endpoint
+        _actionError.value = null
+        val credentials = secure.load()?.takeIf { it.approved }
+        if (credentials == null) {
+            _authStatus.value = "已识别电脑，请输入账号密码继续"
+        } else if (!sameEndpoint(credentials.endpoint, enrollment.endpoint)) {
+            _actionError.value = "这台电脑使用的是另一个 Relay，请重新登录"
+        } else {
+            resumePendingHostEnrollment(credentials)
+        }
+    }
+
+    override fun cancelPendingHostEnrollment() {
+        hostEnrollmentJob?.cancel()
+        secure.clearPendingHostEnrollment()
+        _pendingHostRelay.value = null
+        _actionError.value = null
+        _authStatus.value = if (_isPaired.value) "已登录" else ""
+    }
+
+    override fun approveHostFromQr(payload: String, name: String?) = prepareHostFromQr(payload)
+
+    override fun changePassword(currentPassword: String, newPassword: String) {
+        val credentials = secure.load()?.takeIf { it.approved }
+        if (credentials == null || currentPassword.length !in 12..128 || newPassword.length !in 12..128) {
+            _actionError.value = "当前密码和新密码都必须为 12-128 个字符"
             return
         }
         scope.launch {
             runCatching {
-                val inspected = outerCall("host/enroll/inspect", obj("enrollmentId" to enrollmentId, "secret" to secret)).requireObject("读取 Host")
-                val hostKey = inspected.string("encryption_public_key") ?: error("Host 缺少加密公钥")
-                val packageValue = RelayCrypto.sealHostContentKey(hostKey, credentials.contentKey!!)
-                outerCall(
-                    "host/enroll/approve",
-                    obj(
-                        "enrollmentId" to enrollmentId,
-                        "secret" to secret,
-                        "name" to (name?.takeIf { it.isNotBlank() } ?: inspected.string("requested_name") ?: "Windows Codex"),
-                        "keyPackage" to packageValue,
-                    ),
+                apiPostAuthorized(
+                    credentials.endpoint,
+                    "/api/account/password",
+                    obj("currentPassword" to currentPassword, "newPassword" to newPassword),
+                    credentials.accessToken,
                 )
             }.onSuccess {
                 _actionError.value = null
-                syncHosts()
-            }
-                .onFailure { _actionError.value = "绑定电脑失败：${it.message}" }
+                _authStatus.value = "密码已修改"
+            }.onFailure { _actionError.value = "修改密码失败：${it.message}" }
         }
     }
 
@@ -714,6 +774,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         connectionGeneration.incrementAndGet()
         connectionJob?.cancel()
         pendingApprovalJob?.cancel()
+        hostEnrollmentJob?.cancel()
         fullSyncJob?.cancel()
         fullSyncRerun = false
         val syncJobs = hostSyncJobs.values.toList()
@@ -736,6 +797,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         innerPending.clear()
         pendingCalls.forEach { it.cancel() }
         secure.clear()
+        _pendingHostRelay.value = null
         _isPaired.value = false
         _authStatus.value = "已退出登录"
         _hosts.value = emptyList()
@@ -795,6 +857,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 nextClient.call("relay/hello", obj("protocolVersion" to 2, "deviceId" to credentials.deviceId))
                 nextReady.complete(Unit)
                 backoff = 1_000L
+                approvePendingHostEnrollment(credentials)
                 startFullSync()
                 nextClient.awaitClosed()
             } catch (error: Throwable) {
@@ -1277,6 +1340,9 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 }
             }
             "relay/event" -> applyStoredEvent(params)
+            "update_available" -> if (params.string("platform") == "android") {
+                (context.applicationContext as? PocketApplication)?.updater?.checkForUpdates()
+            }
             "snapshot/updated" -> {
                 val hostId = params.string("hostId") ?: return
                 if (hostInfos[hostId] == null) syncHosts()
@@ -1575,6 +1641,64 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         }
     }
 
+    private fun resumePendingHostEnrollment(credentials: RelayCredentials) {
+        if (hostEnrollmentJob?.isActive == true) return
+        if (rpc == null || relayReady == null) {
+            reconnect()
+            return
+        }
+        hostEnrollmentJob = scope.launch { approvePendingHostEnrollment(credentials) }
+    }
+
+    private suspend fun approvePendingHostEnrollment(credentials: RelayCredentials) {
+        val enrollment = secure.loadPendingHostEnrollment() ?: return
+        if (System.currentTimeMillis() - enrollment.capturedAt >= HOST_ENROLLMENT_TTL_MS) {
+            secure.clearPendingHostEnrollment()
+            _pendingHostRelay.value = null
+            _actionError.value = "电脑绑定二维码已过期，请在配对助手中刷新后重扫"
+            return
+        }
+        if (!sameEndpoint(credentials.endpoint, enrollment.endpoint)) {
+            _actionError.value = "这台电脑使用的是另一个 Relay，请重新登录"
+            return
+        }
+        _authStatus.value = "正在绑定电脑"
+        runCatching {
+            val enrollmentParams = obj("enrollmentId" to enrollment.enrollmentId, "secret" to enrollment.secret)
+            val inspected = outerCall("host/enroll/inspect", enrollmentParams).requireObject("读取电脑")
+            val hostKey = inspected.string("encryption_public_key") ?: error("电脑缺少加密公钥")
+            val packageValue = RelayCrypto.sealHostContentKey(hostKey, credentials.contentKey!!)
+            outerCall(
+                "host/enroll/approve",
+                obj(
+                    "enrollmentId" to enrollment.enrollmentId,
+                    "secret" to enrollment.secret,
+                    "name" to (inspected.string("requested_name") ?: "Windows Codex"),
+                    "keyPackage" to packageValue,
+                ),
+            )
+        }.onSuccess {
+            secure.clearPendingHostEnrollment()
+            _pendingHostRelay.value = null
+            _actionError.value = null
+            _authStatus.value = "电脑已绑定"
+        }.onFailure { error ->
+            if (error is BridgeRpcException && error.nameCode == "AUTH_FAILED") {
+                secure.clearPendingHostEnrollment()
+                _pendingHostRelay.value = null
+                _actionError.value = "电脑绑定二维码无效或已过期，请刷新后重扫"
+                _authStatus.value = "已登录"
+            } else {
+                _actionError.value = "绑定电脑失败：${error.message}"
+                _authStatus.value = "电脑暂未绑定，恢复连接后会自动重试"
+                scope.launch {
+                    delay(5_000)
+                    secure.load()?.takeIf { it.approved }?.let(::resumePendingHostEnrollment)
+                }
+            }
+        }
+    }
+
     private fun pollPendingApproval() {
         if (pendingApprovalJob?.isActive == true) return
         pendingApprovalJob = scope.launch {
@@ -1600,9 +1724,10 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                     _authStatus.value = "设备已批准"
                     BridgeSyncService.start(context)
                     reconnect()
+                    (context.applicationContext as? PocketApplication)?.updater?.checkForUpdates()
                 }.onFailure { error ->
                     if (isPendingSessionRejected(error)) {
-                        secure.clear()
+                        secure.clearCredentials()
                         _device.value = deviceModel(null)
                         _isPaired.value = false
                         _authStatus.value = "待批准设备已失效，请重新登录"
@@ -1652,6 +1777,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private suspend fun apiGet(endpoint: String, path: String, accessToken: String? = null) = apiRequest(endpoint, path, null, accessToken)
     private suspend fun apiPost(endpoint: String, path: String, body: JsonObject) = apiRequest(endpoint, path, body, null)
+    private suspend fun apiPostAuthorized(endpoint: String, path: String, body: JsonObject, accessToken: String) =
+        apiRequest(endpoint, path, body, accessToken)
 
     private suspend fun apiRequest(endpoint: String, path: String, body: JsonObject?, accessToken: String?): JsonElement = withContext(Dispatchers.IO) {
         val base = endpoint.trimEnd('/')

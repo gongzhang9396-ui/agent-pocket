@@ -44,6 +44,7 @@ nav button.active { border-color: #354a3d; color: #eaf5ed; background: #213429; 
 .workspace { min-width: 0; padding: 28px 34px; }
 .workspace header { min-height: 58px; display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 1px solid #2d3531; margin-bottom: 22px; }
 h1 { font-size: 22px; margin: 0 0 5px; }
+h2 { font-size: 17px; margin: 0 0 5px; }
 header p { margin: 0; color: #8e9a93; font-size: 13px; }
 .icon-button { width: 38px; padding: 0; }
 .data-section { border-top: 1px solid #343d38; }
@@ -57,12 +58,21 @@ header p { margin: 0; color: #8e9a93; font-size: 13px; }
 .status { width: fit-content; border-radius: 999px; padding: 3px 8px; font-size: 11px; color: #f1d99e; background: #413719; }
 .status.active { color: #a8ebc2; background: #193a27; }
 .status.offline, .status.disabled { color: #b4bbb7; background: #303633; }
+.status.pending_activation { color: #f7d79b; background: #463816; }
 .actions { display: flex; justify-content: flex-end; gap: 6px; }
 .actions button { min-height: 32px; padding: 5px 8px; font-size: 12px; }
 .device-list { border-top: 1px dashed #354039; padding: 8px 0 8px 28px; }
 .device-list > div { min-height: 40px; display: grid; grid-template-columns: 1fr 120px 80px; align-items: center; gap: 12px; }
 .device-list button { min-height: 30px; padding: 4px 8px; border-color: #713c3c; background: transparent; color: #f0b1b1; }
 .toolbar { display: flex; gap: 10px; margin-bottom: 18px; }
+.create-user { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr auto; gap: 14px; align-items: end; border: 1px solid #35423b; border-radius: 8px; padding: 18px; margin-bottom: 24px; background: #171e1a; }
+.create-user p, .modal p { color: #98a49d; font-size: 12px; margin: 0; line-height: 1.5; }
+.advanced { margin-top: 24px; border: 1px solid #303934; border-radius: 8px; padding: 14px 16px; color: #aeb8b2; }
+.advanced summary { cursor: pointer; }
+.advanced .toolbar { margin-top: 16px; }
+.modal-backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 20px; background: #070907cc; z-index: 10; }
+.modal { width: min(100%, 430px); border: 1px solid #3c4841; border-radius: 9px; padding: 24px; background: #181d1a; box-shadow: 0 20px 70px #000a; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .invite-output { display: grid; grid-template-columns: 1fr 38px; gap: 8px; align-items: center; border: 1px solid #405047; padding: 10px; margin-bottom: 18px; background: #19221d; }
 .invite-output button { min-height: 34px; padding: 0; }
 .spin { animation: spin 1s linear infinite; }
@@ -72,10 +82,11 @@ header p { margin: 0; color: #8e9a93; font-size: 13px; }
   .app-shell { grid-template-columns: 1fr; }
   aside { position: static; height: auto; border-right: 0; border-bottom: 1px solid #2c332f; }
   aside .brand { padding-bottom: 14px; }
-  nav { grid-template-columns: repeat(4, 1fr); }
+  nav { grid-template-columns: repeat(3, 1fr); }
   nav button { flex-direction: column; font-size: 11px; }
   .account { display: none; }
   .workspace { padding: 20px 16px; overflow-x: auto; }
   .form-grid { grid-template-columns: 1fr; }
   .form-action { grid-column: auto; align-items: stretch; flex-direction: column; }
+  .create-user { grid-template-columns: 1fr; align-items: stretch; }
 }

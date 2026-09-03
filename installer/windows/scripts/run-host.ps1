@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $installDir = Split-Path -Parent $PSScriptRoot
 
 function Resolve-CodexCommand([string]$ConfiguredCommand) {

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
 import { hashPassword } from "../src/auth.js";
@@ -49,6 +50,7 @@ function relayConfig() {
     dbPath: "unused",
     publicUrl: "http://127.0.0.1",
     adminDir: "missing",
+    updatesDir: "missing-updates",
   };
 }
 
@@ -73,6 +75,28 @@ test("admin CSP permits only WebAssembly evaluation required by libsodium", asyn
     await relay.stop();
     context.close();
     rmSync(adminDir, { recursive: true, force: true });
+  }
+});
+
+test("admin static files cannot escape into a sibling directory with the same prefix", async () => {
+  const context = tempStore();
+  const adminDir = mkdtempSync(join(tmpdir(), "agent-pocket-admin-root-"));
+  const siblingDir = `${adminDir}-sibling`;
+  mkdirSync(siblingDir);
+  writeFileSync(join(adminDir, "index.html"), "<!doctype html><title>safe</title>");
+  writeFileSync(join(siblingDir, "secret.txt"), "sibling-secret");
+  const relay = new RelayServer({ ...relayConfig(), adminDir }, context.store);
+  await relay.start();
+  try {
+    const relativeEscape = `../${basename(siblingDir)}/secret.txt`;
+    const response = await fetch(`http://127.0.0.1:${relay.address()!.port}/${encodeURIComponent(relativeEscape)}`);
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "<!doctype html><title>safe</title>");
+  } finally {
+    await relay.stop();
+    context.close();
+    rmSync(adminDir, { recursive: true, force: true });
+    rmSync(siblingDir, { recursive: true, force: true });
   }
 });
 
@@ -473,6 +497,277 @@ test("admin recovery API requires CSRF and audits the selected pending device", 
     assert.equal(JSON.stringify(context.store.auditRows(100)).includes("sealed-account-package"), false);
     assert.equal(JSON.stringify(context.store.auditRows(100)).includes("admin-escrow"), false);
   } finally {
+    await relay.stop();
+    context.close();
+  }
+});
+
+test("admin provisions a user and the first phone activates atomically", async () => {
+  const context = tempStore();
+  const adminPassword = "correct-horse-battery";
+  const userPassword = "friend-password-123";
+  const admin = context.store.createAccount({
+    username: "provision-admin",
+    displayName: "Provision Admin",
+    passwordHash: await hashPassword(adminPassword),
+    role: "admin",
+    signingPublicKey: "admin-sign",
+    encryptionPublicKey: "admin-box",
+    escrowCiphertext: "admin-escrow",
+  });
+  const relay = new RelayServer(relayConfig(), context.store);
+  await relay.start();
+  const base = `http://127.0.0.1:${relay.address()!.port}`;
+  try {
+    const adminLogin = await fetch(`${base}/api/admin/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: admin.username, password: adminPassword }),
+    });
+    assert.equal(adminLogin.status, 200);
+    const adminBody = await adminLogin.json() as any;
+    const cookies = cookieJar(adminLogin);
+    const created = await fetch(`${base}/api/admin/users`, {
+      method: "POST",
+      headers: { cookie: cookies, "x-csrf-token": adminBody.csrf, "content-type": "application/json" },
+      body: JSON.stringify({ username: "friend-one", displayName: "Friend One", password: userPassword }),
+    });
+    assert.equal(created.status, 201);
+    const createdBody = await created.json() as any;
+    assert.equal(createdBody.user.status, "pending_activation");
+
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "friend-one",
+        password: userPassword,
+        deviceName: "Friend phone",
+        deviceSigningPublicKey: "device-sign",
+        deviceEncryptionPublicKey: "device-box",
+      }),
+    });
+    assert.equal(login.status, 409);
+    assert.equal((await login.json() as any).error.code, "ACCOUNT_ACTIVATION_REQUIRED");
+
+    const activated = await fetch(`${base}/api/auth/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "friend-one",
+        password: userPassword,
+        displayName: "ignored",
+        accountSigningPublicKey: "account-sign",
+        accountEncryptionPublicKey: "account-box",
+        escrowCiphertext: "escrow-package",
+        deviceName: "Friend phone",
+        deviceSigningPublicKey: "device-sign",
+        deviceEncryptionPublicKey: "device-box",
+        keyPackage: "sealed-account-package",
+      }),
+    });
+    assert.equal(activated.status, 201);
+    const activatedBody = await activated.json() as any;
+    assert.equal(activatedBody.account.displayName, "Friend One");
+    assert.equal(activatedBody.device.status, "approved");
+    assert.ok(activatedBody.tokens.accessToken);
+
+    const replay = await fetch(`${base}/api/auth/activate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: "friend-one",
+        password: userPassword,
+        accountSigningPublicKey: "other-sign",
+        accountEncryptionPublicKey: "other-box",
+        escrowCiphertext: "other-escrow",
+        deviceName: "Other phone",
+        deviceSigningPublicKey: "other-device-sign",
+        deviceEncryptionPublicKey: "other-device-box",
+      }),
+    });
+    assert.equal(replay.status, 401);
+  } finally {
+    await relay.stop();
+    context.close();
+  }
+});
+
+test("device password change keeps its session and admin reset revokes it", async () => {
+  const context = tempStore();
+  const adminPassword = "correct-horse-battery";
+  const oldPassword = "old-password-1234";
+  const newPassword = "new-password-1234";
+  const resetPassword = "reset-password-1234";
+  const admin = context.store.createAccount({
+    username: "password-admin",
+    displayName: "Password Admin",
+    passwordHash: await hashPassword(adminPassword),
+    role: "admin",
+    signingPublicKey: "admin-sign",
+    encryptionPublicKey: "admin-box",
+    escrowCiphertext: "admin-escrow",
+  });
+  const owner = context.store.createAccount({
+    username: "password-user",
+    displayName: "Password User",
+    passwordHash: await hashPassword(oldPassword),
+    role: "user",
+    signingPublicKey: "user-sign",
+    encryptionPublicKey: "user-box",
+    escrowCiphertext: "user-escrow",
+  });
+  const phone = device(context.store, owner.id, "password-user");
+  const deviceSession = context.store.createSession(owner.id, "device", phone.id);
+  const relay = new RelayServer(relayConfig(), context.store);
+  await relay.start();
+  const base = `http://127.0.0.1:${relay.address()!.port}`;
+  try {
+    const changed = await fetch(`${base}/api/account/password`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${deviceSession.accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ currentPassword: oldPassword, newPassword }),
+    });
+    assert.equal(changed.status, 200);
+    assert.ok(context.store.authenticateAccess(deviceSession.accessToken));
+
+    const adminLogin = await fetch(`${base}/api/admin/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: admin.username, password: adminPassword }),
+    });
+    const adminBody = await adminLogin.json() as any;
+    const reset = await fetch(`${base}/api/admin/users/${owner.id}/password`, {
+      method: "POST",
+      headers: { cookie: cookieJar(adminLogin), "x-csrf-token": adminBody.csrf, "content-type": "application/json" },
+      body: JSON.stringify({ newPassword: resetPassword }),
+    });
+    assert.equal(reset.status, 200);
+    assert.equal(context.store.authenticateAccess(deviceSession.accessToken), undefined);
+  } finally {
+    await relay.stop();
+    context.close();
+  }
+});
+
+test("private updates require the matching principal and a signed allowlisted manifest", async () => {
+  const context = tempStore();
+  const updatesDir = join(context.directory, "updates");
+  const version = "0.3.2";
+  const assetName = `Agent-Pocket-${version}-release.apk`;
+  const asset = Buffer.from("signed android package fixture");
+  const assetDir = join(updatesDir, "android", version);
+  mkdirSync(assetDir, { recursive: true });
+  writeFileSync(join(assetDir, assetName), asset);
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const publicKeySpki = publicKey.export({ format: "der", type: "spki" }).toString("base64");
+  const sha256 = (await import("node:crypto")).createHash("sha256").update(asset).digest("hex");
+  const manifestJson = JSON.stringify({
+    schemaVersion: 1,
+    platform: "android",
+    version,
+    versionCode: 302,
+    asset: { name: assetName, size: asset.length, sha256 },
+  });
+  const manifestSignature = sign(null, Buffer.from(manifestJson), privateKey).toString("base64");
+  const adminPassword = "correct-horse-battery";
+  const admin = context.store.createAccount({
+    username: "update-admin",
+    displayName: "Update Admin",
+    passwordHash: await hashPassword(adminPassword),
+    role: "admin",
+    signingPublicKey: "admin-sign",
+    encryptionPublicKey: "admin-box",
+    escrowCiphertext: "admin-escrow",
+  });
+  const owner = account(context.store, "update-owner");
+  const phone = device(context.store, owner.id, "update-phone");
+  const phoneSession = context.store.createSession(owner.id, "device", phone.id);
+  const ownedHost = host(context.store, owner.id, phone.id, "update-host");
+  const relay = new RelayServer({ ...relayConfig(), updatesDir, updatePublicKeySpki: publicKeySpki }, context.store);
+  await relay.start();
+  const base = `http://127.0.0.1:${relay.address()!.port}`;
+  try {
+    const adminLogin = await fetch(`${base}/api/admin/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: admin.username, password: adminPassword }),
+    });
+    const adminBody = await adminLogin.json() as any;
+    const adminHeaders = {
+      cookie: cookieJar(adminLogin),
+      "x-csrf-token": adminBody.csrf,
+      "content-type": "application/json",
+    };
+    const badSignature = await fetch(`${base}/api/admin/updates`, {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ manifestJson, manifestSignature: Buffer.alloc(64).toString("base64") }),
+    });
+    assert.equal(badSignature.status, 403);
+    const published = await fetch(`${base}/api/admin/updates`, {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ manifestJson, manifestSignature }),
+    });
+    assert.equal(published.status, 201);
+
+    assert.equal((await fetch(`${base}/api/updates/android/latest`)).status, 401);
+    assert.equal((await fetch(`${base}/api/updates/android/latest`, {
+      headers: { authorization: `Bearer ${ownedHost.hostToken}` },
+    })).status, 401);
+    const latest = await fetch(`${base}/api/updates/android/latest`, {
+      headers: { authorization: `Bearer ${phoneSession.accessToken}` },
+    });
+    assert.equal(latest.status, 200);
+    const latestBody = await latest.json() as any;
+    assert.equal(latestBody.manifestJson, manifestJson);
+    assert.equal(latestBody.manifestSignature, manifestSignature);
+
+    const download = await fetch(`${base}${new URL(latestBody.downloadUrl).pathname}`, {
+      headers: { authorization: `Bearer ${phoneSession.accessToken}` },
+    });
+    assert.equal(download.status, 200);
+    assert.deepEqual(Buffer.from(await download.arrayBuffer()), asset);
+    assert.equal(download.headers.get("x-checksum-sha256"), sha256);
+    for (let index = 0; index < 9; index += 1) {
+      const head = await fetch(`${base}${new URL(latestBody.downloadUrl).pathname}`, {
+        method: "HEAD",
+        headers: { authorization: `Bearer ${phoneSession.accessToken}` },
+      });
+      assert.equal(head.status, 200);
+    }
+    const throttled = await fetch(`${base}${new URL(latestBody.downloadUrl).pathname}`, {
+      method: "HEAD",
+      headers: { authorization: `Bearer ${phoneSession.accessToken}` },
+    });
+    assert.equal(throttled.status, 429);
+    assert.ok(Number(throttled.headers.get("retry-after")) >= 1);
+    assert.equal((await fetch(`${base}/api/updates/android/${version}/..%2F${assetName}`, {
+      headers: { authorization: `Bearer ${phoneSession.accessToken}` },
+    })).status, 404);
+  } finally {
+    await relay.stop();
+    context.close();
+  }
+});
+
+test("WebSocket connections are capped per device and audited", async () => {
+  const context = tempStore();
+  const owner = account(context.store, "ws-cap-owner");
+  const phone = device(context.store, owner.id, "ws-cap-phone");
+  const session = context.store.createSession(owner.id, "device", phone.id);
+  const relay = new RelayServer(relayConfig(), context.store);
+  await relay.start();
+  const url = `ws://127.0.0.1:${relay.address()!.port}/ws/device`;
+  const sockets: WebSocket[] = [];
+  try {
+    for (let index = 0; index < 4; index += 1) sockets.push(await opened(url, session.accessToken));
+    await assert.rejects(opened(url, session.accessToken));
+    const audits = context.store.auditRows(20).filter((row) => row.action === "ws.connect" && row.actor_id === phone.id);
+    assert.equal(audits.length, 4);
+  } finally {
+    for (const socket of sockets) socket.close();
     await relay.stop();
     context.close();
   }

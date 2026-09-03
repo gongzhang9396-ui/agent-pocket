@@ -76,6 +76,48 @@ test("downloads a Host update only after Ed25519 and SHA-256 verification", asyn
   assert.equal(value.calls.filter((url) => url.endsWith("host.exe")).length, 1);
 });
 
+test("downloads an authenticated Relay update from the exact signed path", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-relay-updater-"));
+  const policyPath = join(base, "update-policy.json");
+  const outputDir = join(base, "updates");
+  const currentVersion = "0.3.2";
+  const version = "0.3.3";
+  const filename = `AgentPocketHost-${version}-windows-x64.exe`;
+  const installer = Buffer.from("private relay installer", "utf8");
+  const sha256 = createHash("sha256").update(installer).digest("hex");
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const publicKeySpki = publicKey.export({ format: "der", type: "spki" }).toString("base64");
+  const apiUrl = "https://relay.example.test/api/updates/host/latest";
+  const downloadUrl = `https://relay.example.test/api/updates/host/${version}/${filename}`;
+  const manifestJson = JSON.stringify({
+    schemaVersion: 1,
+    platform: "host",
+    version,
+    asset: { name: filename, size: installer.length, sha256 },
+  });
+  const manifestSignature = sign(null, Buffer.from(manifestJson), privateKey).toString("base64");
+  writeFileSync(policyPath, JSON.stringify({ schemaVersion: 1, currentVersion, apiUrl, publicKeySpki }));
+  const calls: Array<{ url: string; authorization?: string }> = [];
+  const result = await checkForHostUpdate({
+    policyPath,
+    outputDir,
+    accessToken: "host-token",
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      calls.push({ url, authorization: headers.get("authorization") || undefined });
+      if (url === apiUrl) return response(JSON.stringify({ manifestJson, manifestSignature, downloadUrl }), url);
+      if (url === downloadUrl) return response(installer, url);
+      return new Response("missing", { status: 404 });
+    },
+  });
+  assert.equal(result.status, "ready");
+  assert.deepEqual(calls, [
+    { url: apiUrl, authorization: "Bearer host-token" },
+    { url: downloadUrl, authorization: "Bearer host-token" },
+  ]);
+});
+
 test("rejects a bad update signature before downloading the installer", async () => {
   const value = fixture({ corruptSignature: true });
   await assert.rejects(checkForHostUpdate(value), /签名验证失败/);

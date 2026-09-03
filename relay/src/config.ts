@@ -7,6 +7,8 @@ export type RelayConfig = {
   dbPath: string;
   publicUrl: string;
   adminDir: string;
+  updatesDir: string;
+  updatePublicKeySpki?: string;
   firebaseServiceAccount?: string;
 };
 
@@ -35,6 +37,8 @@ export function loadConfig(env = process.env, cwd = process.cwd()): RelayConfig 
     dbPath: resolve(cwd, env.AGENT_POCKET_RELAY_DB || "data/relay.db"),
     publicUrl,
     adminDir: resolve(cwd, env.AGENT_POCKET_RELAY_ADMIN_DIR || "admin/dist"),
+    updatesDir: resolve(cwd, env.AGENT_POCKET_RELAY_UPDATES_DIR || "data/updates"),
+    updatePublicKeySpki: env.AGENT_POCKET_UPDATE_PUBLIC_KEY_SPKI?.trim() || undefined,
     firebaseServiceAccount: env.AGENT_POCKET_FIREBASE_SERVICE_ACCOUNT
       ? resolve(cwd, env.AGENT_POCKET_FIREBASE_SERVICE_ACCOUNT)
       : undefined,

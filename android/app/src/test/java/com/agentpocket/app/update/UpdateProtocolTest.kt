@@ -16,19 +16,24 @@ class UpdateProtocolTest {
     }
 
     @Test
-    fun requiresMatchingApkAndChecksumAssets() {
-        val apk = GitHubAsset("Agent-Pocket-0.1.10-release.apk", "https://example.invalid/app.apk", 42L)
-        val checksum = GitHubAsset("${apk.name}.sha256", "https://example.invalid/app.sha256", 64L)
-        val candidate = UpdateProtocol.candidate(GitHubRelease("v0.1.10", listOf(apk, checksum)), "0.1.9")
+    fun requiresSignedRelayManifestWithExactApkName() {
+        val manifest = """{"schemaVersion":1,"platform":"android","version":"0.1.10","versionCode":10,"asset":{"name":"Agent-Pocket-0.1.10-release.apk","size":42,"sha256":"${"a".repeat(64)}"}}"""
+        val response = RelayUpdateResponse(manifest, "signature", "https://relay.invalid/api/updates/android/0.1.10/app.apk")
+        val candidate = UpdateProtocol.candidate(response, "0.1.9", 9, signatureValid = true)
 
         assertEquals("0.1.10", candidate?.version)
-        assertEquals(apk, candidate?.apk)
-        assertNull(UpdateProtocol.candidate(GitHubRelease("v0.1.10", listOf(apk)), "0.1.9"))
+        assertEquals(42L, candidate?.size)
+        assertNull(UpdateProtocol.candidate(response, "0.1.10", 10, signatureValid = true))
     }
 
-    @Test
-    fun parsesStandardSha256File() {
-        val checksum = "a".repeat(64)
-        assertEquals(checksum, UpdateProtocol.parseChecksum("$checksum  Agent-Pocket.apk\n"))
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsUnsignedManifest() {
+        val manifest = """{"schemaVersion":1,"platform":"android","version":"0.1.10","versionCode":10,"asset":{"name":"Agent-Pocket-0.1.10-release.apk","size":42,"sha256":"${"a".repeat(64)}"}}"""
+        UpdateProtocol.candidate(
+            RelayUpdateResponse(manifest, "", "https://relay.invalid/api/updates/android/0.1.10/app.apk"),
+            "0.1.9",
+            9,
+            signatureValid = false,
+        )
     }
 }

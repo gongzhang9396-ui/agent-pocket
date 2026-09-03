@@ -23,7 +23,7 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 配置写入 `%LOCALAPPDATA%\AgentPocket\host-config.json`。`attachmentsPath` 可以指向空间充足的其他本地磁盘；缺少该字段的旧配置仍使用 `%LOCALAPPDATA%\AgentPocket\attachments`。也可以直接为 Bridge 设置 `AGENT_POCKET_ATTACHMENTS_DIR`。附件是一小时有效的临时副本。Relay Host 身份、Bridge SQLite 和 Codex 历史仍保存在原状态目录，卸载默认保留它们。
 
-安装完成后，从开始菜单运行“绑定这台 Windows 电脑”，用已登录的 Android v2 扫描五分钟二维码并确认 Host 名称。绑定成功后 Host 任务会重启以加载新身份。
+安装完成后会自动打开“Agent Pocket 配对助手”；开始菜单也保留重复打开入口。助手只显示二维码文件、五分钟倒计时、刷新和连接结果，不把 enrollment secret 写入日志。Android 可以在未登录状态先扫码，登录或首次激活成功后会自动继续 Host inspect/approve；绑定成功后 Host 任务重启以加载新身份。
 
 覆盖升级检测到现有 `host-config.json` 后会跳过 Relay/白名单页面，不重写配置、不删除 Host 身份，也不重复注册 Desktop Attach 插件。首次安装禁止静默模式，避免用示例配置误装。
 
@@ -33,8 +33,9 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 ```powershell
 .\build-installer.ps1 `
-  -AppVersion 0.3.1 `
+  -AppVersion 0.3.2 `
   -DefaultRelayUrl https://relay.example.com `
+  -UpdateApiUrl https://relay.example.com/api/updates/host/latest `
   -SigningKeyFile C:\secure\agent-pocket-host-update-ed25519-private.pem
 ```
 
@@ -42,7 +43,11 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 ```powershell
 $env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY = Get-Content -Raw C:\secure\agent-pocket-host-update-ed25519-private.pem
-try { .\build-installer.ps1 -AppVersion 0.3.1 -DefaultRelayUrl https://relay.example.com }
+try {
+  .\build-installer.ps1 -AppVersion 0.3.2 `
+    -DefaultRelayUrl https://relay.example.com `
+    -UpdateApiUrl https://relay.example.com/api/updates/host/latest
+}
 finally { Remove-Item Env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY }
 ```
 
@@ -58,9 +63,9 @@ finally { Remove-Item Env:AGENT_POCKET_HOST_UPDATE_SIGNING_KEY }
 
 私钥文件、PEM 环境值和任何真实 Relay 配置都不会写入 payload。没有签名私钥时构建会直接失败。
 
-`-DefaultRelayUrl` 只把一个可编辑的初始值编译进首次安装向导，不会包含账号、密码或 Host 身份。省略时仍使用公开占位值 `https://relay.example.com`；正式分发可通过参数或当前进程的 `AGENT_POCKET_DEFAULT_RELAY_URL` 注入实际 HTTPS 地址，避免把私人部署地址提交到 Git。
+`-DefaultRelayUrl` 只把一个可编辑的初始值编译进首次安装向导，不会包含账号、密码或 Host 身份。省略时仍使用公开占位值 `https://relay.example.com`；私有正式分发通过参数或当前进程的 `AGENT_POCKET_DEFAULT_RELAY_URL` 注入实际 HTTPS 地址，避免把私人部署地址提交到公开 Git。
 
-发布到同一个 GitHub Release 的三个 Host 资产必须精确命名：
+0.3.1 的迁移兼容仍识别以下三个 GitHub Release 资产名：
 
 ```text
 AgentPocketHost-<version>-windows-x64.exe
@@ -74,17 +79,21 @@ AgentPocketHost-<version>-windows-x64.exe.sig
 ["agent-pocket-host-update-v1","<version>","<filename>","<sha256-lowercase>",<size>]
 ```
 
-## 自动更新
+## 私有 Relay 自动更新
 
-每日任务下载 GitHub 最新 Release 元数据，要求：
+0.3.2 的私有构建把 `UpdateApiUrl` 指向 `https://<relay>/api/updates/host/latest`。Host 从 DPAPI 身份文件取得 Host token，Relay 只向匹配 Host 返回签名 manifest 和白名单资产；匿名、Android token 和任意 URL 均不能下载 Host 安装包。
 
-- API、证明文件、安装包和最终重定向均使用 HTTPS；
+每日兜底任务和 Relay 的 `update_available` 通知都会启动同一检查器，要求：
+
+- API 和安装包使用同一 HTTPS Relay origin，且下载路径必须精确匹配 manifest；
 - 版本严格高于安装包内的当前版本；
-- 文件名、声明大小、SHA-256 和固定 Ed25519 公钥全部匹配；
+- manifest 签名、文件名、声明大小、SHA-256 和固定 Ed25519 公钥全部匹配；
 - 下载与响应大小不超过策略上限。
 
-校验失败会删除 `.part`，不会出现安装提示。校验成功后由用户确认；脚本写入五分钟维护锁，等待 Bridge 心跳确认维护模式，并再次确认运行状态新鲜且 `activeTaskCount == 0`。只有满足这些条件才会停止 Host 并执行静默覆盖安装。
+校验失败会删除 `.part`。Relay 通知和每日任务在后台静默运行；开始菜单手动检查时才显示确认与错误。脚本写入五分钟维护锁，等待 Bridge 心跳确认维护模式，并再次确认运行状态新鲜且 `activeTaskCount == 0`。只有满足这些条件才会停止 Host 并执行静默覆盖安装。
 
-活动任务、状态未知、状态陈旧、Bridge 未确认维护或 Host 无法停止时都不会强制升级。失败路径会删除维护锁并恢复 Host 计划任务。中断命令在维护阶段仍可用。
+活动任务、状态未知、状态陈旧、Bridge 未确认维护或 Host 无法停止时都不会强制升级。安装前会对回滚副本逐文件计算 SHA-256；失败时先恢复到同级暂存目录，再切换回安装目录。所有失败路径都会删除维护锁并恢复 Host 计划任务。中断命令在维护阶段仍可用。
+
+完整双平台构建、私有 GitHub Release 和固定 SSH 指纹上传由根目录 `scripts/publish-private-release.ps1` 完成。公开仓库的构建默认值始终是占位域名；真实 Relay 和离线 Ed25519 私钥只在发布环境提供。
 
 当前没有 Authenticode 证书，Windows 可能显示 SmartScreen 提示。发布页必须同时提供源码版本、SHA-256 和 Ed25519 签名；不要暗示已经获得系统级代码签名信誉。

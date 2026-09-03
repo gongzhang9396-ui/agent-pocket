@@ -20,6 +20,10 @@ val signingProperties = signingPropertiesFile.takeIf { it.exists() }?.let { file
 }
 val signingStorePassword = System.getenv("AGENT_POCKET_STORE_PASSWORD")
 val signingKeyPassword = System.getenv("AGENT_POCKET_KEY_PASSWORD")
+val appVersion = rootProject.file("../VERSION").readText().trim()
+val appVersionParts = appVersion.split('.').map(String::toInt)
+require(appVersionParts.size == 3) { "Root VERSION must use x.y.z" }
+val appVersionCode = appVersionParts[0] * 10_000 + appVersionParts[1] * 100 + appVersionParts[2]
 val defaultRelayUrl = providers.gradleProperty("agentPocketDefaultRelayUrl")
     .orNull
     ?.trim()
@@ -38,6 +42,12 @@ if (defaultRelayUrl.isNotEmpty()) {
 val defaultRelayUrlLiteral = defaultRelayUrl
     .replace("\\", "\\\\")
     .replace("\"", "\\\"")
+val updatePublicKeySpkiLiteral = providers.gradleProperty("agentPocketUpdatePublicKeySpki")
+    .orNull
+    ?.trim()
+    .orEmpty()
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 if (releaseRequested && (signingProperties == null || signingStorePassword.isNullOrEmpty() || signingKeyPassword.isNullOrEmpty())) {
     throw GradleException("Release signing is required. Run android/scripts/build-release.ps1.")
 }
@@ -52,8 +62,8 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "com.agentpocket.app.data.ReleaseNativeCryptoInstrumentation"
-        versionCode = 30
-        versionName = "0.3.1"
+        versionCode = appVersionCode
+        versionName = appVersion
         buildConfigField(
             "String",
             "DEFAULT_RELAY_URL",
@@ -61,8 +71,8 @@ android {
         )
         buildConfigField(
             "String",
-            "UPDATE_API_URL",
-            "\"https://api.github.com/repos/gongzhang9396-ui/agent-pocket/releases/latest\"",
+            "UPDATE_PUBLIC_KEY_SPKI",
+            "\"$updatePublicKeySpkiLiteral\"",
         )
     }
 

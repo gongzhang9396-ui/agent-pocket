@@ -14,6 +14,10 @@ class PocketMessagingService : FirebaseMessagingService() {
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
+        if (message.data["type"] == "update_available" && message.data["platform"] == "android") {
+            (application as PocketApplication).updater.checkForUpdates()
+            return
+        }
         if (!getSharedPreferences("settings", MODE_PRIVATE).getBoolean("notifications", true)) return
         val type = message.data["type"].orEmpty()
         val hostId = message.data["hostId"].orEmpty()

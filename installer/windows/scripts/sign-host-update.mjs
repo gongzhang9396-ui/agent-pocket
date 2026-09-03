@@ -63,6 +63,35 @@ if (command === "policy") {
   writeFileSync(`${file}.sha256`, `${sha256}  ${filename}\n`, "ascii");
   writeFileSync(`${file}.sig`, `${signature.toString("base64")}\n`, "ascii");
   process.stdout.write(`${JSON.stringify({ file, version, sha256, size, signatureFile: `${file}.sig`, publicKeySpki })}\n`);
+} else if (command === "manifest") {
+  const platform = option("--platform");
+  if (platform !== "android" && platform !== "host") throw new Error("--platform must be android or host");
+  const version = versionOption();
+  const file = resolve(option("--file"));
+  const filename = basename(file);
+  const expected = platform === "android"
+    ? `Agent-Pocket-${version}-release.apk`
+    : `AgentPocketHost-${version}-windows-x64.exe`;
+  if (filename !== expected) throw new Error(`Asset name must be ${expected}`);
+  const versionCodeValue = option("--version-code", false);
+  const versionCode = versionCodeValue === undefined ? undefined : Number(versionCodeValue);
+  if (platform === "android" && (!Number.isSafeInteger(versionCode) || versionCode <= 0)) throw new Error("Android manifest requires --version-code");
+  const size = statSync(file).size;
+  const sha256 = createHash("sha256").update(readFileSync(file)).digest("hex");
+  const manifest = {
+    schemaVersion: 1,
+    platform,
+    version,
+    ...(versionCode === undefined ? {} : { versionCode }),
+    asset: { name: filename, size, sha256 },
+  };
+  const manifestJson = JSON.stringify(manifest);
+  const signature = sign(null, Buffer.from(manifestJson, "utf8"), key);
+  if (!verify(null, Buffer.from(manifestJson, "utf8"), publicKey, signature)) throw new Error("Manifest signing self-check failed");
+  const output = resolve(option("--output"));
+  writeFileSync(output, `${manifestJson}\n`, { encoding: "utf8", mode: 0o600 });
+  writeFileSync(`${output}.sig`, `${signature.toString("base64")}\n`, { encoding: "ascii", mode: 0o600 });
+  process.stdout.write(`${JSON.stringify({ output, signatureFile: `${output}.sig`, platform, version, publicKeySpki, sha256, size })}\n`);
 } else {
-  throw new Error("Usage: sign-host-update.mjs <policy|sign> [options]");
+  throw new Error("Usage: sign-host-update.mjs <policy|sign|manifest> [options]");
 }

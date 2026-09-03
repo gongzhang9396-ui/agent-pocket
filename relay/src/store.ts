@@ -17,6 +17,8 @@ import {
   type PrincipalKind,
 } from "./protocol.js";
 
+const MAX_PENDING_HOST_ENROLLMENTS = 5_000;
+
 type AccountInput = {
   username: string;
   displayName: string;
@@ -36,7 +38,40 @@ type DeviceInput = {
   keyPackage?: string;
 };
 
-const SCHEMA_VERSION = 1;
+type AccountProvisionInput = {
+  username: string;
+  displayName: string;
+  passwordHash: string;
+  createdBy: string;
+};
+
+export type UpdatePlatform = "android" | "host";
+
+export type UpdateReleaseInput = {
+  platform: UpdatePlatform;
+  version: string;
+  versionCode?: number;
+  manifestJson: string;
+  manifestSignature: string;
+  assetName: string;
+  assetPath: string;
+  assetSize: number;
+  assetSha256: string;
+  assetSignature?: string;
+  createdBy: string;
+};
+
+const SCHEMA_VERSION = 2;
+
+function compareReleaseVersions(left: string, right: string) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const compared = (a[index] || 0) - (b[index] || 0);
+    if (compared) return compared;
+  }
+  return 0;
+}
 
 function now() { return Date.now(); }
 
@@ -81,6 +116,15 @@ export class RelayStore {
         escrow_ciphertext TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         disabled_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS account_provisions (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        display_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user' CHECK(role='user'),
+        created_by TEXT NOT NULL REFERENCES accounts(id),
+        created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS invitations (
         id TEXT PRIMARY KEY,
@@ -192,6 +236,29 @@ export class RelayStore {
         revoked_at INTEGER,
         UNIQUE(device_id, installation_id)
       );
+      CREATE TABLE IF NOT EXISTS auth_rate_limits (
+        key_hash TEXT PRIMARY KEY,
+        failure_count INTEGER NOT NULL,
+        last_failure_at INTEGER NOT NULL,
+        blocked_until INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS auth_rate_limits_updated_idx ON auth_rate_limits(last_failure_at);
+      CREATE TABLE IF NOT EXISTS update_releases (
+        platform TEXT NOT NULL CHECK(platform IN ('android','host')),
+        version TEXT NOT NULL,
+        version_code INTEGER,
+        manifest_json TEXT NOT NULL,
+        manifest_signature TEXT NOT NULL,
+        asset_name TEXT NOT NULL,
+        asset_path TEXT NOT NULL,
+        asset_size INTEGER NOT NULL,
+        asset_sha256 TEXT NOT NULL,
+        asset_signature TEXT,
+        published_at INTEGER NOT NULL,
+        created_by TEXT NOT NULL,
+        PRIMARY KEY(platform,version)
+      );
+      CREATE INDEX IF NOT EXISTS update_releases_latest_idx ON update_releases(platform,published_at DESC);
       CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id TEXT,
@@ -266,8 +333,7 @@ export class RelayStore {
     });
   }
 
-  createAccount(input: AccountInput) {
-    const accountId = id();
+  createAccount(input: AccountInput, accountId = id()) {
     this.db.prepare(`INSERT INTO accounts(
       id,username,display_name,password_hash,role,signing_public_key,encryption_public_key,escrow_ciphertext,created_at
     ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
@@ -285,11 +351,78 @@ export class RelayStore {
     return this.db.prepare("SELECT * FROM accounts WHERE username=? COLLATE NOCASE").get(username) as any | undefined;
   }
 
+  accountProvisionByUsername(username: string) {
+    return this.db.prepare("SELECT * FROM account_provisions WHERE username=? COLLATE NOCASE")
+      .get(username) as any | undefined;
+  }
+
+  accountProvisionById(provisionId: string) {
+    return this.db.prepare("SELECT * FROM account_provisions WHERE id=?").get(provisionId) as any | undefined;
+  }
+
+  createAccountProvision(input: AccountProvisionInput) {
+    return this.transaction(() => {
+      if (this.accountByUsername(input.username) || this.accountProvisionByUsername(input.username)) {
+        throw new RelayError("CONFLICT", "用户名已经存在");
+      }
+      const provisionId = id();
+      this.db.prepare(`INSERT INTO account_provisions(
+        id,username,display_name,password_hash,role,created_by,created_at
+      ) VALUES(?,?,?,?,?,?,?)`).run(
+        provisionId, input.username, input.displayName, input.passwordHash, "user", input.createdBy, now(),
+      );
+      this.audit(input.createdBy, "web", input.createdBy, "account.provision.create", "account_provision", provisionId, {
+        username: input.username,
+      });
+      return this.accountProvisionById(provisionId)!;
+    });
+  }
+
+  cancelAccountProvision(provisionId: string, actorId: string) {
+    const provision = this.accountProvisionById(provisionId);
+    if (!provision) throw new RelayError("NOT_FOUND", "待激活用户不存在");
+    const changed = this.db.prepare("DELETE FROM account_provisions WHERE id=?").run(provisionId);
+    if (!changed.changes) throw new RelayError("NOT_FOUND", "待激活用户不存在");
+    this.audit(actorId, "web", actorId, "account.provision.cancel", "account_provision", provisionId, {
+      username: provision.username,
+    });
+  }
+
+  activateAccountProvision(
+    provisionId: string,
+    account: AccountInput,
+    device: Omit<DeviceInput, "accountId" | "approved">,
+  ) {
+    return this.transaction(() => {
+      const provision = this.accountProvisionById(provisionId);
+      if (!provision || provision.username !== account.username) {
+        throw new RelayError("AUTH_FAILED", "用户名或密码错误");
+      }
+      if (this.accountByUsername(account.username)) throw new RelayError("CONFLICT", "用户已经激活");
+      const created = this.createAccount({
+        ...account,
+        displayName: provision.display_name,
+        passwordHash: provision.password_hash,
+        role: "user",
+      }, provision.id);
+      const firstDevice = this.createDevice({ ...device, accountId: created.id, approved: true });
+      const removed = this.db.prepare("DELETE FROM account_provisions WHERE id=?").run(provision.id);
+      if (!removed.changes) throw new RelayError("CONFLICT", "用户已经激活");
+      this.audit(created.id, "device", firstDevice.id, "account.activate", "account", created.id);
+      return { account: created, device: firstDevice };
+    });
+  }
+
   listAccounts() {
-    return this.db.prepare(`SELECT id,username,display_name,role,status,created_at,disabled_at,
-      (SELECT count(*) FROM devices d WHERE d.account_id=accounts.id AND d.status='approved') AS device_count,
-      (SELECT count(*) FROM hosts h WHERE h.account_id=accounts.id AND h.revoked_at IS NULL) AS host_count
-      FROM accounts ORDER BY created_at ASC`).all() as any[];
+    return this.db.prepare(`SELECT * FROM (
+      SELECT id,username,display_name,role,status,created_at,disabled_at,
+        (SELECT count(*) FROM devices d WHERE d.account_id=accounts.id AND d.status='approved') AS device_count,
+        (SELECT count(*) FROM hosts h WHERE h.account_id=accounts.id AND h.revoked_at IS NULL) AS host_count
+        FROM accounts
+      UNION ALL
+      SELECT id,username,display_name,role,'pending_activation' AS status,created_at,NULL AS disabled_at,
+        0 AS device_count,0 AS host_count FROM account_provisions
+      ) ORDER BY created_at ASC`).all() as any[];
   }
 
   listAllHosts() {
@@ -308,6 +441,35 @@ export class RelayStore {
     if (!changed.changes) throw new RelayError("NOT_FOUND", "用户不存在");
     if (disabled) this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL").run(now(), accountId);
     this.audit(accountId, "web", actorId, disabled ? "account.disable" : "account.enable", "account", accountId);
+  }
+
+  changeAccountPassword(accountId: string, passwordHash: string, actorId: string, keepSessionId?: string) {
+    const changed = this.db.prepare("UPDATE accounts SET password_hash=? WHERE id=? AND status='active'")
+      .run(passwordHash, accountId);
+    if (!changed.changes) throw new RelayError("NOT_FOUND", "用户不存在或已停用");
+    if (keepSessionId) {
+      this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND id<>? AND revoked_at IS NULL")
+        .run(now(), accountId, keepSessionId);
+    } else {
+      this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL")
+        .run(now(), accountId);
+    }
+    this.audit(accountId, "device", actorId, "account.password.change", "account", accountId);
+  }
+
+  resetUserPassword(targetId: string, passwordHash: string, actorId: string) {
+    const account = this.accountById(targetId);
+    if (account) {
+      this.db.prepare("UPDATE accounts SET password_hash=? WHERE id=?").run(passwordHash, targetId);
+      this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL").run(now(), targetId);
+      this.audit(targetId, "web", actorId, "account.password.reset", "account", targetId);
+      return "active" as const;
+    }
+    const provision = this.accountProvisionById(targetId);
+    if (!provision) throw new RelayError("NOT_FOUND", "用户不存在");
+    this.db.prepare("UPDATE account_provisions SET password_hash=? WHERE id=?").run(passwordHash, targetId);
+    this.audit(actorId, "web", actorId, "account.provision.password.reset", "account_provision", targetId);
+    return "pending_activation" as const;
   }
 
   createInvite(accountId: string, role: AccountRole, ttlMs = INVITE_TTL_MS) {
@@ -456,12 +618,83 @@ export class RelayStore {
     });
   }
 
+  rateLimitGet(key: string) {
+    return this.db.prepare(`SELECT failure_count AS count,last_failure_at AS lastFailureAt,blocked_until AS blockedUntil
+      FROM auth_rate_limits WHERE key_hash=?`).get(tokenHash(key)) as {
+        count: number;
+        lastFailureAt: number;
+        blockedUntil: number;
+      } | undefined;
+  }
+
+  rateLimitSet(key: string, value: { count: number; lastFailureAt: number; blockedUntil: number }) {
+    this.db.prepare(`INSERT INTO auth_rate_limits(key_hash,failure_count,last_failure_at,blocked_until)
+      VALUES(?,?,?,?) ON CONFLICT(key_hash) DO UPDATE SET failure_count=excluded.failure_count,
+      last_failure_at=excluded.last_failure_at,blocked_until=excluded.blocked_until`)
+      .run(tokenHash(key), value.count, value.lastFailureAt, value.blockedUntil);
+  }
+
+  rateLimitDelete(key: string) {
+    this.db.prepare("DELETE FROM auth_rate_limits WHERE key_hash=?").run(tokenHash(key));
+  }
+
+  rateLimitPrune(before: number, maxEntries: number) {
+    this.db.prepare("DELETE FROM auth_rate_limits WHERE last_failure_at<?").run(before);
+    const count = this.rateLimitSize();
+    if (count < maxEntries) return;
+    this.db.prepare(`DELETE FROM auth_rate_limits WHERE key_hash IN (
+      SELECT key_hash FROM auth_rate_limits ORDER BY last_failure_at ASC LIMIT ?
+    )`).run(count - maxEntries + 1);
+  }
+
+  rateLimitSize() {
+    return Number((this.db.prepare("SELECT count(*) AS value FROM auth_rate_limits").get() as any).value);
+  }
+
+  publishUpdate(input: UpdateReleaseInput) {
+    const latest = this.latestUpdate(input.platform);
+    if (latest && latest.version !== input.version && compareReleaseVersions(input.version, latest.version) <= 0) {
+      throw new RelayError("CONFLICT", "不能发布低于当前版本的更新");
+    }
+    this.db.prepare(`INSERT INTO update_releases(
+      platform,version,version_code,manifest_json,manifest_signature,asset_name,asset_path,asset_size,
+      asset_sha256,asset_signature,published_at,created_by
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(platform,version) DO UPDATE SET
+      version_code=excluded.version_code,manifest_json=excluded.manifest_json,
+      manifest_signature=excluded.manifest_signature,asset_name=excluded.asset_name,
+      asset_path=excluded.asset_path,asset_size=excluded.asset_size,asset_sha256=excluded.asset_sha256,
+      asset_signature=excluded.asset_signature,published_at=excluded.published_at,created_by=excluded.created_by`).run(
+      input.platform, input.version, input.versionCode ?? null, input.manifestJson, input.manifestSignature,
+      input.assetName, input.assetPath, input.assetSize, input.assetSha256, input.assetSignature ?? null,
+      now(), input.createdBy,
+    );
+    this.audit(null, "system", input.createdBy, "update.publish", "update_release", `${input.platform}:${input.version}`);
+    return this.updateRelease(input.platform, input.version)!;
+  }
+
+  latestUpdate(platform: UpdatePlatform) {
+    return (this.db.prepare("SELECT * FROM update_releases WHERE platform=?").all(platform) as any[])
+      .sort((left, right) => compareReleaseVersions(right.version, left.version))[0];
+  }
+
+  updateRelease(platform: UpdatePlatform, version: string) {
+    return this.db.prepare("SELECT * FROM update_releases WHERE platform=? AND version=?")
+      .get(platform, version) as any | undefined;
+  }
+
   startHostEnrollment(name: string, signingPublicKey: string, encryptionPublicKey: string, ttlMs = ENROLLMENT_TTL_MS) {
-    const enrollment = { id: id(), secret: token(24), expiresAt: now() + ttlMs };
-    this.db.prepare(`INSERT INTO host_enrollments(
-      id,secret_hash,requested_name,signing_public_key,encryption_public_key,expires_at,created_at
-    ) VALUES(?,?,?,?,?,?,?)`).run(enrollment.id, tokenHash(enrollment.secret), name, signingPublicKey, encryptionPublicKey, enrollment.expiresAt, now());
-    return enrollment;
+    return this.transaction(() => {
+      const at = now();
+      this.db.prepare("DELETE FROM host_enrollments WHERE expires_at<? OR completed_at IS NOT NULL").run(at);
+      const pending = this.db.prepare("SELECT COUNT(*) AS count FROM host_enrollments").get() as { count: number };
+      if (pending.count >= MAX_PENDING_HOST_ENROLLMENTS) throw new RelayError("RATE_LIMITED", "主机绑定请求数量已达上限");
+      const enrollment = { id: id(), secret: token(24), expiresAt: at + ttlMs };
+      this.db.prepare(`INSERT INTO host_enrollments(
+        id,secret_hash,requested_name,signing_public_key,encryption_public_key,expires_at,created_at
+      ) VALUES(?,?,?,?,?,?,?)`).run(enrollment.id, tokenHash(enrollment.secret), name, signingPublicKey, encryptionPublicKey, enrollment.expiresAt, at);
+      this.audit(null, "system", "anonymous", "host.enroll.start", "host_enrollment", enrollment.id);
+      return enrollment;
+    });
   }
 
   hostEnrollment(enrollmentId: string, secret: string) {
@@ -626,6 +859,13 @@ export class RelayStore {
   pushTokens(accountId: string) {
     return (this.db.prepare(`SELECT p.fcm_token FROM push_tokens p JOIN devices d ON d.id=p.device_id
       WHERE p.account_id=? AND p.revoked_at IS NULL AND d.status='approved'`).all(accountId) as any[])
+      .map((row) => row.fcm_token as string);
+  }
+
+  allPushTokens() {
+    return (this.db.prepare(`SELECT DISTINCT p.fcm_token FROM push_tokens p
+      JOIN devices d ON d.id=p.device_id JOIN accounts a ON a.id=p.account_id
+      WHERE p.revoked_at IS NULL AND d.status='approved' AND a.status='active'`).all() as any[])
       .map((row) => row.fcm_token as string);
   }
 

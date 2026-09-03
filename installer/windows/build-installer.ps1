@@ -1,5 +1,5 @@
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$AppVersion = '0.3.1',
+    [string]$AppVersion,
     [string]$NodeVersion = '24.12.0',
     [string]$UpdateApiUrl = 'https://api.github.com/repos/gongzhang9396-ui/agent-pocket/releases/latest',
     [string]$DefaultRelayUrl = $env:AGENT_POCKET_DEFAULT_RELAY_URL,
@@ -7,6 +7,12 @@ param(
     [string]$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 )
 $ErrorActionPreference = 'Stop'
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$rootVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repoRoot 'VERSION')).Trim()
+if (-not $AppVersion) { $AppVersion = $rootVersion }
+if ($AppVersion -notmatch '^\d+\.\d+\.\d+$' -or $AppVersion -ne $rootVersion) {
+    throw "AppVersion must match root VERSION ($rootVersion)."
+}
 $updateUri = [Uri]$UpdateApiUrl
 if ($updateUri.Scheme -ne 'https' -or -not $updateUri.Host -or $updateUri.UserInfo -or $updateUri.Fragment) {
     throw 'UpdateApiUrl must be a credential-free HTTPS URL.'
@@ -26,7 +32,6 @@ if ($SigningKeyFile -and -not (Test-Path -LiteralPath $SigningKeyFile -PathType 
     throw "Host update signing key was not found: $SigningKeyFile"
 }
 $scriptRoot = [IO.Path]::GetFullPath($PSScriptRoot)
-$repoRoot = [IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
 $payload = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'payload'))
 if (-not $payload.StartsWith($scriptRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid payload path.' }
 if (Test-Path -LiteralPath $payload) { Remove-Item -LiteralPath $payload -Recurse -Force }
@@ -130,6 +135,7 @@ Copy-AllowlistedFiles (Join-Path $scriptRoot 'scripts') $scriptsStage @(
     'check-host-update.ps1',
     'configure-host.ps1',
     'enroll-host.ps1',
+    'pairing-assistant.ps1',
     'register-host-tasks.ps1',
     'run-host.ps1',
     'task-names.ps1',
@@ -150,6 +156,16 @@ foreach ($script in Get-ChildItem -LiteralPath $scriptsStage -Filter '*.ps1' -Fi
     }
 }
 
+if (-not (Test-Path -LiteralPath $InnoCompiler -PathType Leaf)) {
+    $innoInstall = Get-ItemProperty `
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', `
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', `
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -like 'Inno Setup*' -and $_.InstallLocation } |
+        Select-Object -First 1
+    if ($innoInstall) { $InnoCompiler = Join-Path ([string]$innoInstall.InstallLocation) 'ISCC.exe' }
+}
 if (-not (Test-Path -LiteralPath $InnoCompiler -PathType Leaf)) { throw "Inno Setup compiler not found: $InnoCompiler" }
 & $InnoCompiler "/DMyAppVersion=$AppVersion" "/DMyDefaultRelayUrl=$DefaultRelayUrl" (Join-Path $scriptRoot 'AgentPocketHost.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }

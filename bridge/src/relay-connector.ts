@@ -228,6 +228,7 @@ export class RelayConnector extends EventEmitter {
       if (message.method === "channel/open") await this.openChannel(message.params);
       else if (message.method === "channel/data") await this.handleChannelData(message.params);
       else if (message.method === "channel/close") await this.closeChannel(message.params);
+      else if (message.method === "update_available" && message.params?.platform === "host") this.emit("update_available", message.params);
     } catch (error) {
       console.error("Relay channel:", error instanceof Error ? error.message : error);
       const channelId = message.params?.envelope?.channelId;
@@ -412,6 +413,7 @@ export async function waitForHostEnrollment(
   identityPath: string,
   identity: HostIdentity,
   enrollment: { id: string; secret: string; expiresAt: number },
+  onStatus?: (status: { approved: boolean; completed: boolean; expiresAt: number }) => void,
 ) {
   const base = relayHttpUrl(relayUrl);
   const endpoint = (path: string) => new URL(path, `${base.href.replace(/\/$/, "")}/`);
@@ -424,6 +426,11 @@ export async function waitForHostEnrollment(
     });
     const status = await statusResponse.json() as any;
     if (!statusResponse.ok) throw new Error(status?.error?.message || "读取 Host 绑定状态失败");
+    onStatus?.({
+      approved: Boolean(status.approved),
+      completed: Boolean(status.completed),
+      expiresAt: Number(status.expiresAt || enrollment.expiresAt),
+    });
     if (!status.approved) continue;
     const completeResponse = await fetch(endpoint("api/host/enroll/complete"), {
       method: "POST",

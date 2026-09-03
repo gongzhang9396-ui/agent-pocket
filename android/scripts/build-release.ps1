@@ -1,5 +1,6 @@
 param(
-    [string]$DefaultRelayUrl = $env:AGENT_POCKET_DEFAULT_RELAY_URL
+    [string]$DefaultRelayUrl = $env:AGENT_POCKET_DEFAULT_RELAY_URL,
+    [string]$UpdatePublicKeySpki = $env:AGENT_POCKET_UPDATE_PUBLIC_KEY_SPKI
 )
 $ErrorActionPreference = "Stop"
 $AndroidRoot = Split-Path -Parent $PSScriptRoot
@@ -30,6 +31,7 @@ try {
     Push-Location $AndroidRoot
     $GradleArgs = @('--no-daemon', '--no-configuration-cache')
     if ($DefaultRelayUrl) { $GradleArgs += "-PagentPocketDefaultRelayUrl=$DefaultRelayUrl" }
+    if ($UpdatePublicKeySpki) { $GradleArgs += "-PagentPocketUpdatePublicKeySpki=$UpdatePublicKeySpki" }
     $GradleArgs += ':app:assembleRelease'
     try { & .\gradlew.bat @GradleArgs } finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { throw "Gradle release build failed." }

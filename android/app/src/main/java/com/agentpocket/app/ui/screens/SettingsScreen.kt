@@ -27,6 +27,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -35,9 +36,13 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -70,6 +75,11 @@ fun SettingsScreen(
     val device by repo.device.collectAsState()
     val devices by repo.accountDevices.collectAsState()
     val actionError by repo.actionError.collectAsState()
+    val authStatus by repo.authStatus.collectAsState()
+    var showPasswordForm by rememberSaveable { mutableStateOf(false) }
+    var currentPassword by rememberSaveable { mutableStateOf("") }
+    var newPassword by rememberSaveable { mutableStateOf("") }
+    var confirmPassword by rememberSaveable { mutableStateOf("") }
 
     Scaffold(
         topBar = {
@@ -208,6 +218,60 @@ fun SettingsScreen(
                     SectionLabel("账号")
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
+                        onClick = { showPasswordForm = !showPasswordForm },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(if (showPasswordForm) "收起修改密码" else "修改密码")
+                    }
+                    if (showPasswordForm) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = currentPassword,
+                            onValueChange = { currentPassword = it },
+                            label = { Text("当前密码") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = newPassword,
+                            onValueChange = { newPassword = it },
+                            label = { Text("新密码") },
+                            supportingText = { Text("12-128 个字符") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = confirmPassword,
+                            onValueChange = { confirmPassword = it },
+                            label = { Text("确认新密码") },
+                            isError = confirmPassword.isNotEmpty() && confirmPassword != newPassword,
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = { repo.changePassword(currentPassword, newPassword) },
+                            enabled = currentPassword.length in 12..128 && newPassword.length in 12..128 && confirmPassword == newPassword,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("保存新密码")
+                        }
+                        if (authStatus == "密码已修改") {
+                            Spacer(Modifier.height(6.dp))
+                            Text(authStatus, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                        actionError?.let {
+                            Spacer(Modifier.height(6.dp))
+                            Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
                         onClick = onReenterPairing,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
@@ -229,7 +293,7 @@ fun SettingsScreen(
                     Spacer(Modifier.height(8.dp))
                     when (val update = updateState) {
                         AppUpdateState.Idle -> UpdateText("尚未检查更新")
-                        AppUpdateState.Checking -> UpdateText("正在检查 GitHub Release")
+                        AppUpdateState.Checking -> UpdateText("正在通过 Relay 检查私有更新")
                         AppUpdateState.UpToDate -> UpdateText("当前已是最新版本")
                         is AppUpdateState.Available -> UpdateText("发现版本 ${update.version}，安装包约 ${megabytes(update.sizeBytes)} MB")
                         is AppUpdateState.Downloading -> {

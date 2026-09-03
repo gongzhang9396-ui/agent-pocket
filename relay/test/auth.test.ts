@@ -4,6 +4,7 @@ import { hashPassword, verifyPassword } from "../src/auth.js";
 import { sanitizedFcmData } from "../src/fcm.js";
 import { validateEnvelope } from "../src/protocol.js";
 import { LoginThrottle } from "../src/rate-limit.js";
+import { tempStore } from "./helpers.js";
 
 const TEST_COST = { N: 1 << 10, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
 
@@ -38,4 +39,18 @@ test("login throttle bounds source and account tracking entries", () => {
   assert.equal(throttle.size(), 3);
   throttle.failed("fifth", 5);
   assert.equal(throttle.size(), 3);
+});
+
+test("login throttle persists failures in RelayStore", () => {
+  const context = tempStore();
+  try {
+    const first = new LoginThrottle({ freeFailures: 1, persistent: context.store });
+    first.failed("device-account:127.0.0.1:friend", 1_000);
+    const second = new LoginThrottle({ freeFailures: 1, persistent: context.store });
+    assert.throws(() => second.assertAllowed("device-account:127.0.0.1:friend", 1_500), /过于频繁/);
+    second.succeeded("device-account:127.0.0.1:friend");
+    assert.doesNotThrow(() => first.assertAllowed("device-account:127.0.0.1:friend", 1_500));
+  } finally {
+    context.close();
+  }
 });

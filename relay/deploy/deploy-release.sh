@@ -35,6 +35,7 @@ current_link="$root_dir/current"
 service=agent-pocket-relay.service
 install -d -m 0755 -o root -g root "$root_dir/releases"
 install -d -m 0700 -o agent-pocket-relay -g agent-pocket-relay "$data_dir"
+install -d -m 0700 -o agent-pocket-relay -g agent-pocket-relay "$data_dir/updates"
 install -d -m 0700 -o root -g root "$backup_dir"
 exec 9>"$root_dir/deploy.lock"
 flock -n 9 || { echo "another Relay deployment is running" >&2; exit 1; }
@@ -47,13 +48,14 @@ find "$data_dir" -maxdepth 1 -type f \( -name 'relay.db' -o -name 'relay.db-wal'
 rm -rf -- "$release_dir"
 install -d -m 0755 "$release_dir"
 tar -xzf "$artifact" -C "$release_dir"
-[[ -f "$release_dir/dist/cli.js" && -f "$release_dir/admin/dist/index.html" && -f "$release_dir/package-lock.json" ]] || {
+[[ -f "$release_dir/dist/cli.js" && -f "$release_dir/dist/register-update.js" && -f "$release_dir/admin/dist/index.html" && -f "$release_dir/package-lock.json" ]] || {
   echo "release archive is incomplete" >&2
   exit 1
 }
 (cd "$release_dir" && npm ci --omit=dev --ignore-scripts)
 ln -sfn "$release_dir" "$current_link"
 install -m 0644 "$release_dir/deploy/agent-pocket-relay.service" /etc/systemd/system/agent-pocket-relay.service
+install -m 0755 "$release_dir/deploy/register-update.sh" /usr/local/bin/agent-pocket-register-update
 systemctl daemon-reload
 systemctl enable --now "$service"
 

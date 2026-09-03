@@ -75,6 +75,7 @@ object MockPocketRepository : PocketRepository {
     private val _isPaired = MutableStateFlow(true)
     override val isPaired: StateFlow<Boolean> = _isPaired.asStateFlow()
     override val authStatus: StateFlow<String> = MutableStateFlow("已登录").asStateFlow()
+    override val pendingHostRelay: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
 
     override val actionError: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
     override val creatingTask: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
@@ -728,7 +729,10 @@ object MockPocketRepository : PocketRepository {
     override fun pairFromQr(payload: String) = pairManually("wss://agent.example.com/high-entropy-path", payload)
     override fun login(relayUrl: String, username: String, password: String) = pairManually(relayUrl, password)
     override fun claimInvite(inviteUrl: String, relayUrl: String, username: String, displayName: String, password: String) = pairManually(relayUrl, inviteUrl)
+    override fun prepareHostFromQr(payload: String) = Unit
+    override fun cancelPendingHostEnrollment() = Unit
     override fun approveHostFromQr(payload: String, name: String?) = Unit
+    override fun changePassword(currentPassword: String, newPassword: String) = Unit
     override fun approveDevice(deviceId: String) = Unit
     override fun revokeAccountDevice(deviceId: String) = Unit
 

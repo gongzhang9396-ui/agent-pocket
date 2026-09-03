@@ -5,8 +5,11 @@ import { RelayStore } from "../src/store.js";
 
 export function tempStore() {
   const directory = mkdtempSync(join(tmpdir(), "agent-pocket-relay-"));
-  const store = new RelayStore(join(directory, "relay.db"));
+  const path = join(directory, "relay.db");
+  const store = new RelayStore(path);
   return {
+    directory,
+    path,
     store,
     close() {
       store.close();

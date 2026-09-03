@@ -1,6 +1,6 @@
 {
   "name": "agent-pocket-relay",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.json && tsc -p admin/tsconfig.json --noEmit && vite build --config admin/vite.config.ts",
     "start": "node dist/cli.js serve",
     "bootstrap": "tsx src/cli.ts bootstrap",
+    "register-update": "tsx src/register-update.ts",
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {

@@ -32,6 +32,19 @@ type ReleasePayload = {
   assets?: unknown;
 };
 
+type RelayReleasePayload = {
+  manifestJson?: unknown;
+  manifestSignature?: unknown;
+  downloadUrl?: unknown;
+};
+
+type RelayHostManifest = {
+  schemaVersion?: unknown;
+  platform?: unknown;
+  version?: unknown;
+  asset?: unknown;
+};
+
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export type HostUpdateResult =
@@ -46,11 +59,12 @@ function strictVersion(value: unknown, name: string) {
   return version;
 }
 
-function httpsUrl(value: unknown, name: string) {
+function httpsUrl(value: unknown, name: string, allowQuery = true) {
   if (typeof value !== "string") throw new Error(`${name} 无效`);
   let parsed: URL;
   try { parsed = new URL(value); } catch { throw new Error(`${name} 必须是完整 HTTPS URL`); }
-  if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.hash) {
+  if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.hash
+    || (!allowQuery && parsed.search)) {
     throw new Error(`${name} 必须是无凭据和片段的完整 HTTPS URL`);
   }
   return parsed;
@@ -109,9 +123,10 @@ function parseAsset(value: unknown): ReleaseAsset | undefined {
   return { name: asset.name, browser_download_url: asset.browser_download_url, size: Number(asset.size) };
 }
 
-async function responseBytes(response: Response, sourceUrl: URL, maxBytes: number) {
+async function responseBytes(response: Response, sourceUrl: URL, maxBytes: number, sameOrigin = false) {
   if (!response.ok) throw new Error(`Host 更新下载失败 (${response.status})`);
-  httpsUrl(response.url || sourceUrl.href, "更新响应 URL");
+  const responseUrl = httpsUrl(response.url || sourceUrl.href, "更新响应 URL");
+  if (sameOrigin && responseUrl.origin !== sourceUrl.origin) throw new Error("Host 更新响应发生跨域跳转");
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) throw new Error("Host 更新响应超过大小限制");
   if (!response.body) throw new Error("Host 更新响应为空");
@@ -131,23 +146,31 @@ async function responseBytes(response: Response, sourceUrl: URL, maxBytes: numbe
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total);
 }
 
-async function fetchBytes(fetchImpl: FetchLike, url: URL, maxBytes: number, accept: string) {
+function authenticatedHeaders(accessToken: string | undefined, accept: string) {
+  return {
+    Accept: accept,
+    "User-Agent": "Agent-Pocket-Host-Updater",
+    ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+  };
+}
+
+async function fetchBytes(fetchImpl: FetchLike, url: URL, maxBytes: number, accept: string, accessToken?: string) {
   const response = await fetchImpl(url, {
-    headers: { Accept: accept, "User-Agent": "Agent-Pocket-Host-Updater" },
+    headers: authenticatedHeaders(accessToken, accept),
     redirect: "follow",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  return responseBytes(response, url, maxBytes);
+  return responseBytes(response, url, maxBytes, Boolean(accessToken));
 }
 
-async function fetchReleaseMetadata(fetchImpl: FetchLike, url: URL) {
+async function fetchReleaseMetadata(fetchImpl: FetchLike, url: URL, accessToken?: string) {
   const response = await fetchImpl(url, {
-    headers: { Accept: "application/vnd.github+json", "User-Agent": "Agent-Pocket-Host-Updater" },
+    headers: authenticatedHeaders(accessToken, "application/json"),
     redirect: "follow",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (response.status === 404) return undefined;
-  return responseBytes(response, url, MAX_METADATA_BYTES);
+  return responseBytes(response, url, MAX_METADATA_BYTES, Boolean(accessToken));
 }
 
 async function sha256File(path: string) {
@@ -156,14 +179,15 @@ async function sha256File(path: string) {
   return hash.digest("hex");
 }
 
-async function downloadInstaller(fetchImpl: FetchLike, url: URL, partPath: string, maxBytes: number) {
+async function downloadInstaller(fetchImpl: FetchLike, url: URL, partPath: string, maxBytes: number, accessToken?: string) {
   const response = await fetchImpl(url, {
-    headers: { Accept: "application/octet-stream", "User-Agent": "Agent-Pocket-Host-Updater" },
+    headers: authenticatedHeaders(accessToken, "application/octet-stream"),
     redirect: "follow",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`Host 安装包下载失败 (${response.status})`);
-  httpsUrl(response.url || url.href, "安装包响应 URL");
+  const responseUrl = httpsUrl(response.url || url.href, "安装包响应 URL");
+  if (accessToken && responseUrl.origin !== url.origin) throw new Error("Host 安装包下载发生跨域跳转");
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) throw new Error("Host 安装包超过大小限制");
   if (!response.body) throw new Error("Host 安装包响应为空");
@@ -196,17 +220,100 @@ function findAsset(assets: ReleaseAsset[], name: string) {
   return assets.find((asset) => asset.name === name);
 }
 
+function relayCandidate(metadata: RelayReleasePayload, policy: HostUpdatePolicy, apiUrl: URL) {
+  if (typeof metadata.manifestJson !== "string" || typeof metadata.manifestSignature !== "string" || typeof metadata.downloadUrl !== "string") {
+    return undefined;
+  }
+  const signature = decodeBase64(metadata.manifestSignature, "更新清单签名");
+  if (signature.length !== 64) throw new Error("更新清单签名长度无效");
+  const publicKey = createPublicKey({ key: Buffer.from(policy.publicKeySpki, "base64"), format: "der", type: "spki" });
+  if (!verify(null, Buffer.from(metadata.manifestJson, "utf8"), publicKey, signature)) throw new Error("更新清单签名验证失败");
+  const manifest = JSON.parse(metadata.manifestJson) as RelayHostManifest;
+  if (manifest.schemaVersion !== 1 || manifest.platform !== "host") throw new Error("Host 更新清单不兼容");
+  const version = strictVersion(manifest.version, "更新版本");
+  if (!manifest.asset || typeof manifest.asset !== "object" || Array.isArray(manifest.asset)) throw new Error("Host 更新资产清单无效");
+  const asset = manifest.asset as Record<string, unknown>;
+  const filename = `AgentPocketHost-${version}-windows-x64.exe`;
+  if (asset.name !== filename || !Number.isSafeInteger(asset.size) || typeof asset.sha256 !== "string") throw new Error("Host 更新资产清单无效");
+  const size = Number(asset.size);
+  const sha256 = asset.sha256.toLowerCase();
+  if (size <= 0 || size > (policy.maxInstallerBytes || DEFAULT_MAX_INSTALLER_BYTES) || !SHA256_PATTERN.test(sha256)) {
+    throw new Error("Host 更新资产清单无效");
+  }
+  const downloadUrl = httpsUrl(metadata.downloadUrl, "Host 安装包 URL", false);
+  const expectedPath = `/api/updates/host/${encodeURIComponent(version)}/${encodeURIComponent(filename)}`;
+  if (downloadUrl.origin !== apiUrl.origin || downloadUrl.pathname !== expectedPath) {
+    throw new Error("Host 安装包 URL 不属于更新 Relay");
+  }
+  return { version, filename, size, sha256, downloadUrl };
+}
+
+async function materializeInstaller(options: {
+  fetchImpl: FetchLike;
+  outputDir: string;
+  currentVersion: string;
+  version: string;
+  filename: string;
+  size: number;
+  sha256: string;
+  downloadUrl: URL;
+  maxBytes: number;
+  accessToken?: string;
+}): Promise<HostUpdateResult> {
+  const outputDir = resolve(options.outputDir);
+  mkdirSync(outputDir, { recursive: true });
+  const targetPath = join(outputDir, options.filename);
+  const partPath = `${targetPath}.part`;
+  try {
+    if (existsSync(targetPath) && statSync(targetPath).size === options.size && await sha256File(targetPath) === options.sha256) {
+      return { status: "ready", currentVersion: options.currentVersion, version: options.version, file: targetPath, sha256: options.sha256, size: options.size };
+    }
+    rmSync(targetPath, { force: true });
+    const downloaded = await downloadInstaller(options.fetchImpl, options.downloadUrl, partPath, options.maxBytes, options.accessToken);
+    if (downloaded.size !== options.size || downloaded.sha256 !== options.sha256) throw new Error("Host 安装包完整性校验失败");
+    renameSync(partPath, targetPath);
+    return { status: "ready", currentVersion: options.currentVersion, version: options.version, file: targetPath, sha256: options.sha256, size: options.size };
+  } catch (error) {
+    rmSync(partPath, { force: true });
+    throw error;
+  }
+}
+
 export async function checkForHostUpdate(options: {
   policyPath: string;
   outputDir: string;
   fetchImpl?: FetchLike;
+  accessToken?: string;
+  apiUrl?: string;
 }): Promise<HostUpdateResult> {
   const policy = parseHostUpdatePolicy(JSON.parse(readFileSync(resolve(options.policyPath), "utf8")));
   const fetchImpl = options.fetchImpl || fetch;
-  const apiUrl = httpsUrl(policy.apiUrl, "更新 API");
-  const metadataBytes = await fetchReleaseMetadata(fetchImpl, apiUrl);
+  const policyApiUrl = httpsUrl(policy.apiUrl, "更新 API");
+  const apiUrl = options.apiUrl ? httpsUrl(options.apiUrl, "更新 API") : policyApiUrl;
+  if (apiUrl.origin !== policyApiUrl.origin) throw new Error("更新 Relay 与安装包策略不一致");
+  const metadataBytes = await fetchReleaseMetadata(fetchImpl, apiUrl, options.accessToken);
   if (!metadataBytes) return { status: "no-compatible-release", currentVersion: policy.currentVersion };
-  const metadata = JSON.parse(metadataBytes.toString("utf8")) as ReleasePayload;
+  const metadata = JSON.parse(metadataBytes.toString("utf8")) as ReleasePayload & RelayReleasePayload;
+  if (metadata.manifestJson !== undefined || metadata.manifestSignature !== undefined || metadata.downloadUrl !== undefined) {
+    const candidate = relayCandidate(metadata, policy, apiUrl);
+    if (!candidate) throw new Error("Relay 更新响应无效");
+    if (compareVersions(candidate.version, policy.currentVersion) <= 0) {
+      return { status: "up-to-date", currentVersion: policy.currentVersion, latestVersion: candidate.version };
+    }
+    return materializeInstaller({
+      fetchImpl,
+      outputDir: options.outputDir,
+      currentVersion: policy.currentVersion,
+      version: candidate.version,
+      filename: candidate.filename,
+      size: candidate.size,
+      sha256: candidate.sha256,
+      downloadUrl: candidate.downloadUrl,
+      maxBytes: policy.maxInstallerBytes || DEFAULT_MAX_INSTALLER_BYTES,
+      accessToken: options.accessToken,
+    });
+  }
+  if (options.accessToken) throw new Error("Relay 更新响应缺少签名清单");
   if (metadata.draft === true || metadata.prerelease === true) {
     return { status: "no-compatible-release", currentVersion: policy.currentVersion };
   }

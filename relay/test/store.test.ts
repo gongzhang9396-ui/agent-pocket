@@ -1,11 +1,80 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { RelayStore } from "../src/store.js";
 import { account, device, host, tempStore } from "./helpers.js";
 
 test("database initialization records an explicit schema version", () => {
   const context = tempStore();
   try {
-    assert.equal(context.store.meta("schemaVersion"), "1");
+    assert.equal(context.store.meta("schemaVersion"), "2");
+  } finally {
+    context.close();
+  }
+});
+
+test("schema v1 upgrades in place and creates v2 tables", () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-pocket-relay-v1-"));
+  const path = join(directory, "relay.db");
+  const old = new DatabaseSync(path);
+  old.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES('schemaVersion','1')");
+  old.close();
+  const store = new RelayStore(path);
+  try {
+    assert.equal(store.meta("schemaVersion"), "2");
+    const names = (store.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((row) => row.name);
+    assert.ok(names.includes("account_provisions"));
+    assert.ok(names.includes("auth_rate_limits"));
+    assert.ok(names.includes("update_releases"));
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a provision activates exactly one approved first device", () => {
+  const context = tempStore();
+  try {
+    const admin = account(context.store, "provision-admin", "admin");
+    const provision = context.store.createAccountProvision({
+      username: "friend",
+      displayName: "Friend",
+      passwordHash: "hash",
+      createdBy: admin.id,
+    });
+    const claimed = context.store.activateAccountProvision(provision.id, {
+      username: "friend",
+      displayName: "ignored",
+      passwordHash: "ignored",
+      role: "user",
+      signingPublicKey: "account-sign",
+      encryptionPublicKey: "account-box",
+      escrowCiphertext: "escrow",
+    }, {
+      name: "First phone",
+      signingPublicKey: "device-sign",
+      encryptionPublicKey: "device-box",
+      keyPackage: "sealed-account-package",
+    });
+    assert.equal(claimed.account.id, provision.id);
+    assert.equal(claimed.device.status, "approved");
+    assert.equal(context.store.accountProvisionByUsername("friend"), undefined);
+    assert.throws(() => context.store.activateAccountProvision(provision.id, {
+      username: "friend",
+      displayName: "Friend",
+      passwordHash: "hash",
+      role: "user",
+      signingPublicKey: "second-sign",
+      encryptionPublicKey: "second-box",
+      escrowCiphertext: "second-escrow",
+    }, {
+      name: "Second phone",
+      signingPublicKey: "second-device-sign",
+      encryptionPublicKey: "second-device-box",
+    }), /用户名或密码错误/);
   } finally {
     context.close();
   }

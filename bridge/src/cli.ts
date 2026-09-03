@@ -14,7 +14,7 @@ import { RelayConnector, beginHostEnrollment, waitForHostEnrollment } from "./re
 import { loadHostIdentity } from "./relay-crypto.ts";
 
 function usage() {
-  console.log("Agent Pocket Bridge\n\n  serve\n  relay-enroll [https-url]\n  relay-status\n  host-update-check [--policy <file>] [--output <directory>]\n  pair [wss-url]\n  devices\n  revoke <device-id>\n  desktop-probe");
+  console.log("Agent Pocket Bridge\n\n  serve\n  relay-enroll [https-url] [--output ndjson]\n  relay-status [--output ndjson]\n  host-update-check [--policy <file>] [--output <directory>]\n  pair [wss-url]\n  devices\n  revoke <device-id>\n  desktop-probe");
 }
 
 function optionValue(argv: string[], name: string) {
@@ -25,7 +25,7 @@ function optionValue(argv: string[], name: string) {
   return value;
 }
 
-export async function writePairingPng(uri: string, pairingId: string) {
+export async function writePairingPng(uri: string, pairingId: string, openFile = true) {
   try {
     const module = await import("qrcode");
     const qr = module.default ?? module;
@@ -39,11 +39,13 @@ export async function writePairingPng(uri: string, pairingId: string) {
       margin: 4,
       width: 1024,
     });
-    try {
-      const explorer = spawn("explorer.exe", [outputFile], { detached: true, stdio: "ignore" });
-      explorer.unref();
-    } catch {
-      // Opening the file is a convenience; the file path is still printed below.
+    if (openFile) {
+      try {
+        const explorer = spawn("explorer.exe", [outputFile], { detached: true, stdio: "ignore" });
+        explorer.unref();
+      } catch {
+        // Opening the file is a convenience; the file path is still printed below.
+      }
     }
     return outputFile;
   } catch {
@@ -121,7 +123,12 @@ export async function main(argv = process.argv.slice(2)) {
     const installRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
     const policyPath = optionValue(argv, "--policy") || process.env.AGENT_POCKET_UPDATE_POLICY || join(installRoot, "update-policy.json");
     const outputDir = optionValue(argv, "--output") || process.env.AGENT_POCKET_UPDATE_DIR || join(localAppData, "AgentPocket", "updates");
-    const result = await checkForHostUpdate({ policyPath, outputDir });
+    const identityPath = process.env.AGENT_POCKET_RELAY_IDENTITY || join(localAppData, "AgentPocket", "relay-host.json");
+    const identity = loadHostIdentity(identityPath);
+    const apiUrl = identity?.hostToken && identity.relayUrl
+      ? new URL("/api/updates/host/latest", identity.relayUrl).href
+      : undefined;
+    const result = await checkForHostUpdate({ policyPath, outputDir, apiUrl, accessToken: identity?.hostToken });
     console.log(JSON.stringify(result));
     return;
   }
@@ -132,16 +139,40 @@ export async function main(argv = process.argv.slice(2)) {
   const store = new BridgeStore(config.dbPath);
 
   if (command === "relay-enroll") {
-    const relayUrl = argv[1] || config.relayUrl;
+    const output = optionValue(argv, "--output");
+    if (output && output !== "ndjson") throw new Error("--output 仅支持 ndjson");
+    const relayUrl = argv.slice(1).find((value, index, values) =>
+      !value.startsWith("--") && values[index - 1] !== "--output",
+    ) || config.relayUrl;
     if (!relayUrl) throw new Error("缺少 Relay 地址；请执行 relay-enroll https://你的Relay域名");
     const started = await beginHostEnrollment(relayUrl, config.hostName, config.relayIdentityPath);
-    const pngFile = await writePairingPng(started.enrollment.pairUri, started.enrollment.id);
-    console.log(`Relay：${relayUrl}\n有效期：5 分钟\nHost：${config.hostName}`);
-    if (pngFile) console.log(`\n已生成二维码图片并尝试打开：${pngFile}`);
-    console.log("\n请用已登录 Agent Pocket v2 的手机扫码确认这台电脑：");
-    await printPairingQr(started.enrollment.pairUri);
-    await waitForHostEnrollment(relayUrl, config.relayIdentityPath, started.identity, started.enrollment);
-    console.log("\nHost 已绑定。重新启动 Agent Pocket Bridge 后将自动连接 Relay。");
+    const pngFile = await writePairingPng(started.enrollment.pairUri, started.enrollment.id, output !== "ndjson");
+    if (output === "ndjson") {
+      console.log(JSON.stringify({
+        event: "enrollment_started",
+        qrFile: pngFile,
+        expiresAt: started.enrollment.expiresAt,
+        relayUrl,
+        hostName: config.hostName,
+      }));
+    } else {
+      console.log(`Relay：${relayUrl}\n有效期：5 分钟\nHost：${config.hostName}`);
+      if (pngFile) console.log(`\n已生成二维码图片并尝试打开：${pngFile}`);
+      console.log("\n请用 Agent Pocket 手机扫码确认这台电脑：");
+      await printPairingQr(started.enrollment.pairUri);
+    }
+    await waitForHostEnrollment(
+      relayUrl,
+      config.relayIdentityPath,
+      started.identity,
+      started.enrollment,
+      output === "ndjson" ? (status) => console.log(JSON.stringify({ event: "enrollment_status", ...status })) : undefined,
+    );
+    if (output === "ndjson") {
+      console.log(JSON.stringify({ event: "enrollment_completed", enrolled: true }));
+    } else {
+      console.log("\nHost 已绑定。重新启动 Agent Pocket Bridge 后将自动连接 Relay。");
+    }
     store.close();
     return;
   }
@@ -209,6 +240,22 @@ export async function main(argv = process.argv.slice(2)) {
   if (relayUrl && relayIdentity?.hostToken) {
     relayConnector = new RelayConnector(relayUrl, config.relayIdentityPath, relayIdentity, bridge, store);
     relayConnector.on("status", (status) => writeSync(1, `Agent Pocket Relay：${status.connected ? "已连接" : `已断开（${status.error || "正在重连"}）`}\n`));
+    let updateLaunchedAt = 0;
+    relayConnector.on("update_available", () => {
+      if (Date.now() - updateLaunchedAt < 15 * 60_000) return;
+      updateLaunchedAt = Date.now();
+      const installRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+      const script = join(installRoot, "scripts", "check-host-update.ps1");
+      try {
+        const updater = spawn("powershell.exe", [
+          "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+          "-File", script, "-InstallDir", installRoot,
+        ], { detached: true, stdio: "ignore", windowsHide: true });
+        updater.unref();
+      } catch (error) {
+        console.error("Host 更新启动失败:", error instanceof Error ? error.message : error);
+      }
+    });
     relayConnector.start();
   } else if (relayUrl) {
     writeSync(1, "Agent Pocket Relay：尚未绑定，请执行 relay-enroll\n");

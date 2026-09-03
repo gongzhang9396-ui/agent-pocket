@@ -39,25 +39,41 @@ internal data class RelayCredentials(
     val approved: Boolean get() = deviceStatus == "approved" && !contentKey.isNullOrBlank()
 }
 
+@Serializable
+internal data class PendingHostEnrollment(
+    val endpoint: String,
+    val enrollmentId: String,
+    val secret: String,
+    val capturedAt: Long,
+)
+
 internal class SecurePrefs(context: Context) {
     private val prefs = context.getSharedPreferences("relay_v2", Context.MODE_PRIVATE)
     private val alias = "agent-pocket-relay-v2"
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
     fun save(credentials: RelayCredentials) {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key())
-        val plaintext = json.encodeToString(credentials).toByteArray()
-        prefs.edit()
-            .putString("credentials", Base64.encodeToString(cipher.doFinal(plaintext), Base64.NO_WRAP))
-            .putString("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-            .apply()
+        saveEncrypted("credentials", json.encodeToString(credentials))
     }
 
     fun load(): RelayCredentials? = runCatching {
-        val encoded = prefs.getString("credentials", null) ?: return null
-        json.decodeFromString<RelayCredentials>(decrypt(encoded))
-    }.getOrElse { clear(); null }
+        json.decodeFromString<RelayCredentials>(loadEncrypted("credentials") ?: return null)
+    }.getOrElse { clearCredentials(); null }
+
+    fun savePendingHostEnrollment(enrollment: PendingHostEnrollment) {
+        saveEncrypted("pendingHostEnrollment", json.encodeToString(enrollment))
+    }
+
+    fun loadPendingHostEnrollment(): PendingHostEnrollment? = runCatching {
+        json.decodeFromString<PendingHostEnrollment>(loadEncrypted("pendingHostEnrollment") ?: return null)
+    }.getOrElse { clearPendingHostEnrollment(); null }
+
+    fun clearPendingHostEnrollment() {
+        prefs.edit()
+            .remove("pendingHostEnrollment")
+            .remove("pendingHostEnrollment:iv")
+            .apply()
+    }
 
     fun lastSeq(hostId: String): Long = prefs.getLong("lastSeq:$hostId", 0)
 
@@ -74,9 +90,27 @@ internal class SecurePrefs(context: Context) {
         prefs.edit().clear().apply()
     }
 
-    private fun decrypt(encoded: String): String {
+    fun clearCredentials() {
+        prefs.edit().remove("credentials").remove("credentials:iv").remove("iv").apply()
+    }
+
+    private fun saveEncrypted(name: String, value: String) {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        prefs.edit()
+            .putString(name, Base64.encodeToString(cipher.doFinal(value.toByteArray()), Base64.NO_WRAP))
+            .putString("$name:iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .apply()
+    }
+
+    private fun loadEncrypted(name: String): String? {
+        val encoded = prefs.getString(name, null) ?: return null
         val encrypted = Base64.decode(encoded, Base64.NO_WRAP)
-        val iv = Base64.decode(prefs.getString("iv", null), Base64.NO_WRAP)
+        // "iv" is the v0.3.1 credential key and remains readable during upgrade.
+        val encodedIv = prefs.getString("$name:iv", null)
+            ?: (if (name == "credentials") prefs.getString("iv", null) else null)
+            ?: error("加密数据缺少 IV")
+        val iv = Base64.decode(encodedIv, Base64.NO_WRAP)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
         return cipher.doFinal(encrypted).toString(Charsets.UTF_8)

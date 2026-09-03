@@ -1,4 +1,4 @@
-# Agent Pocket 0.3.1 朋友测试安装说明
+# Agent Pocket 0.3.2 朋友测试安装说明
 
 > 这是一份小范围测试说明。Agent Pocket 仍处于实验阶段，请只在你信任的电脑、手机和项目目录上使用。
 
@@ -6,12 +6,12 @@
 
 压缩包中包含：
 
-- `Agent-Pocket-0.3.1-release.apk`：Android 手机端；
-- `AgentPocketHost-0.3.1-windows-x64.exe`：Windows Host 安装器；
+- `Agent-Pocket-0.3.2-release.apk`：Android 手机端；
+- `AgentPocketHost-0.3.2-windows-x64.exe`：Windows Host 安装器；
 - 对应的 `.sha256`、`.sig` 和 `SHA256SUMS.txt`：完整性校验文件；
 - 本安装说明的 Markdown 和 PDF 版本。
 
-本测试包已经预填 Relay 地址。这个地址仍然可以修改；升级安装也不会覆盖你已经保存的 Relay 地址。账号、密码、邀请信息和设备身份均不包含在安装包中。
+本测试包已经预填 Relay 地址，一般无需手工填写；升级安装也不会覆盖已保存的地址。账号、密码和设备身份均不包含在安装包中。
 
 ## 安装前准备
 
@@ -19,7 +19,7 @@
 - Windows 10/11 x64 电脑；
 - Windows 上已安装最新版 ChatGPT Desktop，并已经登录可使用 Codex 的账号；
 - 一个已经存在的项目目录，例如 `D:\Projects`；
-- 管理员单独发给你的 Agent Pocket 邀请链接；
+- 管理员单独发给你的 Agent Pocket 用户名和初始密码；
 - 手机与电脑都能访问互联网，不要求处在同一 Wi-Fi 或 VPN。
 
 ChatGPT Desktop 的官方安装与登录说明：<https://learn.chatgpt.com/docs/app>
@@ -29,8 +29,8 @@ ChatGPT Desktop 的官方安装与登录说明：<https://learn.chatgpt.com/docs
 解压后，在该目录打开 PowerShell：
 
 ```powershell
-Get-FileHash .\Agent-Pocket-0.3.1-release.apk -Algorithm SHA256
-Get-FileHash .\AgentPocketHost-0.3.1-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\Agent-Pocket-0.3.2-release.apk -Algorithm SHA256
+Get-FileHash .\AgentPocketHost-0.3.2-windows-x64.exe -Algorithm SHA256
 Get-Content .\SHA256SUMS.txt
 ```
 
@@ -49,18 +49,16 @@ Agent Pocket 不会替你登录 ChatGPT，也不会把模型调用放到手机�
 
 ## 第三步：安装 Android App
 
-1. 把 `Agent-Pocket-0.3.1-release.apk` 发送到手机并打开；
+1. 把 `Agent-Pocket-0.3.2-release.apk` 发送到手机并打开；
 2. Android 如提示“允许安装未知应用”，只为当前文件来源临时授权；
 3. 安装并打开 Agent Pocket；
-4. Relay 地址已经预填，一般不需要修改；
-5. 打开管理员给你的邀请链接，填写用户名、显示名称和密码；
-6. 完成注册并登录。新手机如显示“等待批准”，请联系管理员或由已有可信手机批准。
+4. 先停留在“扫描电脑二维码”页面，不需要提前注册，也不需要邀请链接。
 
-密码长度为 12-128 个字符。邀请链接只能发给目标用户，不要截图或转发到公开群聊。
+密码长度为 12-128 个字符。用户名和密码只应通过可信渠道接收，不要截图或转发到公开群聊。
 
 ## 第四步：安装 Windows Host
 
-1. 运行 `AgentPocketHost-0.3.1-windows-x64.exe`；
+1. 运行 `AgentPocketHost-0.3.2-windows-x64.exe`；
 2. Relay 地址已经预填，一般不需要修改；
 3. “项目白名单”填写允许手机操作的项目根目录。多个目录用英文分号分隔，例如：
 
@@ -70,19 +68,23 @@ Agent Pocket 不会替你登录 ChatGPT，也不会把模型调用放到手机�
 
 4. “附件临时目录”建议选择空间充足的本地磁盘，例如 `D:\AgentPocketData\attachments`；
 5. 完成安装。安装器按当前 Windows 用户安装，不要求管理员权限；
-6. 如果安装后没有自动出现绑定窗口，从开始菜单打开“Agent Pocket > 绑定这台 Windows 电脑”。
+6. 安装完成后“Agent Pocket 配对助手”会自动打开。如果没有出现，从开始菜单打开“Agent Pocket > 绑定这台 Windows 电脑”。
 
 Host 不会修改系统代理、防火墙或休眠设置。附件只在 Host 上临时落盘，默认一小时后清理。
 
 ## 第五步：绑定电脑
 
-1. Windows 绑定窗口生成二维码；二维码默认有效 5 分钟；
-2. Android Agent Pocket 中打开主机绑定/扫码页面；
-3. 允许相机权限，扫描二维码并核对电脑名称；
-4. 等待 Windows 显示绑定成功；
-5. 返回手机刷新，确认 Host 显示在线。
+1. Windows 配对助手生成二维码；二维码默认有效 5 分钟；
+2. Android Agent Pocket 点击“扫描电脑二维码”，允许相机权限并扫码；
+3. Relay 地址会自动填写。输入管理员发给你的用户名和密码；
+4. 如果这是该账号的第一台手机，Relay 会自动激活手机并绑定电脑；无需管理员批准，也无需再次扫码；
+5. Windows 显示“绑定成功”后，手机会自动进入任务列表并显示 Host 在线。
 
-若 Codex Desktop 弹出 Agent Pocket `SessionStart` Hook 信任提示，请阅读内容后，只信任 Agent Pocket 提供的这一条 Hook。首次信任后重新打开一个 Codex 任务；不要顺便信任来源不明的其他 Hook。
+密码错误时修正后重试即可；Host 暂时离线时不要退出登录，重新打开配对助手或刷新二维码后可继续。二维码过期时点击 Windows 助手中的“刷新二维码”。成功绑定、取消配对或退出账号后，手机会清除暂存的二维码密钥。
+
+如果账号已经激活过，新增手机仍会进入“等待批准”，必须由该账号的已有可信手机或管理员处理。这条限制不会因为再次扫描 Host 二维码而绕过。
+
+Desktop Attach 插件由安装器一并安装。新建或恢复 Codex 任务时会自动探测 Attach 通道；如当前 Codex 版本仍显示 `SessionStart` Hook 信任提示，请阅读内容后，只信任 Agent Pocket 提供的这一条 Hook，不要顺便信任来源不明的其他 Hook。
 
 ## 第六步：做一次最小测试
 
@@ -121,9 +123,25 @@ Host 不会修改系统代理、防火墙或休眠设置。附件只在 Host 上
 
 优先选择“Bridge · 手机完整控制”。重新选择在线 Host、项目、模型和 reasoning 后再发送。Desktop 路径使用第三方模型中转时，首轮任务可能不稳定。
 
+### 登录提示账号不存在、等待激活或尝试过多
+
+- 确认用户名、密码来自管理员，并且没有多余空格；
+- 确认扫码后自动填写的是管理员提供服务所用的 Relay；
+- 账号必须由管理员提前创建，首次正确登录才会自动激活；
+- 连续输错会触发持久限流，请按提示的等待时间后再试，不要反复刷新；
+- 忘记密码时让管理员重置。重置不会删除已绑定的电脑和设备，但所有现有会话会退出。
+
+### 管理员只给了旧邀请链接
+
+0.3.2 普通流程不需要邀请。旧邀请 API 和 Android 深链只为旧客户端兼容；请优先让管理员直接创建账号并提供用户名、初始密码。
+
 ### Windows 安全软件提示未知发布者
 
 这是因为测试包尚未购买 Authenticode 证书，不代表可以忽略任何警告。请先核对 SHA-256；若哈希不一致或文件来源不明，立即停止安装。
+
+## 后续更新
+
+从 0.3.2 开始，Android 和 Windows Host 登录后通过同一 Relay 鉴权检查更新，不提供匿名下载。Android 下载并验签后仍由系统弹出安装确认；Host 只有在没有活动任务时才静默覆盖升级，有任务会延后。首次 0.3.2 APK/EXE 仍由管理员手工发送和安装。
 
 ## 隐私与卸载
 

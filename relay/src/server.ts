@@ -1,7 +1,7 @@
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { extname, join, normalize } from "node:path";
-import { timingSafeEqual } from "node:crypto";
+import { basename, extname, join, normalize, resolve, sep } from "node:path";
+import { createHash, createPublicKey, timingSafeEqual, verify } from "node:crypto";
 import { isIP } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { hashPassword, validatePassword, verifyPassword } from "./auth.js";
@@ -21,7 +21,7 @@ import {
   type CipherEnvelope,
 } from "./protocol.js";
 import { LoginThrottle } from "./rate-limit.js";
-import { RelayStore } from "./store.js";
+import { RelayStore, type UpdatePlatform } from "./store.js";
 
 type RpcId = string | number;
 type RpcRequest = { jsonrpc: "2.0"; id: RpcId; method: string; params?: unknown };
@@ -55,6 +55,18 @@ const CHANNEL_OPEN_TIMEOUT_MS = 30_000;
 const MAX_CHANNELS = 10_000;
 const MAX_CHANNELS_PER_DEVICE = 8;
 const MAX_CHANNELS_PER_HOST = 64;
+const MAX_DEVICE_WS_CONNECTIONS = 2_000;
+const MAX_DEVICE_WS_CONNECTIONS_PER_DEVICE = 4;
+const MAX_HOST_WS_CONNECTIONS = 2_000;
+const MAX_WS_ATTEMPTS_PER_MINUTE = 120;
+const MAX_WS_ATTEMPT_SOURCES = 5_000;
+const UPDATE_MANIFEST_LIMIT = 16 * 1024;
+const UPDATE_MAX_BYTES: Record<UpdatePlatform, number> = {
+  android: 250 * 1024 * 1024,
+  host: 512 * 1024 * 1024,
+};
+const UPDATE_VERSION = /^\d+\.\d+\.\d+$/;
+const UPDATE_SHA256 = /^[0-9a-f]{64}$/;
 
 function asObject(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -107,6 +119,12 @@ function equalText(left: string | undefined, right: string | undefined) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+async function sha256File(path: string) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest("hex");
+}
+
 async function readJson(req: IncomingMessage) {
   let length = 0;
   const chunks: Buffer[] = [];
@@ -126,6 +144,7 @@ function statusFor(error: RelayError) {
   if (error.nameCode === "FORBIDDEN") return 403;
   if (error.nameCode === "NOT_FOUND") return 404;
   if (error.nameCode === "CONFLICT") return 409;
+  if (error.nameCode === "ACCOUNT_ACTIVATION_REQUIRED") return 409;
   if (error.nameCode === "RATE_LIMITED") return 429;
   if (error.nameCode === "PAYLOAD_TOO_LARGE") return 413;
   return 400;
@@ -179,14 +198,28 @@ export class RelayServer {
   private readonly devices = new Map<string, Set<DeviceSocket>>();
   private readonly hosts = new Map<string, HostSocket>();
   private readonly channels = new Map<string, Channel>();
-  private readonly throttle = new LoginThrottle();
-  private readonly sourceThrottle = new LoginThrottle({ maxEntries: 5_000, freeFailures: 50 });
+  private readonly throttle: LoginThrottle;
+  private readonly accountThrottle: LoginThrottle;
+  private readonly sourceThrottle: LoginThrottle;
+  private readonly enrollmentThrottle: LoginThrottle;
+  private readonly wsAttempts = new Map<string, { startedAt: number; count: number }>();
+  private updateDownloadCount = 0;
+  private readonly updateDownloadsByPrincipal = new Map<string, number>();
+  private readonly updateDownloadAttempts = new Map<string, { startedAt: number; count: number }>();
+  private readonly updateVerificationCache = new Map<string, { fingerprint: string; sha256: string }>();
+  private readonly updateVerificationsInFlight = new Map<string, Promise<string>>();
+  private updateReleaseTimer?: NodeJS.Timeout;
+  private readonly knownUpdateVersions = new Map<UpdatePlatform, string>();
 
   constructor(
     readonly config: RelayConfig,
     readonly store: RelayStore,
     readonly fcm = new FcmNotifier(config.firebaseServiceAccount),
   ) {
+    this.throttle = new LoginThrottle({ persistent: store });
+    this.accountThrottle = new LoginThrottle({ maxEntries: 10_000, freeFailures: 10, persistent: store });
+    this.sourceThrottle = new LoginThrottle({ maxEntries: 5_000, freeFailures: 30, persistent: store });
+    this.enrollmentThrottle = new LoginThrottle({ maxEntries: 5_000, freeFailures: 10, persistent: store });
     this.http.on("upgrade", (req, socket, head) => this.onUpgrade(req, socket, head));
     this.deviceWss.on("connection", (socket: WebSocket, request: IncomingMessage, principal: DeviceSocket) => this.onDeviceConnected(socket, request, principal));
     this.hostWss.on("connection", (socket: WebSocket, request: IncomingMessage, principal: HostSocket) => this.onHostConnected(socket, request, principal));
@@ -200,6 +233,12 @@ export class RelayServer {
         resolve();
       });
     });
+    for (const platform of ["android", "host"] as const) {
+      const current = this.store.latestUpdate(platform);
+      if (current) this.knownUpdateVersions.set(platform, current.version);
+    }
+    this.updateReleaseTimer = setInterval(() => this.checkPublishedUpdates(), 30_000);
+    this.updateReleaseTimer.unref();
   }
 
   address() {
@@ -209,6 +248,8 @@ export class RelayServer {
   }
 
   async stop() {
+    if (this.updateReleaseTimer) clearInterval(this.updateReleaseTimer);
+    this.updateReleaseTimer = undefined;
     for (const sessions of this.devices.values()) for (const session of sessions) session.socket.close(1001, "Relay stopping");
     for (const session of this.hosts.values()) session.socket.close(1001, "Relay stopping");
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
@@ -218,12 +259,18 @@ export class RelayServer {
 
   private onUpgrade(req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) {
     try {
+      this.consumeWebSocketAttempt(req);
       const pathname = new URL(req.url || "/", this.config.publicUrl).pathname;
       const authToken = bearer(req);
       if (!authToken) throw new RelayError("AUTH_FAILED", "缺少访问令牌");
       if (pathname === "/ws/device") {
         const principal = this.store.authenticateAccess(authToken);
         if (!principal || principal.principal_kind !== "device") throw new RelayError("AUTH_FAILED", "设备令牌无效");
+        const deviceConnectionCount = [...this.devices.values()].reduce((total, sessions) => total + sessions.size, 0);
+        if (deviceConnectionCount >= MAX_DEVICE_WS_CONNECTIONS
+          || (this.devices.get(principal.principal_id)?.size || 0) >= MAX_DEVICE_WS_CONNECTIONS_PER_DEVICE) {
+          throw new RelayError("CAPACITY_EXCEEDED", "设备连接数量已达上限");
+        }
         const session: DeviceSocket = {
           socket: undefined as unknown as WebSocket,
           accessToken: authToken,
@@ -240,6 +287,9 @@ export class RelayServer {
       if (pathname === "/ws/host") {
         const principal = this.store.authenticateHost(authToken);
         if (!principal) throw new RelayError("AUTH_FAILED", "主机令牌无效");
+        if (!this.hosts.has(principal.id) && this.hosts.size >= MAX_HOST_WS_CONNECTIONS) {
+          throw new RelayError("CAPACITY_EXCEEDED", "主机连接数量已达上限");
+        }
         const session: HostSocket = {
           socket: undefined as unknown as WebSocket,
           hostToken: authToken,
@@ -254,9 +304,32 @@ export class RelayServer {
         return;
       }
       throw new RelayError("NOT_FOUND", "WebSocket 路径不存在");
-    } catch {
-      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    } catch (error) {
+      const relayError = error instanceof RelayError ? error : new RelayError("AUTH_FAILED", "WebSocket 连接失败");
+      const status = relayError.nameCode === "RATE_LIMITED" ? "429 Too Many Requests"
+        : relayError.nameCode === "CAPACITY_EXCEEDED" ? "503 Service Unavailable"
+          : "401 Unauthorized";
+      const retryAfter = relayError.nameCode === "RATE_LIMITED" ? "Retry-After: 60\r\n" : "";
+      socket.write(`HTTP/1.1 ${status}\r\n${retryAfter}Connection: close\r\n\r\n`);
       socket.destroy();
+    }
+  }
+
+  private consumeWebSocketAttempt(req: IncomingMessage) {
+    const at = Date.now();
+    const source = clientAddress(req);
+    const current = this.wsAttempts.get(source);
+    if (!current || at - current.startedAt >= 60_000) {
+      this.wsAttempts.set(source, { startedAt: at, count: 1 });
+    } else {
+      if (current.count >= MAX_WS_ATTEMPTS_PER_MINUTE) throw new RelayError("RATE_LIMITED", "WebSocket 连接尝试过于频繁");
+      current.count += 1;
+    }
+    if (this.wsAttempts.size > MAX_WS_ATTEMPT_SOURCES) {
+      for (const [key, value] of this.wsAttempts) {
+        if (at - value.startedAt >= 60_000) this.wsAttempts.delete(key);
+        if (this.wsAttempts.size <= MAX_WS_ATTEMPT_SOURCES) break;
+      }
     }
   }
 
@@ -264,6 +337,7 @@ export class RelayServer {
     const sessions = this.devices.get(session.deviceId) || new Set<DeviceSocket>();
     sessions.add(session);
     this.devices.set(session.deviceId, sessions);
+    this.store.audit(session.accountId, "device", session.deviceId, "ws.connect", "device", session.deviceId);
     socket.on("message", (data) => void this.onDeviceMessage(session, data));
     socket.on("close", () => {
       sessions.delete(session);
@@ -283,6 +357,7 @@ export class RelayServer {
     }
     this.hosts.set(session.hostId, session);
     this.store.touchHost(session.accountId, session.hostId);
+    this.store.audit(session.accountId, "host", session.hostId, "ws.connect", "host", session.hostId);
     socket.on("message", (data) => void this.onHostMessage(session, data));
     socket.on("close", () => {
       if (this.hosts.get(session.hostId) === session) {
@@ -614,7 +689,15 @@ export class RelayServer {
     } catch (error) {
       const relayError = error instanceof RelayError ? error : new RelayError("INTERNAL_ERROR", "Relay 内部错误");
       if (!(error instanceof RelayError)) console.error(error);
-      json(res, statusFor(relayError), { error: { code: relayError.nameCode, message: relayError.message, data: relayError.data } });
+      const retryAfterMs = relayError.nameCode === "RATE_LIMITED"
+        ? Number((relayError.data as { retryAfterMs?: unknown } | undefined)?.retryAfterMs || 0)
+        : 0;
+      json(
+        res,
+        statusFor(relayError),
+        { error: { code: relayError.nameCode, message: relayError.message, data: relayError.data } },
+        retryAfterMs > 0 ? { "retry-after": String(Math.max(1, Math.ceil(retryAfterMs / 1000))) } : {},
+      );
     }
   }
 
@@ -662,20 +745,57 @@ export class RelayServer {
       json(res, 201, this.loginResult(claimed.account, claimed.device, tokens));
       return;
     }
+    if (method === "POST" && url.pathname === "/api/auth/activate") {
+      const body = asObject(await readJson(req));
+      const username = normalizeUsername(body.username);
+      const sourceKey = `device-source:${clientAddress(req)}`;
+      const accountKey = `device-username:${username}`;
+      const key = `device-account-source:${username}:${clientAddress(req)}`;
+      this.sourceThrottle.assertAllowed(sourceKey);
+      this.accountThrottle.assertAllowed(accountKey);
+      this.throttle.assertAllowed(key);
+      const provision = this.store.accountProvisionByUsername(username);
+      if (!provision || !await verifyPassword(String(body.password || ""), provision.password_hash)) {
+        const sourceDelay = this.sourceThrottle.failed(sourceKey);
+        const retryAfterMs = Math.max(sourceDelay, this.accountThrottle.failed(accountKey), this.throttle.failed(key));
+        throw new RelayError(retryAfterMs ? "RATE_LIMITED" : "AUTH_FAILED", "用户名或密码错误", retryAfterMs ? { retryAfterMs } : undefined);
+      }
+      const account = this.accountInput({ ...body, displayName: provision.display_name }, username, provision.password_hash, "user");
+      const claimed = this.store.activateAccountProvision(provision.id, account, this.deviceInput(body));
+      const tokens = this.store.createSession(claimed.account.id, "device", claimed.device.id);
+      this.throttle.succeeded(key);
+      this.accountThrottle.succeeded(accountKey);
+      this.sourceThrottle.succeeded(sourceKey);
+      json(res, 201, this.loginResult(claimed.account, claimed.device, tokens));
+      return;
+    }
     if (method === "POST" && url.pathname === "/api/auth/login") {
       const body = asObject(await readJson(req));
       const username = normalizeUsername(body.username);
       const sourceKey = `device-source:${clientAddress(req)}`;
-      const key = `device-account:${clientAddress(req)}:${username}`;
+      const accountKey = `device-username:${username}`;
+      const key = `device-account-source:${username}:${clientAddress(req)}`;
       this.sourceThrottle.assertAllowed(sourceKey);
+      this.accountThrottle.assertAllowed(accountKey);
       this.throttle.assertAllowed(key);
+      const password = String(body.password || "");
       const account = this.store.accountByUsername(username);
-      if (!account || account.status !== "active" || !await verifyPassword(String(body.password || ""), account.password_hash)) {
+      if (!account) {
+        const provision = this.store.accountProvisionByUsername(username);
+        if (provision && await verifyPassword(password, provision.password_hash)) {
+          this.throttle.succeeded(key);
+          this.accountThrottle.succeeded(accountKey);
+          this.sourceThrottle.succeeded(sourceKey);
+          throw new RelayError("ACCOUNT_ACTIVATION_REQUIRED", "账号等待首次激活");
+        }
+      }
+      if (!account || account.status !== "active" || !await verifyPassword(password, account.password_hash)) {
         const sourceDelay = this.sourceThrottle.failed(sourceKey);
-        const retryAfterMs = Math.max(sourceDelay, this.throttle.failed(key));
+        const retryAfterMs = Math.max(sourceDelay, this.accountThrottle.failed(accountKey), this.throttle.failed(key));
         throw new RelayError(retryAfterMs ? "RATE_LIMITED" : "AUTH_FAILED", "用户名或密码错误", retryAfterMs ? { retryAfterMs } : undefined);
       }
       this.throttle.succeeded(key);
+      this.accountThrottle.succeeded(accountKey);
       this.sourceThrottle.succeeded(sourceKey);
       const device = this.store.findDeviceForLogin(
         account.id,
@@ -687,6 +807,18 @@ export class RelayServer {
       const tokens = this.store.createSession(account.id, "device", device.id);
       this.store.audit(account.id, "device", device.id, "auth.login", "device", device.id, { status: device.status });
       json(res, 200, this.loginResult(account, device, tokens));
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/account/password") {
+      const principal = this.devicePrincipal(req);
+      const body = asObject(await readJson(req));
+      const account = this.store.accountById(principal.account_id);
+      if (!account || !await verifyPassword(String(body.currentPassword || ""), account.password_hash)) {
+        throw new RelayError("AUTH_FAILED", "当前密码错误");
+      }
+      const passwordHash = await hashPassword(validatePassword(body.newPassword));
+      this.store.changeAccountPassword(account.id, passwordHash, principal.principal_id, principal.id);
+      json(res, 200, { changed: true });
       return;
     }
     if (method === "POST" && url.pathname === "/api/auth/refresh") {
@@ -712,6 +844,9 @@ export class RelayServer {
       return;
     }
     if (method === "POST" && url.pathname === "/api/host/enroll/start") {
+      const rateKey = `host-enrollment-start:${clientAddress(req)}`;
+      this.enrollmentThrottle.assertAllowed(rateKey);
+      this.enrollmentThrottle.failed(rateKey);
       const body = asObject(await readJson(req));
       const enrollment = this.store.startHostEnrollment(
         requiredString(body.name, "name", 80),
@@ -738,6 +873,26 @@ export class RelayServer {
         requiredString(body.secret, "secret", 128),
       );
       json(res, 201, completed);
+      return;
+    }
+    const updateLatestMatch = /^\/api\/updates\/(android|host)\/latest$/.exec(url.pathname);
+    if (method === "GET" && updateLatestMatch) {
+      const platform = updateLatestMatch[1] as UpdatePlatform;
+      this.updatePrincipal(req, platform);
+      const release = this.store.latestUpdate(platform);
+      if (!release) throw new RelayError("NOT_FOUND", "当前平台尚未发布更新");
+      json(res, 200, {
+        manifestJson: release.manifest_json,
+        manifestSignature: release.manifest_signature,
+        downloadUrl: `${this.config.publicUrl}/api/updates/${platform}/${encodeURIComponent(release.version)}/${encodeURIComponent(release.asset_name)}`,
+      });
+      return;
+    }
+    const updateAssetMatch = /^\/api\/updates\/(android|host)\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if ((method === "GET" || method === "HEAD") && updateAssetMatch) {
+      const platform = updateAssetMatch[1] as UpdatePlatform;
+      const principal = this.updatePrincipal(req, platform);
+      await this.serveUpdateAsset(req, res, platform, decodeURIComponent(updateAssetMatch[2]), decodeURIComponent(updateAssetMatch[3]), principal);
       return;
     }
     if (url.pathname.startsWith("/api/admin/")) {
@@ -800,6 +955,30 @@ export class RelayServer {
       json(res, 200, { users: this.store.listAccounts() });
       return;
     }
+    if (method === "POST" && url.pathname === "/api/admin/users") {
+      const body = asObject(await readJson(req));
+      const username = normalizeUsername(body.username);
+      const passwordHash = await hashPassword(validatePassword(body.password));
+      const provision = this.store.createAccountProvision({
+        username,
+        displayName: requiredString(body.displayName, "displayName", 80),
+        passwordHash,
+        createdBy: principal.account_id,
+      });
+      json(res, 201, {
+        user: {
+          id: provision.id,
+          username: provision.username,
+          display_name: provision.display_name,
+          role: provision.role,
+          status: "pending_activation",
+          device_count: 0,
+          host_count: 0,
+          created_at: provision.created_at,
+        },
+      });
+      return;
+    }
     if (method === "GET" && url.pathname === "/api/admin/invites") {
       json(res, 200, { invites: this.store.listInvites(principal.account_id) });
       return;
@@ -860,6 +1039,35 @@ export class RelayServer {
       json(res, 200, { audit: this.store.auditRows(Math.min(500, integer(url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : 200, "limit", 1))) });
       return;
     }
+    if (method === "POST" && url.pathname === "/api/admin/updates") {
+      const body = asObject(await readJson(req));
+      const release = await this.registerUpdate(body, principal.account_id);
+      this.broadcastUpdate(release.platform, release.version);
+      json(res, 201, { published: true, platform: release.platform, version: release.version });
+      return;
+    }
+    const provisionCancelMatch = /^\/api\/admin\/users\/([^/]+)\/cancel$/.exec(url.pathname);
+    if (method === "POST" && provisionCancelMatch) {
+      this.store.cancelAccountProvision(provisionCancelMatch[1], principal.account_id);
+      json(res, 200, { cancelled: true });
+      return;
+    }
+    const passwordResetMatch = /^\/api\/admin\/users\/([^/]+)\/password$/.exec(url.pathname);
+    if (method === "POST" && passwordResetMatch) {
+      const target = this.store.accountById(passwordResetMatch[1]);
+      if (target?.role === "admin") throw new RelayError("FORBIDDEN", "不能通过用户管理重置管理员密码");
+      const body = asObject(await readJson(req));
+      const passwordHash = await hashPassword(validatePassword(body.newPassword));
+      const status = this.store.resetUserPassword(passwordResetMatch[1], passwordHash, principal.account_id);
+      if (status === "active") {
+        for (const device of this.store.listDevices(passwordResetMatch[1])) {
+          const sessions = this.devices.get(device.id);
+          if (sessions) for (const session of sessions) session.socket.close(4003, "Password reset");
+        }
+      }
+      json(res, 200, { changed: true, status });
+      return;
+    }
     const accountMatch = /^\/api\/admin\/users\/([^/]+)\/(disable|enable)$/.exec(url.pathname);
     if (method === "POST" && accountMatch) {
       this.store.setAccountDisabled(accountMatch[1], accountMatch[2] === "disable", principal.account_id);
@@ -882,6 +1090,207 @@ export class RelayServer {
       return;
     }
     throw new RelayError("NOT_FOUND", "管理 API 路径不存在");
+  }
+
+  private updatePrincipal(req: IncomingMessage, platform: UpdatePlatform) {
+    if (platform === "android") {
+      const principal = this.devicePrincipal(req);
+      return { accountId: principal.account_id as string, kind: "device", id: principal.principal_id as string };
+    }
+    const hostToken = bearer(req);
+    const host = hostToken && this.store.authenticateHost(hostToken);
+    if (!host) throw new RelayError("AUTH_FAILED", "Host 更新令牌无效");
+    return { accountId: host.account_id as string, kind: "host", id: host.id as string };
+  }
+
+  private updateFile(relativePath: string) {
+    const root = resolve(this.config.updatesDir);
+    const file = resolve(root, relativePath);
+    if (file !== root && !file.startsWith(`${root}${sep}`)) throw new RelayError("FORBIDDEN", "更新文件路径无效");
+    return file;
+  }
+
+  private async registerUpdate(body: Record<string, unknown>, createdBy: string) {
+    const manifestJson = requiredString(body.manifestJson, "manifestJson", UPDATE_MANIFEST_LIMIT);
+    const manifestSignature = requiredString(body.manifestSignature, "manifestSignature", 256);
+    let manifest: Record<string, unknown>;
+    try { manifest = asObject(JSON.parse(manifestJson)); }
+    catch { throw new RelayError("INVALID_REQUEST", "更新清单 JSON 无效"); }
+    if (manifest.schemaVersion !== 1 || (manifest.platform !== "android" && manifest.platform !== "host")) {
+      throw new RelayError("INVALID_REQUEST", "更新清单版本或平台无效");
+    }
+    const platform = manifest.platform as UpdatePlatform;
+    const version = requiredString(manifest.version, "version", 32);
+    if (!UPDATE_VERSION.test(version)) throw new RelayError("INVALID_REQUEST", "更新版本必须使用 x.y.z");
+    const versionCode = manifest.versionCode === undefined || manifest.versionCode === null
+      ? undefined
+      : integer(manifest.versionCode, "versionCode", 1);
+    if (platform === "android" && versionCode === undefined) throw new RelayError("INVALID_REQUEST", "Android 更新缺少 versionCode");
+    const asset = asObject(manifest.asset);
+    const assetName = requiredString(asset.name, "asset.name", 160);
+    const expectedName = platform === "android"
+      ? `Agent-Pocket-${version}-release.apk`
+      : `AgentPocketHost-${version}-windows-x64.exe`;
+    if (basename(assetName) !== assetName || assetName !== expectedName) throw new RelayError("INVALID_REQUEST", "更新文件名无效");
+    const assetSize = integer(asset.size, "asset.size", 1);
+    if (assetSize > UPDATE_MAX_BYTES[platform]) throw new RelayError("PAYLOAD_TOO_LARGE", "更新文件超过大小限制");
+    const assetSha256 = requiredString(asset.sha256, "asset.sha256", 64).toLowerCase();
+    if (!UPDATE_SHA256.test(assetSha256)) throw new RelayError("INVALID_REQUEST", "更新文件 SHA-256 无效");
+    const assetSignature = optionalString(asset.signature, "asset.signature", 256);
+
+    if (!this.config.updatePublicKeySpki) throw new RelayError("CONFIG_INVALID", "Relay 尚未配置更新签名公钥");
+    let publicKey;
+    let signature: Buffer;
+    try {
+      publicKey = createPublicKey({ key: Buffer.from(this.config.updatePublicKeySpki, "base64"), format: "der", type: "spki" });
+      signature = Buffer.from(manifestSignature, "base64");
+    } catch { throw new RelayError("INVALID_REQUEST", "更新签名或公钥格式无效"); }
+    if (publicKey.asymmetricKeyType !== "ed25519" || signature.length !== 64
+      || !verify(null, Buffer.from(manifestJson, "utf8"), publicKey, signature)) {
+      throw new RelayError("FORBIDDEN", "更新清单签名验证失败");
+    }
+
+    const assetPath = `${platform}/${version}/${assetName}`;
+    const file = this.updateFile(assetPath);
+    if (!existsSync(file) || !statSync(file).isFile()) throw new RelayError("NOT_FOUND", "服务器更新文件不存在");
+    const stat = statSync(file);
+    if (stat.size !== assetSize || await sha256File(file) !== assetSha256) {
+      throw new RelayError("CONFLICT", "服务器更新文件与签名清单不一致");
+    }
+    return this.store.publishUpdate({
+      platform,
+      version,
+      versionCode,
+      manifestJson,
+      manifestSignature,
+      assetName,
+      assetPath,
+      assetSize,
+      assetSha256,
+      assetSignature,
+      createdBy,
+    });
+  }
+
+  private async serveUpdateAsset(
+    req: IncomingMessage,
+    res: ServerResponse,
+    platform: UpdatePlatform,
+    version: string,
+    assetName: string,
+    principal: { accountId: string; kind: string; id: string },
+  ) {
+    if (!UPDATE_VERSION.test(version) || basename(assetName) !== assetName) throw new RelayError("NOT_FOUND", "更新文件不存在");
+    const release = this.store.updateRelease(platform, version);
+    if (!release || release.asset_name !== assetName) throw new RelayError("NOT_FOUND", "更新文件不存在");
+    const principalKey = `${principal.kind}:${principal.id}`;
+    this.consumeUpdateDownloadAttempt(principalKey);
+    if (this.updateDownloadCount >= 16 || (this.updateDownloadsByPrincipal.get(principalKey) || 0) >= 2) {
+      throw new RelayError("RATE_LIMITED", "更新下载繁忙，请稍后重试", { retryAfterMs: 30_000 });
+    }
+    this.updateDownloadCount += 1;
+    this.updateDownloadsByPrincipal.set(principalKey, (this.updateDownloadsByPrincipal.get(principalKey) || 0) + 1);
+    let released = false;
+    const releaseSlot = () => {
+      if (released) return;
+      released = true;
+      this.updateDownloadCount = Math.max(0, this.updateDownloadCount - 1);
+      const next = Math.max(0, (this.updateDownloadsByPrincipal.get(principalKey) || 1) - 1);
+      if (next) this.updateDownloadsByPrincipal.set(principalKey, next);
+      else this.updateDownloadsByPrincipal.delete(principalKey);
+    };
+    res.once("finish", releaseSlot);
+    res.once("close", releaseSlot);
+    const file = this.updateFile(release.asset_path);
+    const fileStat = await this.verifyUpdateAsset(file, release.asset_size, release.asset_sha256, UPDATE_MAX_BYTES[platform]);
+    this.store.audit(principal.accountId, principal.kind, principal.id, "update.download", "update_release", `${platform}:${version}`, {
+      assetName,
+      bytes: fileStat.size,
+      method: req.method,
+    });
+    const headers = {
+      "content-type": platform === "android" ? "application/vnd.android.package-archive" : "application/vnd.microsoft.portable-executable",
+      "content-length": String(fileStat.size),
+      "content-disposition": `attachment; filename="${assetName}"`,
+      "cache-control": "private, no-store",
+      "x-content-type-options": "nosniff",
+      "x-checksum-sha256": release.asset_sha256,
+      "accept-ranges": "none",
+    };
+    res.writeHead(200, headers);
+    if (req.method === "HEAD") { res.end(); return; }
+    const stream = createReadStream(file);
+    stream.once("error", () => res.destroy());
+    stream.pipe(res);
+  }
+
+  private async verifyUpdateAsset(file: string, expectedSize: number, expectedSha256: string, maxBytes: number) {
+    if (!existsSync(file) || !statSync(file).isFile()) throw new RelayError("NOT_FOUND", "服务器更新文件不存在");
+    const before = statSync(file);
+    if (before.size !== expectedSize || before.size > maxBytes) throw new RelayError("CONFLICT", "服务器更新文件大小异常");
+    const fingerprint = [before.dev, before.ino, before.size, before.mtimeMs, before.ctimeMs].join(":");
+    const cached = this.updateVerificationCache.get(file);
+    if (cached?.fingerprint === fingerprint && cached.sha256 === expectedSha256) return before;
+
+    let verification = this.updateVerificationsInFlight.get(file);
+    if (!verification) {
+      verification = sha256File(file);
+      this.updateVerificationsInFlight.set(file, verification);
+    }
+    let actualSha256: string;
+    try {
+      actualSha256 = await verification;
+    } finally {
+      if (this.updateVerificationsInFlight.get(file) === verification) this.updateVerificationsInFlight.delete(file);
+    }
+    const after = statSync(file);
+    const afterFingerprint = [after.dev, after.ino, after.size, after.mtimeMs, after.ctimeMs].join(":");
+    if (afterFingerprint !== fingerprint || actualSha256 !== expectedSha256) {
+      this.updateVerificationCache.delete(file);
+      throw new RelayError("CONFLICT", "服务器更新文件完整性异常");
+    }
+    this.updateVerificationCache.set(file, { fingerprint, sha256: actualSha256 });
+    return after;
+  }
+
+  private consumeUpdateDownloadAttempt(principalKey: string) {
+    const at = Date.now();
+    const current = this.updateDownloadAttempts.get(principalKey);
+    if (!current || at - current.startedAt >= 60_000) {
+      this.updateDownloadAttempts.set(principalKey, { startedAt: at, count: 1 });
+    } else {
+      if (current.count >= 10) throw new RelayError("RATE_LIMITED", "更新请求过于频繁", { retryAfterMs: 60_000 - (at - current.startedAt) });
+      current.count += 1;
+    }
+    if (this.updateDownloadAttempts.size > 10_000) {
+      for (const [key, value] of this.updateDownloadAttempts) {
+        if (at - value.startedAt >= 60_000 || this.updateDownloadAttempts.size > 10_000) this.updateDownloadAttempts.delete(key);
+        if (this.updateDownloadAttempts.size <= 10_000) break;
+      }
+    }
+  }
+
+  private broadcastUpdate(platform: UpdatePlatform, version: string) {
+    this.knownUpdateVersions.set(platform, version);
+    for (const sessions of this.devices.values()) {
+      for (const session of sessions) if (session.hello) notification(session.socket, "update_available", { platform, version });
+    }
+    for (const session of this.hosts.values()) if (session.hello) notification(session.socket, "update_available", { platform, version });
+    if (platform === "android") {
+      void this.fcm.send(this.store.allPushTokens(), { type: "update_available", platform, version })
+        .catch((error) => {
+          this.store.audit(null, "system", "relay", "update.notify.failed", "update_release", `${platform}:${version}`, {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
+  }
+
+  private checkPublishedUpdates() {
+    for (const platform of ["android", "host"] as const) {
+      const release = this.store.latestUpdate(platform);
+      if (release && this.knownUpdateVersions.get(platform) !== release.version) this.broadcastUpdate(platform, release.version);
+    }
   }
 
   private accountInput(body: Record<string, unknown>, username: string, passwordHash: string, role: AccountRole) {
@@ -971,9 +1380,10 @@ export class RelayServer {
   }
 
   private serveAdmin(res: ServerResponse, pathname: string) {
+    const root = resolve(this.config.adminDir);
     const relative = normalize(decodeURIComponent(pathname)).replace(/^([/\\])+/, "");
-    let file = join(this.config.adminDir, relative || "index.html");
-    if (!file.startsWith(this.config.adminDir) || !existsSync(file) || statSync(file).isDirectory()) file = join(this.config.adminDir, "index.html");
+    let file = resolve(root, relative || "index.html");
+    if ((file !== root && !file.startsWith(`${root}${sep}`)) || !existsSync(file) || statSync(file).isDirectory()) file = join(root, "index.html");
     if (!existsSync(file)) throw new RelayError("NOT_FOUND", "管理后台尚未构建");
     const contentType: Record<string, string> = {
       ".html": "text/html; charset=utf-8",

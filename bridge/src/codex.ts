@@ -59,7 +59,7 @@ export class CodexAppServer extends EventEmitter {
 
     try {
       await this.request("initialize", {
-        clientInfo: { name: "agent-pocket-bridge", version: "0.3.1" },
+        clientInfo: { name: "agent-pocket-bridge", version: "0.3.2" },
         capabilities: { experimentalApi: true },
       });
       this.notify("initialized");

@@ -7,8 +7,11 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.Base64
 import androidx.core.content.FileProvider
 import com.agentpocket.app.BuildConfig
+import com.agentpocket.app.data.RelayCrypto
+import com.agentpocket.app.data.SecurePrefs
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -22,7 +25,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -39,37 +41,58 @@ sealed interface AppUpdateState {
 }
 
 @Serializable
-internal data class GitHubRelease(
-    @SerialName("tag_name") val tagName: String,
-    val assets: List<GitHubAsset> = emptyList(),
+internal data class RelayUpdateResponse(
+    val manifestJson: String,
+    val manifestSignature: String,
+    val downloadUrl: String,
 )
 
 @Serializable
-internal data class GitHubAsset(
+internal data class RelayUpdateManifest(
+    val schemaVersion: Int,
+    val platform: String,
+    val version: String,
+    val versionCode: Long,
+    val asset: RelayUpdateAsset,
+)
+
+@Serializable
+internal data class RelayUpdateAsset(
     val name: String,
-    @SerialName("browser_download_url") val downloadUrl: String,
-    val size: Long = 0,
+    val size: Long,
+    val sha256: String,
 )
 
 internal data class UpdateCandidate(
     val version: String,
-    val apk: GitHubAsset,
-    val checksum: GitHubAsset,
+    val versionCode: Long,
+    val name: String,
+    val downloadUrl: String,
+    val size: Long,
+    val sha256: String,
 )
 
 internal object UpdateProtocol {
     private val versionPart = Regex("\\d+")
     private val checksumPattern = Regex("^[0-9a-fA-F]{64}$")
+    private val json = Json { ignoreUnknownKeys = false }
 
-    fun candidate(release: GitHubRelease, currentVersion: String): UpdateCandidate? {
-        val version = release.tagName.trim().removePrefix("v")
-        if (!isNewer(version, currentVersion)) return null
-        val exactName = "Agent-Pocket-$version-release.apk"
-        val apk = release.assets.firstOrNull { it.name == exactName }
-            ?: release.assets.singleOrNull { it.name.endsWith(".apk", ignoreCase = true) }
-            ?: return null
-        val checksum = release.assets.firstOrNull { it.name == "${apk.name}.sha256" } ?: return null
-        return UpdateCandidate(version, apk, checksum)
+    fun candidate(response: RelayUpdateResponse, currentVersion: String, currentVersionCode: Long, signatureValid: Boolean): UpdateCandidate? {
+        require(signatureValid) { "更新清单签名验证失败" }
+        val manifest = json.decodeFromString<RelayUpdateManifest>(response.manifestJson)
+        require(manifest.schemaVersion == 1 && manifest.platform == "android") { "更新清单不兼容" }
+        require(manifest.version.matches(Regex("^\\d+\\.\\d+\\.\\d+$"))) { "更新版本无效" }
+        require(manifest.asset.name == "Agent-Pocket-${manifest.version}-release.apk") { "APK 文件名无效" }
+        require(manifest.asset.size in 1..MAX_APK_BYTES && checksumPattern.matches(manifest.asset.sha256)) { "APK 清单无效" }
+        if (manifest.versionCode <= currentVersionCode || !isNewer(manifest.version, currentVersion)) return null
+        return UpdateCandidate(
+            manifest.version,
+            manifest.versionCode,
+            manifest.asset.name,
+            response.downloadUrl,
+            manifest.asset.size,
+            manifest.asset.sha256.lowercase(Locale.US),
+        )
     }
 
     fun isNewer(candidate: String, current: String): Boolean {
@@ -83,12 +106,23 @@ internal object UpdateProtocol {
         return false
     }
 
-    fun parseChecksum(value: String): String {
-        val checksum = value.trim().split(Regex("\\s+"), limit = 2).firstOrNull().orEmpty()
-        require(checksumPattern.matches(checksum)) { "更新校验文件格式不正确" }
-        return checksum.lowercase(Locale.US)
-    }
+    fun verifyManifest(manifestJson: String, signatureBase64: String, publicKeySpkiBase64: String): Boolean = runCatching {
+        val spki = Base64.decode(publicKeySpkiBase64, Base64.DEFAULT)
+        val prefix = byteArrayOf(0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00)
+        require(spki.size == prefix.size + 32 && spki.copyOfRange(0, prefix.size).contentEquals(prefix))
+        val signature = Base64.decode(signatureBase64, Base64.DEFAULT)
+        RelayCrypto.verify(signature, manifestJson.toByteArray(Charsets.UTF_8), spki.copyOfRange(prefix.size, spki.size))
+    }.getOrDefault(false)
+
+    const val MAX_APK_BYTES = 250L * 1024 * 1024
 }
+
+private fun sameOrigin(endpoint: String, downloadUrl: String): Boolean = runCatching {
+    val base = java.net.URI(endpoint)
+    val download = java.net.URI(downloadUrl)
+    base.scheme.equals(download.scheme, true) && base.host.equals(download.host, true) && base.port == download.port &&
+        download.userInfo == null && download.query == null && download.fragment == null && download.path.startsWith("/api/updates/android/")
+}.getOrDefault(false)
 
 class AppUpdateManager(private val context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
@@ -109,25 +143,35 @@ class AppUpdateManager(private val context: Context) {
         activeJob = scope.launch {
             _state.value = AppUpdateState.Checking
             runCatching {
+                val credentials = SecurePrefs(context).load()?.takeIf { it.approved }
+                    ?: return@runCatching AppUpdateState.UpToDate
+                if (BuildConfig.UPDATE_PUBLIC_KEY_SPKI.isBlank()) throw IOException("当前安装包未配置更新签名公钥")
                 val request = Request.Builder()
-                    .url(BuildConfig.UPDATE_API_URL)
-                    .header("Accept", "application/vnd.github+json")
+                    .url("${credentials.endpoint.trimEnd('/')}/api/updates/android/latest")
+                    .header("Authorization", "Bearer ${credentials.accessToken}")
+                    .header("Accept", "application/json")
                     .header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}")
                     .build()
                 val release = client.newCall(request).execute().use { response ->
                     if (response.code == 404) return@use null
                     if (!response.isSuccessful) throw IOException("更新检查失败 (${response.code})")
                     val body = response.body?.string() ?: throw IOException("更新检查返回为空")
-                    json.decodeFromString<GitHubRelease>(body)
+                    json.decodeFromString<RelayUpdateResponse>(body)
                 }
                 if (release == null) {
                     candidate = null
                     AppUpdateState.UpToDate
                 } else {
-                    val next = UpdateProtocol.candidate(release, BuildConfig.VERSION_NAME)
+                    if (!sameOrigin(credentials.endpoint, release.downloadUrl)) throw IOException("更新下载地址不属于当前 Relay")
+                    val signatureValid = UpdateProtocol.verifyManifest(
+                        release.manifestJson,
+                        release.manifestSignature,
+                        BuildConfig.UPDATE_PUBLIC_KEY_SPKI,
+                    )
+                    val next = UpdateProtocol.candidate(release, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE.toLong(), signatureValid)
                     candidate = next
                     if (next == null) AppUpdateState.UpToDate
-                    else AppUpdateState.Available(next.version, next.apk.size)
+                    else AppUpdateState.Available(next.version, next.size)
                 }
             }.onSuccess { _state.value = it }
                 .onFailure { _state.value = AppUpdateState.Error(updateError(it)) }
@@ -143,14 +187,15 @@ class AppUpdateManager(private val context: Context) {
         activeJob = scope.launch {
             _state.value = AppUpdateState.Downloading(update.version, 0)
             runCatching {
-                val expectedChecksum = UpdateProtocol.parseChecksum(downloadText(update.checksum.downloadUrl))
+                val credentials = SecurePrefs(context).load()?.takeIf { it.approved && sameOrigin(it.endpoint, update.downloadUrl) }
+                    ?: throw IOException("登录已失效，请重新登录后下载")
                 val updateDir = File(context.cacheDir, "updates").apply { mkdirs() }
                 updateDir.listFiles()?.forEach { if (it.isFile) it.delete() }
-                val partial = File(updateDir, "${update.apk.name}.part")
-                val target = File(updateDir, update.apk.name)
-                downloadApk(update, partial)
+                val partial = File(updateDir, "${update.name}.part")
+                val target = File(updateDir, update.name)
+                downloadApk(update, partial, credentials.accessToken)
                 val actualChecksum = sha256(partial)
-                if (actualChecksum != expectedChecksum) throw IOException("APK 校验失败，请重新下载")
+                if (partial.length() != update.size || actualChecksum != update.sha256) throw IOException("APK 校验失败，请重新下载")
                 if (!partial.renameTo(target)) {
                     partial.copyTo(target, overwrite = true)
                     partial.delete()
@@ -183,21 +228,18 @@ class AppUpdateManager(private val context: Context) {
         )
     }
 
-    private fun downloadText(url: String): String {
-        val request = Request.Builder().url(url).header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}").build()
-        return client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("更新校验下载失败 (${response.code})")
-            response.body?.string()?.take(4_096) ?: throw IOException("更新校验返回为空")
-        }
-    }
-
-    private fun downloadApk(update: UpdateCandidate, output: File) {
-        val request = Request.Builder().url(update.apk.downloadUrl).header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}").build()
+    private fun downloadApk(update: UpdateCandidate, output: File, accessToken: String) {
+        val request = Request.Builder().url(update.downloadUrl)
+            .header("Authorization", "Bearer $accessToken")
+            .header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}")
+            .build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) throw IOException("APK 下载失败 (${response.code})")
             val body = response.body ?: throw IOException("APK 下载返回为空")
-            val total = body.contentLength().takeIf { it > 0 } ?: update.apk.size
-            if (total <= 0 || total > MAX_APK_BYTES) throw IOException("APK 文件大小异常")
+            val declared = body.contentLength()
+            if (declared > 0 && declared != update.size) throw IOException("APK 响应大小与签名清单不一致")
+            val total = update.size
+            if (total <= 0 || total > UpdateProtocol.MAX_APK_BYTES) throw IOException("APK 文件大小异常")
             body.byteStream().use { input ->
                 output.outputStream().buffered().use { destination ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -207,7 +249,7 @@ class AppUpdateManager(private val context: Context) {
                         val count = input.read(buffer)
                         if (count < 0) break
                         downloaded += count
-                        if (downloaded > MAX_APK_BYTES) throw IOException("APK 文件超过大小限制")
+                        if (downloaded > update.size || downloaded > UpdateProtocol.MAX_APK_BYTES) throw IOException("APK 文件超过大小限制")
                         destination.write(buffer, 0, count)
                         val progress = ((downloaded * 100) / total).toInt().coerceIn(0, 100)
                         if (progress != lastProgress) {
@@ -296,7 +338,4 @@ class AppUpdateManager(private val context: Context) {
         else -> "更新失败，请稍后重试"
     }
 
-    private companion object {
-        const val MAX_APK_BYTES = 250L * 1024 * 1024
-    }
 }

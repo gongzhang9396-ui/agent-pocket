@@ -38,3 +38,27 @@ test("release signer emits a policy and matching detached Ed25519 signature", ()
   const statement = hostUpdateStatement("0.3.0", "AgentPocketHost-0.3.0-windows-x64.exe", sha256, readFileSync(installer).length);
   assert.equal(verify(null, Buffer.from(statement), publicKey, signature), true);
 });
+
+test("release signer emits a canonical signed Relay manifest", () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-manifest-signer-"));
+  const keyFile = join(base, "update-private.pem");
+  const manifestFile = join(base, "host-manifest.json");
+  const installer = join(base, "AgentPocketHost-0.3.2-windows-x64.exe");
+  const signer = resolve("..", "installer", "windows", "scripts", "sign-host-update.mjs");
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  writeFileSync(keyFile, privateKey.export({ format: "pem", type: "pkcs8" }));
+  writeFileSync(installer, "relay installer fixture");
+
+  const run = spawnSync(process.execPath, [
+    signer, "manifest", "--platform", "host", "--version", "0.3.2", "--file", installer,
+    "--output", manifestFile, "--key-file", keyFile,
+  ], { encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+
+  const manifestJson = readFileSync(manifestFile, "utf8").trim();
+  const manifest = JSON.parse(manifestJson);
+  assert.equal(manifest.platform, "host");
+  assert.equal(manifest.asset.name, "AgentPocketHost-0.3.2-windows-x64.exe");
+  const signature = Buffer.from(readFileSync(`${manifestFile}.sig`, "ascii").trim(), "base64");
+  assert.equal(verify(null, Buffer.from(manifestJson), publicKey, signature), true);
+});
