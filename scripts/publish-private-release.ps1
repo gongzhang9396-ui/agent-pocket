@@ -103,6 +103,8 @@ $bundleFiles = @(
     (Join-Path $stage 'FRIEND-QUICKSTART-zh-CN.md')
 )
 Compress-Archive -LiteralPath $bundleFiles -DestinationPath $bundle
+$bundleSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $bundle).Hash.ToLowerInvariant()
+[IO.File]::WriteAllText("$bundle.sha256", "$bundleSha256  $([IO.Path]::GetFileName($bundle))`n", [Text.UTF8Encoding]::new($false))
 
 if (-not $Publish) {
     Write-Host "Release staged (dry run): $stage"
