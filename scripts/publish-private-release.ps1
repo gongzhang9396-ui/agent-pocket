@@ -4,6 +4,7 @@ param(
     [string]$ReleaseRepository = 'gongzhang9396-ui/agent-pocket-release',
     [string]$RelayUrl = $env:AGENT_POCKET_DEFAULT_RELAY_URL,
     [Parameter(Mandatory = $true)][string]$SigningKeyFile,
+    [string]$InnoCompiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     [string]$RelaySshTarget,
     [string]$RelaySshHostFingerprint,
     [string]$RemoteUpdateRoot = '/var/lib/agent-pocket-relay/updates',
@@ -57,7 +58,7 @@ $publicKeySpki = [string]$policyJson.publicKeySpki
 & (Join-Path $repoRoot 'android\scripts\build-release.ps1') -DefaultRelayUrl $RelayUrl -UpdatePublicKeySpki $publicKeySpki
 if ($LASTEXITCODE -ne 0) { throw 'Android release build failed.' }
 & (Join-Path $repoRoot 'installer\windows\build-installer.ps1') -AppVersion $Version -DefaultRelayUrl $RelayUrl `
-    -UpdateApiUrl "$RelayUrl/api/updates/host/latest" -SigningKeyFile $SigningKeyFile
+    -UpdateApiUrl "$RelayUrl/api/updates/host/latest" -SigningKeyFile $SigningKeyFile -InnoCompiler $InnoCompiler
 if ($LASTEXITCODE -ne 0) { throw 'Windows Host release build failed.' }
 
 $apk = Join-Path $repoRoot "android\app\build\outputs\apk\release\Agent-Pocket-$Version-release.apk"
