@@ -5,6 +5,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -88,7 +89,7 @@ private fun MessageRow(message: TimelineItem.Message) {
         Role.User -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Surface(
                 shape = RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
                 modifier = Modifier.widthIn(max = 300.dp),
             ) {
                 Column(Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
@@ -215,7 +216,11 @@ private fun StreamingCursor() {
 
 @Composable
 private fun PlanCard(plan: TimelineItem.Plan) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
@@ -298,6 +303,8 @@ private fun CommandCard(command: TimelineItem.Command) {
     Card(
         onClick = { expanded = !expanded },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -365,7 +372,11 @@ private fun QuestionCard(
     actionsEnabled: Boolean,
     onAnswer: (requestId: String, questionId: String, option: String) -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
@@ -412,7 +423,11 @@ private fun ApprovalCard(
     actionsEnabled: Boolean,
     onResolve: (requestId: String, decision: ApprovalDecision) -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("⚠", color = StatusColors.attention)
@@ -421,13 +436,6 @@ private fun ApprovalCard(
                     "需要你的审批",
                     style = MaterialTheme.typography.labelMedium,
                     color = StatusColors.attention,
-                )
-                Spacer(Modifier.weight(1f))
-                Text(
-                    approval.requestId,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             Spacer(Modifier.height(6.dp))

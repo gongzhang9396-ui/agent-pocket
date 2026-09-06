@@ -76,6 +76,7 @@ fun SettingsScreen(
     val devices by repo.accountDevices.collectAsState()
     val actionError by repo.actionError.collectAsState()
     val authStatus by repo.authStatus.collectAsState()
+    val agentStates by repo.agents.collectAsState()
     var showPasswordForm by rememberSaveable { mutableStateOf(false) }
     var currentPassword by rememberSaveable { mutableStateOf("") }
     var newPassword by rememberSaveable { mutableStateOf("") }
@@ -119,7 +120,9 @@ fun SettingsScreen(
                             Column(Modifier.weight(1f)) {
                                 Text(agent.displayName, style = MaterialTheme.typography.bodyMedium)
                                 Text(
-                                    agent.capabilities,
+                                    agentStates.firstOrNull { it.id == agent.kind.id }?.let { state ->
+                                        state.error ?: if (state.available) "${agent.capabilities}${state.version?.let { " · $it" }.orEmpty()}" else "电脑上的 Agent 尚未就绪"
+                                    } ?: agent.capabilities,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )

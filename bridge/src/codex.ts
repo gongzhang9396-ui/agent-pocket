@@ -5,6 +5,7 @@ import { compareVersions } from "./config.ts";
 import { ErrorName, RpcError } from "./protocol.ts";
 
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
+export type CodexOptions = { command: string; args?: string[]; codexHome: string; minVersion: string; env?: NodeJS.ProcessEnv; cwd?: string };
 
 export class CodexAppServer extends EventEmitter {
   command: string;
@@ -18,17 +19,23 @@ export class CodexAppServer extends EventEmitter {
   readOnly = true;
   compatibilityError?: string;
   activeTurns = new Map<string, string>();
+  closing = false;
+  private closed?: Promise<{ code: number | null; signal: string | null }>;
+  private readonly environment?: NodeJS.ProcessEnv;
+  private readonly workingDirectory?: string;
 
-  constructor(options: { command: string; args?: string[]; codexHome: string; minVersion: string }) {
+  constructor(options: CodexOptions) {
     super();
     this.command = options.command;
     this.args = options.args || ["app-server", "--stdio"];
     this.codexHome = options.codexHome;
     this.minVersion = options.minVersion;
+    this.environment = options.env;
+    this.workingDirectory = options.cwd;
   }
 
   checkVersion() {
-    const result = spawnSync(this.command, ["--version"], { encoding: "utf8", shell: false });
+    const result = spawnSync(this.command, ["--version"], { encoding: "utf8", shell: false, windowsHide: true });
     if (result.error || result.status !== 0) throw result.error || new Error(result.stderr || "codex --version failed");
     this.version = (result.stdout || result.stderr).trim();
     if (compareVersions(this.version, this.minVersion) < 0) {
@@ -42,16 +49,21 @@ export class CodexAppServer extends EventEmitter {
   async start() {
     const versionOk = this.checkVersion();
     this.child = spawn(this.command, this.args, {
-      env: { ...process.env, CODEX_HOME: this.codexHome },
+      env: { ...(this.environment || process.env), CODEX_HOME: this.codexHome },
+      cwd: this.workingDirectory,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       shell: false,
     }) as ChildProcessWithoutNullStreams;
+    this.closed = new Promise((resolve) => this.child!.once("close", (code, signal) => resolve({ code, signal })));
+    this.child.on("error", (error) => this.rejectPending(error));
+    this.child.stdin.on("error", (error) => this.rejectPending(error));
     this.child.stderr.on("data", (chunk) => this.emit("stderr", chunk.toString("utf8")));
     this.child.on("exit", (code, signal) => {
       const error = new Error(`codex app-server exited (${code ?? signal})`);
-      for (const value of this.pending.values()) value.reject(error);
-      this.pending.clear();
+      this.readOnly = true;
+      this.compatibilityError = error.message;
+      this.rejectPending(error);
       this.emit("exit", error);
     });
     const lines = createInterface({ input: this.child.stdout });
@@ -63,8 +75,8 @@ export class CodexAppServer extends EventEmitter {
         capabilities: { experimentalApi: true },
       });
       this.notify("initialized");
-      await this.request("model/list", { limit: 1 });
-      await this.request("thread/list", { limit: 1, useStateDbOnly: true });
+      // Model discovery and history indexing are independent read capabilities.
+      // A slow/unavailable catalog must not disable an initialized executor.
       this.readOnly = !versionOk;
     } catch (error) {
       this.readOnly = true;
@@ -97,7 +109,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   request(method: string, params: unknown = {}, timeoutMs = 30_000) {
-    if (!this.child?.stdin.writable) return Promise.reject(new Error("Codex app-server is not running"));
+    if (this.closing || !this.child?.stdin.writable) return Promise.reject(new Error("Codex app-server is not running"));
     const id = this.nextId++;
     return new Promise<any>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -149,6 +161,32 @@ export class CodexAppServer extends EventEmitter {
 
   stop() {
     if (this.child && !this.child.killed) this.child.kill();
+  }
+
+  private rejectPending(error: Error) {
+    for (const value of this.pending.values()) { clearTimeout(value.timer); value.reject(error); }
+    this.pending.clear();
+  }
+
+  /** EOF lets Codex flush its history and release writers. A timeout never kills it. */
+  async closeGracefully(timeoutMs = 8_000) {
+    if (!this.child || !this.closed) throw new Error("Codex app-server was not started");
+    if (!this.closing) {
+      this.closing = true;
+      this.child.stdin.end();
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const result = await Promise.race([
+        this.closed,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Codex 正在释放任务，请稍后重试")), timeoutMs);
+        }),
+      ]);
+      if (result.code !== 0 || result.signal) throw new Error("Codex 未正常退出，尚不能确认交接成功");
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }
 

@@ -2,6 +2,7 @@ package com.agentpocket.app.data
 
 import android.net.Uri
 import com.agentpocket.app.data.model.ApprovalDecision
+import com.agentpocket.app.data.model.AgentAvailability
 import com.agentpocket.app.data.model.CommandStatus
 import com.agentpocket.app.data.model.ConnectionState
 import com.agentpocket.app.data.model.Device
@@ -35,6 +36,7 @@ import kotlinx.coroutines.flow.asStateFlow
  * RpcPocketRepository. Nothing here talks to a network.
  */
 object MockPocketRepository : PocketRepository {
+    override val agents = MutableStateFlow(listOf(AgentAvailability("codex", true))).asStateFlow()
 
     private val _host = MutableStateFlow(
         Host(
@@ -90,6 +92,8 @@ object MockPocketRepository : PocketRepository {
     )).asStateFlow()
     override val projectsLoading: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
     override val projectsError: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
+    override val modelsLoading: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
+    override val modelsError: StateFlow<String?> = MutableStateFlow<String?>(null).asStateFlow()
 
     override val models: StateFlow<List<ModelOption>> = MutableStateFlow(listOf(
         ModelOption(
@@ -577,6 +581,8 @@ object MockPocketRepository : PocketRepository {
     override fun hostSupports(capability: String, hostId: String?): Boolean = true
     override fun refreshAll() = Unit
     override fun refreshThread(threadId: String) = Unit
+    override fun loadEarlierMessages(threadId: String) = Unit
+    override fun handoffThread(threadId: String, onResult: (Boolean) -> Unit) = onResult(true)
     override fun setActiveThread(threadId: String?) = Unit
     override fun threadGoal(threadId: String, onResult: (String?) -> Unit) = onResult(null)
     override fun setThreadGoal(threadId: String, objective: String, onResult: (String?) -> Unit) = onResult(objective)
@@ -595,6 +601,7 @@ object MockPocketRepository : PocketRepository {
         images: List<Uri>,
         files: List<Uri>,
         onCreated: (String) -> Unit,
+        agentId: String,
     ) {
         createdCount += 1
         val id = "t-created-$createdCount"

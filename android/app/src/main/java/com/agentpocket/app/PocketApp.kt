@@ -10,6 +10,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import com.agentpocket.app.data.PocketRepository
@@ -47,6 +48,7 @@ fun PocketApp(
             )
         }
         var handledLaunchKey by remember { mutableStateOf(-1L) }
+        var inboxAgentId by rememberSaveable { mutableStateOf<String?>(null) }
 
         fun push(screen: Screen) = backStack.add(screen)
         fun pop() {
@@ -105,15 +107,19 @@ fun PocketApp(
 
                 Screen.Inbox -> InboxScreen(
                     repo = repo,
+                    selectedAgentId = inboxAgentId,
+                    onSelectAgent = { inboxAgentId = it },
                     onOpenThread = { push(Screen.Detail(it)) },
-                    onNewTask = { push(Screen.NewTask) },
+                    onNewTask = { push(Screen.NewTask(it)) },
                     onOpenSettings = { push(Screen.Settings) },
                 )
 
-                Screen.NewTask -> NewTaskScreen(
+                is Screen.NewTask -> NewTaskScreen(
                     repo = repo,
+                    initialAgentId = screen.agentId,
                     onBack = { pop() },
-                    onCreated = { threadId ->
+                    onCreated = { threadId, agentId ->
+                        inboxAgentId = agentId
                         pop()
                         push(Screen.Detail(threadId))
                     },

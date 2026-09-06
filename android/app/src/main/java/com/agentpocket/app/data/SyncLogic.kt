@@ -65,3 +65,27 @@ internal fun mergeTimelineItems(
     }
     return resolvedServer + preserved.distinctBy { it.id }
 }
+
+/** A latest-page correction retains the already-loaded prefix, without duplicating overlap. */
+internal fun mergeTimelinePage(
+    server: List<TimelineItem>,
+    existing: List<TimelineItem>,
+    baseline: List<TimelineItem>,
+    earlier: Boolean,
+    hasMore: Boolean,
+    historyIds: Set<String>,
+): List<TimelineItem> {
+    if (earlier) {
+        val currentIds = existing.mapTo(mutableSetOf()) { it.id }
+        val pageById = server.associateBy { it.id }
+        val ordered = server.filterNot { it.id in currentIds }.distinctBy { it.id } +
+            existing.map { pageById[it.id] ?: it }
+        return mergeTimelineItems(ordered, existing, baseline)
+    }
+    val serverIds = server.mapTo(mutableSetOf()) { it.id }
+    val overlap = existing.indexOfFirst { it.id in serverIds }
+    val prefix = if (hasMore) {
+        (if (overlap >= 0) existing.take(overlap) else existing).filter { it.id in historyIds }
+    } else emptyList()
+    return mergeTimelineItems(prefix + server, existing, baseline).distinctBy { it.id }
+}

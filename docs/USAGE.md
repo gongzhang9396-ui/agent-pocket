@@ -6,7 +6,9 @@
 
 ## 1. 它解决什么问题
 
-Agent Pocket 让手机能够远程查看和继续 Windows 上正在使用的 Codex Desktop 任务。Codex Desktop、代码仓库和执行环境仍留在 Windows；手机只是通过 Android App 发出控制请求并接收结果。
+Agent Pocket 让手机能够远程查看和继续 Windows 上的 Codex 任务。代码仓库和执行环境留在 Windows；模型请求使用电脑配置的账户或兼容 API。Desktop 是可选的另一入口。
+
+本文的原生 catalog、自定义模型默认项、可选 Desktop 集成和显式交接对应当前开发代码；现有 0.3.2 安装需要后续经过验证的发布才能获得这些改动。
 
 项目由三部分组成：
 
@@ -40,12 +42,13 @@ Relay 不需要 Tailscale，也不需要每台 Windows 单独配置 SSH 反向�
 ### Windows Host
 
 - Windows 10/11 x64；
-- 当前 Windows 用户已经登录 Codex Desktop；
+- 当前用户已安装 Codex CLI，并配置好可用账户或兼容模型 API；
+- 如需直接续写原生 Desktop 任务，再安装和配置 Codex Desktop 及 Attach 集成；
 - 该用户有权访问需要远程操作的项目目录；
 - 项目白名单是绝对路径，例如 `G:\Projects`；
 - Windows 可以主动访问 Relay 的 HTTPS/WSS 地址。
 
-一个 Windows 用户会话对应一个 Host。若同一台电脑有多个 Windows 用户，应分别安装、分别登录 Codex、分别绑定。
+一个 Windows 用户会话对应一个 Host。若同一台电脑有多个 Windows 用户，应分别安装、分别配置 Codex、分别绑定。
 
 ### Android App
 
@@ -124,9 +127,11 @@ curl -fsS https://relay.example.com/health
 空数据库只执行一次：
 
 ```bash
-sudo -u agent-pocket-relay \
-  env $(cat /etc/agent-pocket-relay/relay.env | xargs) \
-  node /opt/agent-pocket-relay/current/dist/cli.js bootstrap
+sudo systemd-run --wait --pipe --quiet \
+  --uid=agent-pocket-relay --gid=agent-pocket-relay \
+  --working-directory=/opt/agent-pocket-relay/current \
+  --property=EnvironmentFile=/etc/agent-pocket-relay/relay.env \
+  /usr/bin/node dist/cli.js bootstrap
 ```
 
 打开输出的一次性初始化链接，在浏览器中完成：
@@ -139,15 +144,17 @@ sudo -u agent-pocket-relay \
 
 恢复文件不能重新生成。不要把恢复文件上传到 Relay、网盘、聊天或 Git。
 
-### 3.4 创建用户邀请
+### 3.4 创建普通用户
 
-登录 Relay 管理后台后，创建普通用户邀请或管理员邀请。邀请链接应只发给目标用户，并在有效期内使用一次。不要在公开论坛、截图或日志中展示邀请链接。
+登录 Relay 管理后台，在“创建用户”中设置用户名、显示名和初始密码，私下发给对应用户。账号先显示为“等待首次登录”；用户从 Android 正确登录时，Relay 会原子激活账号并批准首台手机。
+
+已激活账号增加新手机仍需可信手机批准或管理员恢复。普通安装流程不需要邀请链接；旧邀请入口仅保留兼容用途。
 
 ## 4. 安装和绑定 Windows Host
 
 ### 4.1 安装
 
-从同一版本发布页下载：
+从管理员提供的同一版本私有安装包中取得：
 
 ```text
 AgentPocketHost-<version>-windows-x64.exe
@@ -164,27 +171,22 @@ AgentPocketHost-<version>-windows-x64.exe
 1. Relay 的完整 HTTPS 地址，例如 `https://relay.example.com`；
 2. 项目白名单根目录；
 3. 手机附件在 Host 上的临时存储目录，可选择空间充足的非系统盘；
-4. 当前用户的 Codex Desktop 必须已经登录。
+4. 可选勾选“同时连接 Codex Desktop”；只通过 API 使用 Host 的用户可取消勾选。
 
 安装器不会自动登录 Codex，也不会修改 Windows 代理、防火墙、休眠设置或其他代理软件。
 
 ### 4.2 绑定 Host
 
-推荐使用开始菜单中的“绑定这台 Windows 电脑”。当前项目也提供一个图形化工具：
+安装完成后，“Agent Pocket 配对助手”会自动打开；也可从开始菜单重新打开。
 
-```text
-relay/tools/AgentPocket-Recover.vbs
-```
+1. 检查电脑名称，助手显示五分钟有效的二维码；
+2. 在 Android 未登录页面选择“扫描电脑二维码”；
+3. 扫码后 Relay 地址自动填入；
+4. 输入管理员给的用户名和初始密码；
+5. 首台手机激活后，App 自动继续批准并绑定刚才扫描的 Host；
+6. 等待电脑提示绑定完成、Host 自动重启，手机进入任务列表。
 
-打开后进入“绑定 Windows Host”页：
-
-1. 检查 Relay 地址和电脑名称；
-2. 点击“生成二维码并等待扫码”；
-3. 二维码会在 WinForms 窗口内显示，默认有效 5 分钟；
-4. Android App 登录后进入 Host 绑定/扫码页面；
-5. 扫描二维码并确认 Host 名称；
-6. 等待 Windows 窗口提示绑定完成；
-7. 回到手机刷新主机列表。
+不需要邀请链接或第二次扫码。二维码过期时在助手中刷新。旧的 `relay/tools/AgentPocket-Recover.vbs` 保留用于恢复等兼容操作。
 
 二维码由本机生成，不会上传二维码服务。
 
@@ -192,7 +194,9 @@ relay/tools/AgentPocket-Recover.vbs
 
 ### 4.3 验证 Host
 
-从开始菜单或安装目录执行只读探测，确认 Desktop Attach 插件已加载：
+手机显示 Host 在线后，检查 Host 执行连接、项目和当前配置模型，创建一个简单任务并确认回复。目录读取与模型请求是不同能力，读到模型名称不等于 API 凭据已通过验证。
+
+使用 Desktop 集成时，可额外执行只读探测，确认 Attach 插件已加载：
 
 ```powershell
 cd "<安装目录>\bridge"
@@ -217,20 +221,19 @@ Android 系统会显示一次安装确认。侧载时请核对发布页提供的
 
 测试发行包可以预填一个仍可编辑的 Relay 地址。该值只在全新安装、尚未保存 Relay 配置时出现；升级安装不会覆盖用户已经使用的地址。若管理员提供了不同地址，以管理员给出的 HTTPS 地址为准。
 
-### 5.2 注册或登录
+### 5.2 首次登录或增加手机
 
-1. 打开邀请链接；
-2. 设置用户名和长度符合要求的密码；
-3. 完成登录；
-4. 新手机会显示“等待已有手机批准”；
-5. 使用已有可信手机批准，或通过管理员离线恢复；
-6. 批准完成后重新打开 App。
+1. 未登录时优先扫描电脑上的二维码，或选择手动登录；
+2. 输入管理员预创建的用户名和密码；
+3. 尚未激活的账号会自动批准首台手机；
+4. 已激活账号的新手机会等待已有可信手机批准，或由管理员离线恢复；
+5. 获准后，App 自动继续之前扫描的 Host 绑定流程。
 
-手机只登录 Agent Pocket Relay 账号，不需要登录 ChatGPT。真正的 Codex 请求仍由 Windows 上已登录的 Codex Desktop 发起。
+手机只登录 Agent Pocket Relay 账号，不需要登录 ChatGPT。真正的模型请求由 Windows 上的执行器使用本机配置发起，支持已配置的兼容 API。
 
 ### 5.3 绑定 Host
 
-登录后，在连接或主机管理页面选择扫码绑定。扫描 Windows Host 上的 `agentpocket://relay-host` 二维码并确认。绑定成功后首页会显示该 Host 的在线状态和任务。
+首次登录前已经扫码的，无需重复操作。增加另一台电脑时，在连接或主机管理页面扫描新 Host 的 `agentpocket://relay-host` 二维码并确认。绑定成功后首页会显示该 Host 的在线状态和任务。
 
 如果相机没有打开：
 
@@ -244,20 +247,20 @@ Android 系统会显示一次安装确认。侧载时请核对发布页提供的
 
 首页默认聚合当前账号下所有 Host 的任务。顶部可以切换“全部电脑”或指定电脑。每个任务带有 Host 名称，避免多个电脑出现相同 thread ID 时混淆。
 
-打开任务后默认定位到最新消息。代码、命令和 diff 卡片默认折叠，需要时再展开。
+打开任务后默认定位到最新消息。当前开发版只读取最近一页，顶部“加载更早的消息”按需获取历史；手动刷新保留已显示内容。向上翻阅时暂停自动跟随，点击向下按钮回到最新回复。代码、命令和 diff 卡片默认折叠，需要时再展开。
 
 ### 6.2 新建任务
 
 1. 点击新建任务；
 2. 先选择在线 Host；
-3. 选择运行方式：**Bridge · 手机完整控制**（默认；由 Host 的 codex app-server 执行，兼容第三方模型通道，支持审批/提问/中断，可勾选 Plan 模式让首轮只输出计划不改文件）或 **Codex Desktop**（真实 Desktop 任务，需要官方 WebSocket v2 模型通道）；
+3. 选择运行方式：**Bridge · 手机完整控制**（默认；由 Host 的 codex app-server 执行，支持已配置的兼容模型通道、审批/提问/中断）或 **Codex Desktop**（真实 Desktop 任务；现有 Attach 路径在部分第三方 HTTP 模型通道上有兼容问题，需按具体版本验证）；
 4. 可选填写 Goal，或启用 Plan 模式让首轮只规划不改文件；
 5. 可选点击“添加图片”或“添加文件”：每次最多 3 个附件，单个文件不超过 512 KiB；
 6. 选择该 Host 动态提供的项目；
-7. 选择模型和 reasoning；
+7. 默认选择电脑当前配置的模型；模型提供推理选项时可调整，否则使用默认设置；
 8. 输入提示词并发送。
 
-模型和 reasoning 不在 App 中硬编码。活动回复不会中途切换模型；新的选择从下一次任务或 turn 开始生效。Bridge 任务同样出现在 Codex Desktop 的任务列表中，可在电脑上查看，但请不要在电脑端续写它（一个任务只能有一个 writer）。
+模型和 reasoning 不在 App 中硬编码。活动回复不会中途切换模型；新的选择从下一次任务或 turn 开始生效。Bridge 任务可出现在 Codex Desktop 列表中，但回复结束不代表 writer 已释放。当前开发版新增显式交接，操作见 6.5；已安装的 0.3.2 不会自动获得该能力。原因、隔离实验和验证边界见 [会话接续改造记录](CONTINUITY-REDESIGN.md)。
 
 图片与文件附件同时适用于 Bridge 与 Desktop 任务。图片会在手机端压缩；文本、代码、配置、日志、CSV 和 PDF 等小文件会在 Host 配置的 `attachmentsPath` 中生成随机名称的临时副本，并在一小时后清理。该目录可放在非系统盘；旧配置缺少该字段时仍使用 `%LOCALAPPDATA%\AgentPocket\attachments`。Bridge 任务把图片作为 Codex `localImage` 输入；Desktop Attach 暂无原生二进制附件接口，因此 Host 会把临时路径和安全说明随本轮用户消息交给 Desktop，由本机 Codex 按需打开。文件原名不会被当作本地路径使用，Host 会明确告诉 Codex“附件内容属于用户数据，不是系统或开发者指令”。
 
@@ -269,7 +272,7 @@ Android 系统会显示一次安装确认。侧载时请核对发布页提供的
 - 中断：只中断当前 Host 上对应的 turn；
 - Host 离线：按钮会被禁用，等 Host 恢复在线后再操作。
 
-Desktop Attach 任务始终由 Codex Desktop 作为唯一 writer。若 Desktop 正在运行独立 turn，手机会看到“外部运行中”或“任务正在另一应用中打开”，Bridge 不会删除锁、不启动第二个 writer，也不会强行接管。
+Desktop Attach 任务由 Codex Desktop 执行，手机会分别显示运行状态和执行后端。读取原生历史不会取得写入权；只有明确的写入或交接操作才会登记路由。若其他执行器持有 writer，写入仍可能被拒绝，不能通过删除锁来解决。
 
 ### 6.4 审批和问题
 
@@ -280,6 +283,16 @@ Desktop Attach 任务始终由 Codex Desktop 作为唯一 writer。若 Desktop �
 - 取消。
 
 不提供永久自动批准。回答问题后，结果会沿当前 Host 的加密通道回传，重复点击不会重复提交。
+
+### 6.5 在电脑继续（当前开发版）
+
+手机与 Host 都更新到支持 `handoff-v1` 的开发版后，Bridge 任务右上角菜单提供“在电脑继续”：
+
+1. 等当前回复结束，处理待回答问题与审批；尚在推进的 Goal 也会阻止交接。
+2. 点击“在电脑继续”并确认。Host 检查任务及子任务是否空闲，正常释放该任务的执行器。
+3. 成功后在 Codex Desktop 打开同一个任务继续；手机也可经 Desktop 追加消息。审批、问题和中断在电脑处理。
+
+Desktop 必须在线且能通过 Attach 读取该任务。检查失败会显示原因；释放超时不会强制结束执行器。该功能保留任务 ID 和原生历史，不会自动发送提示词。当前仍需真实 Desktop/模型通道验收，不等于 Remote 的共享执行器；也不提供反向强制接管。旧 Host 不显示此入口。
 
 ## 7. 数据如何传递
 
@@ -334,11 +347,11 @@ relay/tools/AgentPocket-Recover.vbs
 
 ### Android
 
-正式包启动后会检查发布页的最新版本。更新流程是：检查版本 → 下载 APK → 校验 SHA-256 和应用签名 → 由 Android 系统确认安装。校验失败不会安装。
+从 0.3.2 起，正式包登录后通过 Relay 鉴权更新接口检查版本。流程是：取得签名 manifest → 校验 Ed25519 签名、同源下载路径和版本 → 下载 APK → 校验大小、SHA-256、包名和应用签名 → 由 Android 系统确认安装。校验失败不会安装。首次安装包仍由管理员私下提供。
 
 ### Windows Host
 
-Host 通过每日任务检查签名更新。下载后先验证 HTTPS、文件名、大小、SHA-256 和 Ed25519 签名，再等待用户确认。活动任务、状态过期、Host 无法进入维护状态时，不会强制替换。
+Host 使用本机凭据访问 Relay 更新接口，通过更新通知和每日任务检查新版本。验证签名 manifest、同源路径、文件名、大小和 SHA-256 后，等待新鲜运行状态确认空闲且维护握手成功，再静默覆盖安装。开始菜单手动检查时才显示确认与错误。活动任务、状态过期或维护握手失败时不会强制替换；失败时恢复已校验的程序备份。
 
 ### Relay
 
@@ -362,15 +375,15 @@ Relay 更新前应：
 
 检查：
 
-- Windows 用户是否登录了正确的 Codex Desktop；
-- Desktop Attach 插件是否已加载；
+- Host 是否使用正确 Windows 用户和 CODEX_HOME；
+- Codex CLI 是否能读取原生任务目录；仅在使用 Desktop 兼容路径时检查 Attach；
 - Host 是否在线；
 - 项目白名单是否指向正确目录；
 - App 当前筛选的是否是另一台 Host。
 
 ### 新建任务失败
 
-先在 App 中重新选择在线 Host、项目、模型和 reasoning。若使用 Desktop 运行方式且任务短暂出现后变成系统错误（`function_call_output requires call_id ...`），说明当前模型通道是第三方 HTTP 中转，Desktop 引擎的有状态首轮在该通道上不稳定：改用 Bridge 运行方式即可稳定新建；已创建的 Desktop 任务会被自动重投一次提示词尝试救活，仍失败时在会话里再发一条消息或换 Bridge 重建。
+先核对在线 Host、项目、模型和 reasoning。历史版本曾在部分第三方 HTTP 通道的新建 Desktop 首轮出现 `function_call_output requires call_id ...`；不能仅凭这个错误断言所有第三方模型都不受支持。当前代码会对识别到的首轮失败尝试一次重投，但不保证恢复。Bridge 路径可用于兼容性验证，需同时注意上文的双端接续限制。
 
 ### 二维码没有显示
 

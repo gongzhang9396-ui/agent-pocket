@@ -52,6 +52,7 @@ class SyncLogicTest {
         assertTrue(isTransientConnectionFailure(BridgeRpcException("channel timeout", CHANNEL_TIMEOUT_CODE)))
         assertTrue(isTransientConnectionFailure(BridgeRpcException("hello required", HELLO_REQUIRED_CODE)))
         assertFalse(isTransientConnectionFailure(BridgeRpcException("bad request", "INVALID_PARAMS")))
+        assertFalse(isTransientConnectionFailure(BridgeRpcException("one slow metadata request", "REQUEST_TIMEOUT")))
     }
 
     @Test
@@ -102,5 +103,66 @@ class SyncLogicTest {
         val stale = TimelineItem.Message("m2", Role.Assistant, "较旧回复", MessageStatus.Done)
         val merged = mergeTimelineItems(server = listOf(stale), existing = listOf(live), baseline = emptyList())
         assertEquals(listOf(live), merged)
+    }
+
+    private fun message(id: String, text: String = id, status: MessageStatus = MessageStatus.Done) =
+        TimelineItem.Message(id, Role.Assistant, text, status)
+
+    @Test
+    fun latestPageRefreshKeepsLoadedHistoryAndLiveTail() {
+        val old = message("old")
+        val baseline = listOf(old, message("current", "partial", MessageStatus.Streaming))
+        val live = message("current", "complete")
+        val result = mergeTimelinePage(
+            listOf(message("current", "older snapshot")), listOf(old, live), baseline,
+            earlier = false, hasMore = true, historyIds = setOf("old", "current"),
+        )
+        assertEquals(listOf(old, live), result)
+    }
+
+    @Test
+    fun olderPagePrependsWithoutDuplicatingOverlapOrDowngradingLiveText() {
+        val live = message("new", "live text", MessageStatus.Streaming)
+        val existing = listOf(message("middle"), live)
+        val result = mergeTimelinePage(
+            listOf(message("old"), message("middle", "stale")), existing, existing,
+            earlier = true, hasMore = false, historyIds = setOf("middle"),
+        )
+        assertEquals(listOf(message("old"), message("middle", "stale"), live), result)
+    }
+
+    @Test
+    fun overlappingOlderPageCorrectsStaleStateButPreservesConcurrentCompletion() {
+        val baseline = listOf(message("x", "partial", MessageStatus.Streaming))
+        val final = message("x", "final")
+        assertEquals(listOf(final), mergeTimelinePage(
+            listOf(final), baseline, baseline, true, false, setOf("x"),
+        ))
+        val live = message("x", "newer completion")
+        assertEquals(listOf(live), mergeTimelinePage(
+            listOf(final), listOf(live), baseline, true, false, setOf("x"),
+        ))
+    }
+
+    @Test
+    fun latestFullSnapshotStillRemovesObsoleteHistory() {
+        val existing = listOf(message("rolled-back"), message("kept"))
+        assertEquals(listOf(message("kept")), mergeTimelinePage(
+            listOf(message("kept")), existing, existing,
+            earlier = false, hasMore = false, historyIds = setOf("rolled-back", "kept"),
+        ))
+    }
+
+    @Test
+    fun acknowledgedOptimisticMessageIsNotMistakenForOlderHistory() {
+        val optimistic = TimelineItem.Message("mobile-id", Role.User, "hello", MessageStatus.Done)
+        val native = optimistic.copy(id = "native-id")
+        val assistant = message("reply")
+        val old = message("old")
+        val existing = listOf(old, optimistic, assistant)
+        assertEquals(listOf(old, native, assistant), mergeTimelinePage(
+            listOf(native, assistant), existing, existing,
+            earlier = false, hasMore = true, historyIds = setOf("old"),
+        ))
     }
 }

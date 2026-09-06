@@ -102,7 +102,12 @@ $bridgeFiles = @(
     'package.json',
     'package-lock.json',
     'src\cli.ts',
+    'src\acp-client.ts',
+    'src\agent-store.ts',
+    'src\grok.ts',
+    'src\grok-native-catalog.ts',
     'src\codex.ts',
+    'src\codex-pool.ts',
     'src\config.ts',
     'src\desktop-attach.ts',
     'src\fcm.ts',
@@ -111,7 +116,8 @@ $bridgeFiles = @(
     'src\relay-connector.ts',
     'src\relay-crypto.ts',
     'src\server.ts',
-    'src\store.ts'
+    'src\store.ts',
+    'src\task-catalog.ts'
 )
 Copy-AllowlistedFiles (Join-Path $repoRoot 'bridge') $bridgeStage $bridgeFiles
 Push-Location $bridgeStage
@@ -139,6 +145,8 @@ Copy-AllowlistedFiles (Join-Path $scriptRoot 'scripts') $scriptsStage @(
     'pairing-assistant.ps1',
     'register-host-tasks.ps1',
     'run-host.ps1',
+    'resolve-codex.ps1',
+    'update-desktop-integration.ps1',
     'task-names.ps1',
     'uninstall-host.ps1'
 )

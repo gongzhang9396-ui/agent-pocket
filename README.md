@@ -1,8 +1,10 @@
 # Agent Pocket
 
+[简体中文](README.md) | [English](README.en.md) | [日本語](README.ja.md)
+
 Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码和执行环境留在自己的 Windows 电脑；手机通过自托管 Relay 查看并继续真实 Desktop 任务，不占用 Android 的 VPN 槽位，也不要求手机登录 ChatGPT。
 
-当前 v2 是邀请制、多用户、多主机架构，适合个人、家庭或小团队自托管。项目仍处于实验阶段：Desktop Attach 依赖 Codex Desktop 的内部本地能力，Desktop 更新后可能需要适配。
+当前 v2 是管理员预创建账号、多用户、多主机架构，适合个人、家庭或小团队自托管。旧邀请流程只保留兼容能力，不再是普通用户的安装主流程。项目仍处于实验阶段：Desktop Attach 依赖 Codex Desktop 的内部本地能力，Desktop 更新后可能需要适配。
 
 当前稳定版为 **v0.3.2**。版本由根目录 `VERSION` 统一生成，Android App、Windows Host、Bridge、Relay 与 Desktop Attach 使用同一版本号。
 
@@ -35,7 +37,7 @@ Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码�
 
 Desktop 原生任务的硬中断、原生审批响应和结构化问题回答目前没有稳定插件接口。Agent Pocket 不会启动第二个 writer、删除锁或模拟坐标点击来强抢任务。
 
-Android v0.3 的界面方向和附件交互见 [视觉原型](docs/prototypes/agent-pocket-v03-overview.png)。Codex 已接入；Grok 与 Kimi Code 目前只展示能力边界，不会伪装成可用状态。
+Android v0.3 的界面方向和附件交互见 [视觉原型](docs/prototypes/agent-pocket-v03-overview.png)。Codex 已接入；当前开发代码新增 [Grok CLI 接入](docs/GROK-CLI.md)，支持电脑会话同步与手机续聊、新建任务、流式进度、审批与中断，尚未发布到稳定版。Kimi Code 仍待接入。
 
 ## 架构
 
@@ -180,7 +182,7 @@ Android 只用 approved device token，Host 只用 Host token 访问 `/api/updat
 - Windows 安装后自动打开配对助手；Android 可以先扫码再激活账号并自动续接 Host 绑定。
 - Android 与 Host 的后续更新改为 Relay 鉴权下载和 Ed25519 签名 manifest；Host 有活动任务时延后，安装失败恢复已校验备份。
 
-当前源码验证结果：Android JVM 31/31、Bridge 67/67、Relay 26/26；正式发布仍需在持有离线签名材料的构建机上完成 Release/R8/APK 签名和真机端到端验收。Windows 下如仓库路径含中文且 Gradle test worker 报全量 `ClassNotFoundException`，可从临时 ASCII 盘符映射运行测试；这是 Gradle 8.14.3 argfile 路径问题，不是测试类缺失。
+当前源码验证结果：Android JVM 31/31、Bridge 67/67、Relay 27/27；正式发布仍需在持有离线签名材料的构建机上完成 Release/R8/APK 签名和真机端到端验收。Windows 下如仓库路径含中文且 Gradle test worker 报全量 `ClassNotFoundException`，可从临时 ASCII 盘符映射运行测试；这是 Gradle 8.14.3 argfile 路径问题，不是测试类缺失。
 
 ## v1 迁移
 

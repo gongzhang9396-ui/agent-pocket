@@ -8,7 +8,9 @@ import { assertAllowedCwd, listProjects, type BridgeConfig } from "./config.ts";
 import { CodexAppServer, mapCodexBusy } from "./codex.ts";
 import { DesktopAttachClient, type DesktopWaitSummary } from "./desktop-attach.ts";
 import { FcmNotifier } from "./fcm.ts";
+import { GrokAgent } from "./grok.ts";
 import { BridgeStore } from "./store.ts";
+import { TaskCatalog, isCatalogCursor, listEffectiveModels } from "./task-catalog.ts";
 import {
   ErrorName,
   MAX_COMMAND_BYTES,
@@ -27,6 +29,7 @@ type DesktopWatcher = {
   generation: number;
   stopped: boolean;
   lastPublishedKey?: string;
+  lastCorrectionAt?: number;
   task?: Promise<void>;
   /** One-shot bootstrap recovery: re-queue this prompt if the first turn dies. */
   recoveryText?: string;
@@ -39,7 +42,15 @@ const MAINTENANCE_BLOCKED_METHODS = new Set([
   "turn/steer",
   "approval/respond",
   "question/respond",
+  "thread/handoff",
+  "goal/set",
 ]);
+const THREAD_MUTATIONS = new Set(["turn/start", "turn/steer", "turn/interrupt", "goal/set", "goal/clear", "thread/handoff", "approval/respond", "question/respond"]);
+type BridgeCodex = CodexAppServer & {
+  releaseThread?: (threadId: string) => Promise<{ released: boolean; alreadyReleased: boolean }>;
+  pinThread?: (threadId: string) => () => void;
+  isThreadUncertain?: (threadId: string) => boolean;
+};
 
 const execFileAsync = promisify(execFile);
 const CODEX_DESKTOP_APP_ID = "OpenAI.Codex_2p2nqsd0c76g0!App";
@@ -192,9 +203,11 @@ function attachmentPayloads(imagesValue: unknown, filesValue: unknown) {
 export class BridgeServer {
   config: BridgeConfig;
   store: BridgeStore;
-  codex: CodexAppServer;
+  codex: BridgeCodex;
   fcm: FcmNotifier;
   desktop?: DesktopAttachClient;
+  grok?: GrokAgent;
+  catalog: TaskCatalog;
   wss?: WebSocketServer;
   sessions = new Set<Session>();
   commandOutputBytes = new Map<string, number>();
@@ -202,13 +215,23 @@ export class BridgeServer {
   relayEventListeners = new Set<(event: BridgeEvent & { seq: number }) => void>();
   runtimeStatusTimer?: NodeJS.Timeout;
   inFlightMutations = 0;
+  threadMutations = new Set<string>();
+  messageDeltas = new Map<string, any>();
+  messageDeltaTimer?: NodeJS.Timeout;
+  seenMessageItems = new Set<string>();
 
-  constructor(config: BridgeConfig, store: BridgeStore, codex: CodexAppServer, fcm: FcmNotifier, desktop?: DesktopAttachClient) {
+  constructor(config: BridgeConfig, store: BridgeStore, codex: BridgeCodex, fcm: FcmNotifier, desktop?: DesktopAttachClient, grok?: GrokAgent) {
     this.config = config;
     this.store = store;
     this.codex = codex;
     this.fcm = fcm;
     this.desktop = desktop;
+    this.grok = grok;
+    grok?.on("event", (event: BridgeEvent) => {
+      if (event.type === "message.delta" && !(event.payload as any)?.replace) this.queueMessageDelta({ ...(event.payload as any), threadId: event.threadId, turnId: event.turnId });
+      else { this.flushMessageDeltas(); this.publish(event); this.writeRuntimeStatus(); }
+    });
+    this.catalog = new TaskCatalog(codex, config.projectRoots, (thread) => this.describeThread(thread));
     this.cleanupExpiredAttachments();
     codex.on("notification", (message) => this.onCodexNotification(message));
     codex.on("serverRequest", (message) => this.onCodexRequest(message));
@@ -278,21 +301,52 @@ export class BridgeServer {
   }
 
   async dispatch(session: Session, method: string, params: any) {
-    if (!MAINTENANCE_BLOCKED_METHODS.has(method)) return this.dispatchUnchecked(session, method, params);
-    if (this.maintenanceRequested()) {
+    if (!MAINTENANCE_BLOCKED_METHODS.has(method) && !THREAD_MUTATIONS.has(method)) return this.dispatchUnchecked(session, method, params);
+    if (MAINTENANCE_BLOCKED_METHODS.has(method) && this.maintenanceRequested()) {
       throw new RpcError(ErrorName.HOST_MAINTENANCE, "Host 正在准备更新，暂不接受新的任务操作");
     }
+    const threadId = THREAD_MUTATIONS.has(method)
+      ? method === "approval/respond" || method === "question/respond"
+        ? this.store.pending(stringParam(params.requestId, "requestId", 100)!).params.threadId
+        : stringParam(params.threadId, "threadId", 100)!
+      : undefined;
+    if (threadId && this.threadMutations.has(threadId)) throw new RpcError(ErrorName.THREAD_BUSY, "任务正在处理另一个操作，请稍后重试");
+    const unpin = threadId && !threadId.startsWith("grok:") && method !== "thread/handoff" ? this.codex.pinThread?.(threadId) : undefined;
+    if (threadId) this.threadMutations.add(threadId);
     this.inFlightMutations += 1;
     this.writeRuntimeStatus();
     try {
       return await this.dispatchUnchecked(session, method, params);
     } finally {
+      unpin?.();
+      if (threadId) this.threadMutations.delete(threadId);
       this.inFlightMutations = Math.max(0, this.inFlightMutations - 1);
       this.writeRuntimeStatus();
     }
   }
 
   async dispatchUnchecked(session: Session, method: string, params: any) {
+    // Namespaced identities are routed before any Codex/desktop branch, including
+    // unsupported operations. An absent adapter must never adopt a Grok task.
+    const grokThread = typeof params.threadId === "string" && params.threadId.startsWith("grok:");
+    if (grokThread) {
+      if (!this.grok) throw new RpcError(ErrorName.NOT_FOUND, "这个 Host 尚未接入 Grok");
+      const id = stringParam(params.threadId, "threadId", 100)!;
+      if (method === "thread/read") return this.grok.read(id, stringParam(params.cursor, "cursor", 4096, false));
+      if (method === "turn/interrupt") return this.grok.interrupt(id, stringParam(params.turnId, "turnId", 100)!);
+      if (method === "turn/start") {
+        this.assertGrokInput(params);
+        return this.grok.start(id, stringParam(params.text, "text", 64 * 1024)!, stringParam(params.clientMessageId, "clientMessageId", 128, false));
+      }
+      throw new RpcError(ErrorName.INVALID_REQUEST, "Grok 暂不支持这个操作；运行中的任务请先等待完成或中断");
+    }
+    if (method === "approval/respond" || method === "question/respond") {
+      const requestId = stringParam(params.requestId, "requestId", 100)!;
+      if (this.store.pending(requestId).method.startsWith("grok/")) {
+        if (!this.grok || method !== "approval/respond") throw new RpcError(ErrorName.NOT_FOUND, "Grok 审批已失效");
+        return this.grok.respond(requestId, stringParam(params.decision, "decision", 16)!);
+      }
+    }
     switch (method) {
       case "pair/claim": {
         const claimed = this.store.claimPairing({
@@ -318,7 +372,7 @@ export class BridgeServer {
           deviceId: session.device.id, codexVersion: this.codex.version,
           readOnly: this.codex.readOnly, error: this.codex.compatibilityError,
           latestSeq: this.store.latestSeq(),
-          capabilities: BRIDGE_CAPABILITIES,
+          capabilities: this.capabilities(),
         };
       }
       case "push/register": {
@@ -327,8 +381,11 @@ export class BridgeServer {
         return { ok: true };
       }
       case "host/runtime": return this.hostRuntime();
+      case "agent/list": return this.listAgents();
       case "desktop/launch": return this.launchDesktop();
       case "project/list": {
+        // Host directories are immediately usable without a Desktop connection.
+        if (params.target !== "desktop") return { data: await listProjects(this.config.projectRoots), source: "host-scan" };
         let result: any = { data: [], source: "host-scan" };
         let attachWarning: string | undefined;
         if (this.desktop) {
@@ -351,7 +408,7 @@ export class BridgeServer {
             throw error;
           }
         }
-        if (projects.length === 0) projects.push(...listProjects(this.config.projectRoots));
+        if (projects.length === 0) projects.push(...await listProjects(this.config.projectRoots));
         const warning = projects.length === 0
           ? excluded > 0
             ? "Codex Desktop 的已保存项目都不在 Bridge 项目白名单内"
@@ -359,29 +416,41 @@ export class BridgeServer {
           : attachWarning;
         return { ...result, data: projects, excluded, warning };
       }
-      case "model/list": return this.codex.request("model/list", {
+      case "model/list": return listEffectiveModels(this.codex, {
         cursor: stringParam(params.cursor, "cursor", 2048, false), limit: intParam(params.limit, "limit", 100, 200) || 100, includeHidden: false,
       });
       case "thread/list": {
         const cursor = stringParam(params.cursor, "cursor", 2048, false);
         const search = stringParam(params.search, "search", 500, false);
         const limit = intParam(params.limit, "limit", 50, 200) || 50;
-        if (this.desktop) {
-          if (cursor) throw new RpcError(ErrorName.INVALID_REQUEST, "Codex Desktop 任务列表暂不支持 cursor 分页");
-          try {
-            const result = await this.desktop.listThreadsNormalized(Math.min(limit, 50), search);
-            this.rememberDesktopThreads(result);
-            return this.applyStoredThreadOwners(result);
-          } catch (error) {
-            throw desktopOperationError("无法读取 Codex Desktop 任务列表", error);
+        const agentId = stringParam(params.agentId, "agentId", 20, false);
+        if (agentId && !["codex", "grok"].includes(agentId)) throw new RpcError(ErrorName.INVALID_REQUEST, "不支持的 Agent");
+        if (agentId === "grok") return this.grok ? this.grok.listPage(cursor, search, limit) : { data: [], nextCursor: null };
+        // New clients page each Agent independently, so older Grok conversations
+        // cannot disappear behind the first page of newer Codex tasks.
+        const grokPage = !cursor && !agentId && this.grok ? await this.grok.listPage(undefined, search, 200) : undefined;
+        const mergeGrok = (result: any) => !grokPage ? result : {
+          ...result, data: [...result.data, ...grokPage.data].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)), grokNextCursor: grokPage.nextCursor,
+        };
+        try {
+          return mergeGrok(await this.catalog.list(cursor, search, limit));
+        } catch (error) {
+          if (!cursor && !agentId && grokPage && (!this.desktop || this.codex.readOnly)) {
+            return { data: grokPage.data, nextCursor: null, grokNextCursor: grokPage.nextCursor, warning: "Codex 目录暂不可用，已显示 Grok 任务" };
           }
+          if (cursor || !this.desktop || error instanceof RpcError) throw error;
+          const result = await this.desktop.listThreadsNormalized(Math.min(limit, 50), search)
+            .catch((desktopError) => { throw desktopOperationError("无法读取任务列表", desktopError); });
+          const data = [] as any[];
+          for (const thread of result?.data || []) {
+            try { data.push(this.describeThread({ ...thread, cwd: assertAllowedCwd(thread.cwd, this.config.projectRoots) })); }
+            catch (pathError) { if (!(pathError instanceof RpcError) || pathError.nameCode !== ErrorName.PATH_DENIED) throw pathError; }
+          }
+          return mergeGrok({ ...result, data, nextCursor: null, warning: "本机任务目录暂不可用，已通过 Desktop 读取" });
         }
-        return this.codex.request("thread/list", {
-          cursor, searchTerm: search, limit,
-          sortKey: "updated_at", sortDirection: "desc", useStateDbOnly: true, archived: false,
-        });
       }
       case "thread/read": return this.readThread(params);
+      case "thread/handoff": return this.handoffThread(params);
       case "thread/start": return this.startThread(params, session.device?.id);
       case "turn/start": return this.startTurn(params, session.device?.id);
       case "turn/steer": return this.steerTurn(params, session.device?.id);
@@ -414,7 +483,7 @@ export class BridgeServer {
         readOnly: this.codex.readOnly,
         error: this.codex.compatibilityError,
         latestSeq: this.store.latestSeq(),
-        capabilities: BRIDGE_CAPABILITIES,
+        capabilities: this.capabilities(),
       };
     }
     const virtual = { device: { id: deviceId }, hello: true } as Session;
@@ -426,7 +495,61 @@ export class BridgeServer {
     return () => this.relayEventListeners.delete(listener);
   }
 
+  capabilities() {
+    return [...BRIDGE_CAPABILITIES, ...(this.grok ? ["agents-v1"] : []), ...(this.grok?.native ? ["grok-native-v1", "grok-shared-v1"] : []), ...(this.codex.releaseThread && this.desktop ? ["handoff-v1"] : [])];
+  }
+
+  async listAgents() {
+    const [codex, grok] = await Promise.allSettled([
+      listEffectiveModels(this.codex, { limit: 100, includeHidden: false }),
+      this.grok?.probe() ?? { id: "grok", available: false, error: "Host 尚未接入 Grok", models: [] },
+    ]);
+    return { data: [
+      { id: "codex", name: "Codex", available: !this.codex.readOnly,
+        error: codex.status === "rejected" ? "Codex 模型目录读取失败" : codex.value.warning,
+        models: codex.status === "fulfilled" ? codex.value.data.map((m: any) => ({ ...m, agentId: "codex" })) : [] },
+      grok.status === "fulfilled" ? grok.value : { id: "grok", available: false, error: "Grok CLI 暂不可用", models: [] },
+    ] };
+  }
+
+  assertGrokInput(params: any) {
+    if (params.mode || params.goal || params.images?.length || params.files?.length || (params.target && params.target !== "bridge")) {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "Grok 当前支持文本、工具执行、单次审批和中断；不支持附件、Plan/Goal 或 Codex Desktop 交接");
+    }
+  }
+
+  async handoffThread(params: any) {
+    const threadId = stringParam(params.threadId, "threadId", 100)!;
+    const owner = this.store.threadOwner(threadId);
+    if (owner === "desktop") return { threadId, source: "desktop", released: true, alreadyReleased: true };
+    if (owner !== "bridge") throw new RpcError(ErrorName.NOT_FOUND, "该任务不是当前 Host 管理的任务");
+    if (!this.codex.releaseThread) throw new RpcError(ErrorName.VERSION_UNSUPPORTED, "请先更新 Host，以支持任务交接");
+    if (!this.desktop) throw new RpcError(ErrorName.NOT_FOUND, "请先连接 Codex Desktop");
+    // Check visibility before touching the writer. readThreadNormalized is read-only;
+    // readDesktopThread cannot be used here because it claims the stored route.
+    let visible: any;
+    try { visible = await this.desktop.readThreadNormalized(threadId, 1); }
+    catch (error) { throw desktopOperationError("Desktop 尚不能读取这个任务", error); }
+    if (visible?.thread?.id !== threadId) throw new RpcError(ErrorName.NOT_FOUND, "Desktop 尚未发现这个任务，请稍后重试");
+    assertAllowedCwd(visible.thread.cwd, this.config.projectRoots);
+    this.flushMessageDeltas();
+    const released = await this.codex.releaseThread(threadId);
+    if (!released.released) throw new RpcError(ErrorName.THREAD_BUSY, "执行器尚未释放，请稍后重试");
+    this.store.setThreadOwner(threadId, "desktop");
+    this.publish(newEvent("sync.required", { threadId, reason: "desktop-handoff", source: "desktop" }));
+    return { threadId, source: "desktop", ...released };
+  }
+
   async startThread(params: any, deviceId = "unknown-device") {
+    const agentId = stringParam(params.agentId, "agentId", 32, false) || "codex";
+    if (agentId !== "codex" && agentId !== "grok") throw new RpcError(ErrorName.INVALID_REQUEST, "不支持这个 Agent");
+    if (agentId === "grok") {
+      if (!this.grok) throw new RpcError(ErrorName.NOT_FOUND, "请先更新 Host 以支持 Grok");
+      this.assertGrokInput(params);
+      return this.grok.create({ cwd: assertAllowedCwd(params.cwd, this.config.projectRoots), text: stringParam(params.text, "text", 64 * 1024)!,
+        model: stringParam(params.model, "model", 200, false), effort: stringParam(params.effort, "effort", 32, false),
+        clientMessageId: stringParam(params.clientMessageId, "clientMessageId", 128, false) }, deviceId);
+    }
     const target = stringParam(params.target, "target", 32, false)?.trim() || "bridge";
     if (target !== "desktop" && target !== "bridge") {
       throw new RpcError(ErrorName.INVALID_REQUEST, "target 仅支持 desktop 或 bridge");
@@ -459,13 +582,13 @@ export class BridgeServer {
         return {
           ...created,
           source: "desktop",
-          thread: {
+          thread: this.describeThread({
             ...created.thread,
             id: threadId,
             cwd,
             source: "desktop",
             capabilities: { send: true, interrupt: false, approval: false, question: false },
-          },
+          }),
         };
       } catch (error) {
         throw desktopOperationError("无法通过 Codex Desktop 新建任务", error);
@@ -481,23 +604,29 @@ export class BridgeServer {
       cwd, model, approvalPolicy: "on-request",
     });
     const threadId = started.thread.id;
-    this.store.setThreadOwner(threadId, "bridge");
-    let goalWarning: string | undefined;
-    if (goal) {
-      try {
-        await this.codex.request("thread/goal/set", { threadId, objective: goal });
-      } catch (error) {
-        goalWarning = `任务已创建，但 Goal 保存失败：${error instanceof Error ? error.message : String(error)}`;
+    const unpin = this.codex.pinThread?.(threadId);
+    try {
+      this.store.setThreadOwner(threadId, "bridge");
+      let goalWarning: string | undefined;
+      if (goal) {
+        try {
+          await this.codex.request("thread/goal/set", { threadId, objective: goal });
+        } catch (error) {
+          goalWarning = `任务已创建，但 Goal 保存失败：${error instanceof Error ? error.message : String(error)}`;
+          if (this.codex.isThreadUncertain?.(threadId) || /timeout|timed out/i.test(String(error))) {
+            return { thread: this.describeThread(started.thread), warning: "任务已创建，但目标操作结果尚不确定。请先查看任务状态，确认后再继续。" };
+          }
+        }
       }
-    }
-    const attachmentInput = this.materializeAttachments(deviceId, images, files);
-    const turn = await this.codex.request("turn/start", {
-      threadId, input: [{ type: "text", text }, ...attachmentInput], model, effort,
-      ...(mode === "plan" ? { collaborationMode: planCollaborationMode(model!, effort) } : {}),
-    });
-    this.codex.markTurn(threadId, turn.turn.id);
-    this.writeRuntimeStatus();
-    return { thread: started.thread, turn: turn.turn, ...(goalWarning ? { warning: goalWarning } : {}) };
+      const attachmentInput = this.materializeAttachments(deviceId, images, files);
+      const turn = await this.codex.request("turn/start", {
+        threadId, input: [{ type: "text", text }, ...attachmentInput], model, effort,
+        ...(mode === "plan" ? { collaborationMode: planCollaborationMode(model!, effort) } : {}),
+      });
+      this.codex.markTurn(threadId, turn.turn.id);
+      this.writeRuntimeStatus();
+      return { thread: this.describeThread(started.thread), turn: turn.turn, ...(goalWarning ? { warning: goalWarning } : {}) };
+    } finally { unpin?.(); }
   }
 
   async hostRuntime() {
@@ -511,6 +640,7 @@ export class BridgeServer {
     const processRunning = process.platform === "win32" ? await this.isDesktopProcessRunning() : false;
     return {
       platform: process.platform,
+      bridge: { state: this.codex.readOnly ? "unavailable" : "ready", readOnly: this.codex.readOnly, version: this.codex.version },
       desktop: {
         state: attachReady ? "ready" : processRunning ? "starting" : "closed",
         attachReady,
@@ -567,9 +697,13 @@ export class BridgeServer {
     this.codex.assertWritable();
     await this.codex.assertThreadControllable(threadId);
     const resumed = await this.codex.request("thread/resume", { threadId });
+    // App-server returns effective settings on ThreadResumeResponse itself.
+    // Preserve the existing nested fallback, preferring the resolved values.
     const model = stringParam(params.model, "model", 200, false)?.trim()
+      || (typeof resumed?.model === "string" ? resumed.model : undefined)
       || (typeof resumed?.thread?.model === "string" ? resumed.thread.model : undefined);
     const effort = stringParam(params.effort, "effort", 32, false)?.trim()
+      || (typeof resumed?.reasoningEffort === "string" ? resumed.reasoningEffort : undefined)
       || (typeof resumed?.thread?.reasoningEffort === "string" ? resumed.thread.reasoningEffort : undefined);
     if (mode === "plan" && !model) throw new RpcError(ErrorName.INVALID_REQUEST, "该任务缺少模型信息，无法进入 Plan 模式");
     const attachmentInput = this.materializeAttachments(deviceId, images, files);
@@ -757,41 +891,39 @@ export class BridgeServer {
     return result;
   }
 
-  rememberDesktopThreads(result: any) {
-    for (const thread of Array.isArray(result?.data) ? result.data : []) {
-      if (typeof thread?.id !== "string" || !thread.id) continue;
-      this.store.claimThreadOwner(thread.id, "desktop");
-    }
-  }
-
-  applyStoredThreadOwners(result: any) {
-    if (!Array.isArray(result?.data)) return result;
+  describeThread(thread: any) {
+    const owner = this.store.threadOwner(thread.id) || null;
+    const backend = owner || "desktop";
+    const bridge = backend === "bridge";
+    const writable = bridge ? !this.codex.readOnly && !this.codex.isThreadUncertain?.(thread.id) : !!this.desktop;
+    const capabilities = { send: writable, interrupt: bridge, approval: bridge, question: bridge,
+      plan: bridge && writable, goal: bridge && writable, handoff: bridge && !!this.codex.releaseThread && !!this.desktop };
     return {
-      ...result,
-      data: result.data.map((thread: any) => {
-        if (typeof thread?.id !== "string" || this.store.threadOwner(thread.id) !== "bridge") return thread;
-        return {
-          ...thread,
-          source: "bridge",
-          capabilities: { send: true, interrupt: true, approval: true, question: true },
-        };
-      }),
+      ...thread,
+      ...(this.codex.activeTurns.has(thread.id) ? { status: { type: "active" } } : {}),
+      source: backend, capabilities, execution: { backend, owner, capabilities },
     };
   }
 
   async readThread(params: any) {
     const threadId = stringParam(params.threadId, "threadId", 100)!;
-    if (this.store.threadOwner(threadId) === "bridge") {
-      return this.codex.request("thread/read", { threadId, includeTurns: true });
-    }
     const cursor = stringParam(params.cursor, "cursor", 4096, false);
     if (cursor !== undefined && !cursor.trim()) {
       throw new RpcError(ErrorName.INVALID_REQUEST, "cursor 格式或长度无效");
     }
-    return this.readDesktopThread(threadId, 10, cursor);
+    const bridgeOwned = this.store.threadOwner(threadId) === "bridge";
+    if (cursor && !isCatalogCursor(cursor)) {
+      if (bridgeOwned) throw new RpcError(ErrorName.INVALID_REQUEST, "历史游标与执行后端不匹配，请刷新任务");
+      return this.readDesktopThread(threadId, 10, cursor, false);
+    }
+    try { return await this.catalog.read(threadId, cursor); }
+    catch (error) {
+      if (bridgeOwned || cursor || !this.desktop || error instanceof RpcError) throw error;
+      return this.readDesktopThread(threadId, 10, undefined, false);
+    }
   }
 
-  async readDesktopThread(threadId: string, turnLimit = 10, cursor?: string) {
+  async readDesktopThread(threadId: string, turnLimit = 10, cursor?: string, claimOwner = true) {
     if (!this.desktop) throw new RpcError(ErrorName.NOT_FOUND, "Desktop Attach 插件未连接");
     let result: any;
     try {
@@ -799,12 +931,12 @@ export class BridgeServer {
     } catch (error) {
       throw desktopOperationError("无法通过 Codex Desktop 读取任务", error);
     }
-    if (!result?.thread || typeof result.thread !== "object") {
+    if (!result?.thread || result.thread.id !== threadId) {
       throw new RpcError("INTERNAL", "Codex Desktop 返回的任务详情不完整");
     }
     const cwd = assertAllowedCwd(result.thread.cwd, this.config.projectRoots);
-    const owner = this.store.claimThreadOwner(threadId, "desktop");
-    if (owner !== "desktop") {
+    const owner = claimOwner ? this.store.claimThreadOwner(threadId, "desktop") : this.store.threadOwner(threadId);
+    if (owner === "bridge") {
       throw new RpcError(ErrorName.NOT_FOUND, "该任务由 Bridge app-server 管理，不能通过 Desktop Attach 接管");
     }
     const turns = Array.isArray(result.thread.turns) ? result.thread.turns : [];
@@ -824,13 +956,13 @@ export class BridgeServer {
         : [...turns, overlayTurn];
     return {
       ...result,
-      thread: {
+      thread: this.describeThread({
         ...result.thread,
         cwd,
         turns: mergedTurns,
         source: "desktop",
         capabilities: { send: true, interrupt: false, approval: false, question: false },
-      },
+      }),
     };
   }
 
@@ -951,8 +1083,15 @@ export class BridgeServer {
           );
         }
         const eventKey = this.desktopWaitEventKey(result);
+        // Text already arrives through message.delta. Correct history only at
+        // lifecycle transitions; elapsed time alone is not evidence of a gap.
         if (eventKey !== watcher.lastPublishedKey) {
           watcher.lastPublishedKey = eventKey;
+          watcher.lastCorrectionAt = Date.now();
+          this.publish(newEvent("turn.status", {
+            threadId, turnId: result.turnId, source: "desktop",
+            status: terminal ? result.turnStatus || "completed" : result.turnStatus === "inProgress" || result.threadStatus === "active" ? "started" : result.threadStatus,
+          }));
           this.publish(newEvent("sync.required", {
             threadId,
             turnId: result.turnId,
@@ -990,7 +1129,7 @@ export class BridgeServer {
   }
 
   desktopWaitEventKey(result: DesktopWaitSummary) {
-    return result.cursor || [result.threadStatus, result.turnId, result.turnStatus, result.wakeReason].join(":");
+    return [result.threadStatus, result.turnId, result.turnStatus, result.wakeReason].join(":");
   }
 
   desktopWaitIsTerminal(result: DesktopWaitSummary) {
@@ -1041,6 +1180,7 @@ export class BridgeServer {
   }
 
   async onCodexRequest(message: any) {
+    this.flushMessageDeltas();
     const method = String(message.method);
     const isQuestion = method === "item/tool/requestUserInput";
     const isApproval = method.endsWith("/requestApproval");
@@ -1055,9 +1195,10 @@ export class BridgeServer {
 
   onCodexNotification(message: any) {
     const p = message.params || {};
+    if (!["item/agentMessage/delta", "item/plan/delta", "thread/tokenUsage/updated", "account/rateLimits/updated"].includes(message.method)) this.flushMessageDeltas();
     switch (message.method) {
       case "item/agentMessage/delta":
-        this.publish(newEvent("message.delta", { ...p })); break;
+        this.queueMessageDelta(p); break;
       case "item/started":
       case "item/completed":
         if (p.item?.type === "commandExecution") {
@@ -1072,7 +1213,7 @@ export class BridgeServer {
       case "item/plan/delta":
         // Plan 文档是流式 markdown 文本，不是结构化步骤；按助手消息增量下发，
         // 与 thread/read 里同 itemId 的 plan item 自然对齐。
-        this.publish(newEvent("message.delta", { ...p, role: "assistant" })); break;
+        this.queueMessageDelta({ ...p, role: "assistant" }); break;
       case "item/commandExecution/outputDelta": {
         const key = `${p.threadId || ""}:${p.turnId || ""}:${p.itemId || ""}`;
         const used = this.commandOutputBytes.get(key) || 0;
@@ -1097,8 +1238,9 @@ export class BridgeServer {
         this.publish(newEvent("turn.status", { ...p, turnId: p.turn?.id, status: "started" })); break;
       case "turn/completed":
         if (p.threadId) this.codex.clearTurn(p.threadId, p.turn?.id);
+        for (const key of this.seenMessageItems) if (key.startsWith(`${p.threadId}:`)) this.seenMessageItems.delete(key);
         this.writeRuntimeStatus();
-        this.publish(newEvent("turn.status", { ...p, turnId: p.turn?.id, status: "completed" })); break;
+        this.publish(newEvent("turn.status", { ...p, turnId: p.turn?.id, status: p.turn?.status || "completed" })); break;
       case "thread/status/changed":
         this.publish(newEvent("turn.status", { ...p })); break;
       case "thread/archived":
@@ -1108,6 +1250,31 @@ export class BridgeServer {
           change: message.method === "thread/archived" ? "archived" : "unarchived",
         })); break;
     }
+  }
+
+  queueMessageDelta(params: any) {
+    const key = `${params.threadId}:${params.turnId}:${params.itemId}`;
+    if (!this.seenMessageItems.has(key)) {
+      this.flushMessageDeltas();
+      this.seenMessageItems.add(key);
+      this.publish(newEvent("message.delta", { ...params }));
+      return;
+    }
+    const previous = this.messageDeltas.get(key);
+    const delta = (previous?.delta || "") + (typeof params.delta === "string" ? params.delta : "");
+    this.messageDeltas.set(key, { ...params, delta });
+    if (delta.length >= 8_192) { this.flushMessageDeltas(); return; }
+    // Keep the first token immediate, then batch small deltas before SQLite,
+    // encryption and Relay acknowledgements. Never coalesce persisted events.
+    this.messageDeltaTimer ??= setTimeout(() => this.flushMessageDeltas(), 100);
+  }
+
+  flushMessageDeltas() {
+    if (this.messageDeltaTimer) clearTimeout(this.messageDeltaTimer);
+    this.messageDeltaTimer = undefined;
+    const pending = [...this.messageDeltas.values()];
+    this.messageDeltas.clear();
+    for (const params of pending) this.publish(newEvent("message.delta", params));
   }
 
   publish(event: BridgeEvent) {
@@ -1131,6 +1298,8 @@ export class BridgeServer {
   }
 
   async stop() {
+    await this.grok?.stop();
+    this.flushMessageDeltas();
     if (this.runtimeStatusTimer) {
       clearInterval(this.runtimeStatusTimer);
       this.runtimeStatusTimer = undefined;
@@ -1164,6 +1333,7 @@ export class BridgeServer {
       running,
       activeTaskCount: new Set([
         ...this.codex.activeTurns.keys(),
+        ...(this.grok?.active.keys() || []),
         ...this.desktopWatchers.keys(),
       ]).size + this.inFlightMutations,
       maintenance: Boolean(maintenance),

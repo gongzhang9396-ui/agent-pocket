@@ -73,18 +73,23 @@ import com.agentpocket.app.ui.theme.AgentPocketTheme
 fun NewTaskScreen(
     repo: PocketRepository,
     onBack: () -> Unit,
-    onCreated: (threadId: String) -> Unit,
+    onCreated: (threadId: String, agentId: String) -> Unit,
+    initialAgentId: String = "codex",
 ) {
     val hosts by repo.hosts.collectAsState()
     val selectedHostId by repo.selectedHostId.collectAsState()
     val projects by repo.projects.collectAsState()
     val projectsLoading by repo.projectsLoading.collectAsState()
     val projectsError by repo.projectsError.collectAsState()
-    val models by repo.models.collectAsState()
+    val allModels by repo.models.collectAsState()
+    val agents by repo.agents.collectAsState()
+    val modelsLoading by repo.modelsLoading.collectAsState()
+    val modelsError by repo.modelsError.collectAsState()
     val actionError by repo.actionError.collectAsState()
     val creating by repo.creatingTask.collectAsState()
     var hostMenuExpanded by remember { mutableStateOf(false) }
-    var agentId by rememberSaveable { mutableStateOf(AgentRegistry.codex.kind.id) }
+    var agentId by rememberSaveable(initialAgentId) { mutableStateOf(initialAgentId) }
+    val models = allModels.filter { it.agentId == agentId }
     var projectId by rememberSaveable { mutableStateOf("") }
     var projectMenuExpanded by remember { mutableStateOf(false) }
     var modelId by rememberSaveable { mutableStateOf("") }
@@ -123,28 +128,36 @@ fun NewTaskScreen(
     val selectedHost = hosts.firstOrNull { it.id == selectedHostId }
     val selectedProject = projects.firstOrNull { it.id == projectId }
     val selectedAgent = AgentRegistry.all.firstOrNull { it.kind.id == agentId } ?: AgentRegistry.codex
-    val attachmentsSupported = repo.hostSupports("attachments-v1", selectedHostId)
-    val planSupported = target == "bridge" && repo.hostSupports("plan-v1", selectedHostId)
-    val goalSupported = target == "bridge" && repo.hostSupports("goal-v1", selectedHostId)
+    val agentState = agents.firstOrNull { it.id == agentId }
+    val agentAvailable = agentState?.available ?: (agentId == "codex")
+    val attachmentsSupported = agentId == "codex" && repo.hostSupports("attachments-v1", selectedHostId)
+    val planSupported = agentId == "codex" && target == "bridge" && repo.hostSupports("plan-v1", selectedHostId)
+    val goalSupported = agentId == "codex" && target == "bridge" && repo.hostSupports("goal-v1", selectedHostId)
+    LaunchedEffect(agentId) {
+        reasoningId = ""
+        if (agentId != "codex") { target = "bridge"; planMode = false; imageAttachments = emptyList(); fileAttachments = emptyList() }
+    }
     // 推理选项跟随所选模型动态变化；切换模型后回落到该模型的第一个档位。
     val reasoning = model?.reasoningOptions?.firstOrNull { it.id == reasoningId }
         ?: model?.reasoningOptions?.firstOrNull()
-    val canCreate = !creating && selectedAgent.available && selectedHost?.connectionState == ConnectionState.Connected &&
-        prompt.isNotBlank() && projectId.isNotBlank() && modelId.isNotBlank() && reasoning != null
+    val canCreate = !creating && selectedAgent.available && agentAvailable && selectedHost?.connectionState == ConnectionState.Connected &&
+        prompt.isNotBlank() && projectId.isNotBlank() && modelId.isNotBlank()
     val submit = {
         if (canCreate) {
             focusManager.clearFocus()
+            val createdAgentId = agentId
             repo.createTask(
                 projectId,
                 modelId,
                 reasoning?.id.orEmpty(),
                 prompt,
                 target,
-                planMode && target == "bridge",
-                goalDraft.trim().takeIf { target == "bridge" && it.isNotBlank() },
+                planMode && planSupported,
+                goalDraft.trim().takeIf { goalSupported && it.isNotBlank() },
                 imageAttachments,
                 fileAttachments,
-                onCreated,
+                { threadId -> onCreated(threadId, createdAgentId) },
+                agentId = createdAgentId,
             )
         }
     }
@@ -281,37 +294,40 @@ fun NewTaskScreen(
             }
             Spacer(Modifier.height(4.dp))
             Text(
-                selectedAgent.capabilities,
+                agentState?.error ?: if (agentId == "grok" && agentState == null) "需要支持 Grok 的 Host；更新后刷新检查电脑上的安装和登录状态。" else selectedAgent.capabilities,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             Spacer(Modifier.height(16.dp))
-            SectionLabel("运行方式")
+            SectionLabel(if (agentId == "grok") "Grok CLI" else "运行方式")
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(
                     selected = target == "bridge",
                     onClick = { target = "bridge" },
-                    label = { Text("Bridge · 手机完整控制") },
+                    label = { Text(if (agentId == "grok") "电脑上的 Grok CLI" else "Bridge · 手机完整控制") },
                 )
                 FilterChip(
                     selected = target == "desktop",
                     onClick = { target = "desktop" },
+                    enabled = agentId == "codex",
                     label = { Text("Codex Desktop") },
                 )
             }
             Spacer(Modifier.height(4.dp))
             Text(
-                if (target == "bridge") {
-                    "由这台电脑的 codex app-server 执行，兼容第三方模型通道；支持从手机审批、回答提问和中断。任务同样出现在 Codex Desktop 列表中，可在电脑上查看，但请不要在电脑端续写它。"
+                if (agentId == "grok") {
+                    "复用这台电脑的 Grok 登录。手机新建的任务由 Host 管理，支持重连后继续；暂不接管其他终端的会话。"
+                } else if (target == "bridge") {
+                    "使用电脑上配置的模型，支持 API 接入和手机审批。任务空闲时，可通过“在电脑继续”交接给 Codex Desktop。"
                 } else {
                     "创建真实 Codex Desktop 任务，可在电脑上继续操作。图片和文件会先经端到端加密传到 Host，再以本机临时路径交给 Desktop。注意：第三方 HTTP 模型通道（如 cc-switch 中转）暂不支持新建，需要官方 WebSocket v2 通道。"
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (target == "bridge") {
+            if (target == "bridge" && agentId == "codex") {
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
@@ -384,7 +400,7 @@ fun NewTaskScreen(
                 if (attachmentsSupported) {
                     "每次最多 3 个附件；图片会压缩，文件限 512 KiB。内容端到端加密传给 Host，Relay 不保存明文。"
                 } else {
-                    "附件需要 Windows Host v0.3 或更高版本；请先覆盖更新 Host。"
+                    if (agentId == "grok") "当前 Grok 接入只支持文本；文件可以通过项目目录中的工具操作。" else "附件需要 Windows Host v0.3 或更高版本；请先覆盖更新 Host。"
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -400,12 +416,12 @@ fun NewTaskScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        Text("正在读取 Codex Desktop 项目…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("正在读取电脑上的项目…", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
                 projects.isEmpty() -> {
                     Text(
-                        projectsError ?: "Codex Desktop 中没有可用的本地项目。请先在电脑端保存项目，然后重新加载。",
+                        projectsError ?: "没有可用的工作目录。请在 Host 配置中添加项目路径，然后重新加载。",
                         style = MaterialTheme.typography.bodySmall,
                         color = if (projectsError == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
                     )
@@ -494,7 +510,7 @@ fun NewTaskScreen(
             }
             Spacer(Modifier.height(4.dp))
             Text(
-                model?.description ?: "正在从 Codex 读取可用模型…",
+                modelsError ?: model?.description ?: if (modelsLoading) "正在读取模型…" else "未读到模型，请检查电脑上的 Codex 模型配置后重试。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -516,7 +532,7 @@ fun NewTaskScreen(
             }
             Spacer(Modifier.height(4.dp))
             Text(
-                reasoning?.description ?: "",
+                reasoning?.description ?: "使用模型的默认设置",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -543,6 +559,6 @@ fun NewTaskScreen(
 @Composable
 private fun NewTaskScreenPreview() {
     AgentPocketTheme {
-        NewTaskScreen(repo = MockPocketRepository, onBack = {}, onCreated = {})
+        NewTaskScreen(repo = MockPocketRepository, onBack = {}, onCreated = { _, _ -> })
     }
 }

@@ -3,7 +3,8 @@
     [Parameter(Mandatory = $true)][string]$RelayUrl,
     [Parameter(Mandatory = $true)][string]$ProjectRoots,
     [string]$AttachmentsPath = "$env:LOCALAPPDATA\AgentPocket\attachments",
-    [string]$HostName = $env:COMPUTERNAME
+    [string]$HostName = $env:COMPUTERNAME,
+    [switch]$SkipDesktopAttach
 )
 $ErrorActionPreference = 'Stop'
 $uri = [Uri]$RelayUrl
@@ -20,8 +21,9 @@ if ([string]::IsNullOrWhiteSpace($AttachmentsPath) -or -not [IO.Path]::IsPathRoo
     throw '附件临时目录必须是绝对路径。'
 }
 $attachmentsPath = [IO.Path]::GetFullPath($AttachmentsPath)
-$codex = Get-Command codex -ErrorAction SilentlyContinue
-if (-not $codex) { throw '没有找到 Codex CLI。请先安装并登录 Codex Desktop。' }
+. (Join-Path $PSScriptRoot 'resolve-codex.ps1')
+try { $codexCommand = Resolve-CodexCommand }
+catch { $codexCommand = 'codex'; Write-Warning 'Codex CLI 尚未安装；Host 仍可使用已登录的 Grok CLI。' }
 $stateDir = Join-Path $env:LOCALAPPDATA 'AgentPocket'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 New-Item -ItemType Directory -Force -Path $attachmentsPath | Out-Null
@@ -30,12 +32,12 @@ New-Item -ItemType Directory -Force -Path $attachmentsPath | Out-Null
     projectRoots = $roots
     attachmentsPath = $attachmentsPath
     hostName = $HostName
-    codexCommand = $codex.Source
+    codexCommand = $codexCommand
+    desktopIntegrationEnabled = -not $SkipDesktopAttach
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stateDir 'host-config.json') -Encoding UTF8
 
-& (Join-Path $InstallDir 'scripts\install-desktop-plugin.ps1') -InstallDir $InstallDir
+& (Join-Path $InstallDir 'scripts\update-desktop-integration.ps1') -InstallDir $InstallDir
 
 & (Join-Path $InstallDir 'scripts\register-host-tasks.ps1') -InstallDir $InstallDir
-if ($LASTEXITCODE -ne 0) { throw '注册 Agent Pocket Host 计划任务失败。' }
 . (Join-Path $InstallDir 'scripts\task-names.ps1')
 Start-ScheduledTask -TaskName $AgentPocketHostTaskName

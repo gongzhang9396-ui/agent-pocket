@@ -109,7 +109,7 @@ fun MonoBlock(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF0A0D11))
+            .background(Color(0xFFF4F1E8))
             .horizontalScroll(rememberScrollState())
             .padding(10.dp),
     ) {

@@ -1,5 +1,6 @@
 package com.agentpocket.app.ui.components
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -7,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.PowerSettingsNew
@@ -40,6 +42,8 @@ fun HostRuntimeCard(
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -59,14 +63,19 @@ fun HostRuntimeCard(
                     )
                 }
                 IconButton(onClick = onRefresh, enabled = hostOnline) {
-                    Icon(Icons.Filled.Refresh, contentDescription = "刷新 Desktop 状态")
+                    Icon(Icons.Filled.Refresh, contentDescription = "刷新电脑状态")
                 }
+            }
+            if (hostOnline) when (runtime?.bridgeReady) {
+                true -> RuntimeText("Codex 执行连接已就绪，可使用本机配置的模型。", StatusColors.running)
+                false -> RuntimeText("Codex 执行连接暂不可用；其他 Agent 的状态请在新建任务中查看。", StatusColors.attention)
+                null -> Unit
             }
             when (state) {
                 DesktopRuntimeState.Ready -> RuntimeText("Codex Desktop 已连接，可创建和续写 Desktop 任务。", StatusColors.running)
                 DesktopRuntimeState.Starting -> RuntimeText("Codex Desktop 正在启动，Attach 加载后会自动变为可用。", StatusColors.attention)
                 DesktopRuntimeState.Closed -> {
-                    RuntimeText("Codex Desktop 未运行；Bridge 任务仍可直接创建。", MaterialTheme.colorScheme.onSurfaceVariant)
+                    RuntimeText("Codex Desktop 未运行。", MaterialTheme.colorScheme.onSurfaceVariant)
                     if (runtime?.canWake == true) {
                         OutlinedButton(onClick = onLaunch, modifier = Modifier.fillMaxWidth()) {
                             Icon(Icons.Filled.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(16.dp))

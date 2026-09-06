@@ -1,33 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 $installDir = Split-Path -Parent $PSScriptRoot
 
-function Resolve-CodexCommand([string]$ConfiguredCommand) {
-    if ($ConfiguredCommand -and (Test-Path -LiteralPath $ConfiguredCommand -PathType Leaf)) {
-        return (Resolve-Path -LiteralPath $ConfiguredCommand).Path
-    }
-
-    # Codex Desktop installs the CLI below a version/hash directory. A Desktop
-    # update replaces that directory, so the path saved during Host setup is a
-    # hint rather than a permanent executable location.
-    $fromPath = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($fromPath) {
-        $path = [string]$fromPath.Source
-        if (-not $path) { $path = [string]$fromPath.Path }
-        if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) {
-            return (Resolve-Path -LiteralPath $path).Path
-        }
-    }
-
-    $codexBin = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin'
-    if (Test-Path -LiteralPath $codexBin -PathType Container) {
-        $candidate = Get-ChildItem -LiteralPath $codexBin -File -Filter 'codex.exe' -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTimeUtc -Descending |
-            Select-Object -First 1
-        if ($candidate) { return $candidate.FullName }
-    }
-
-    throw '找不到可用的 Codex CLI。请先启动或更新 Codex Desktop，再重新运行 Agent Pocket Host。'
-}
+. (Join-Path $PSScriptRoot 'resolve-codex.ps1')
 
 $configPath = Join-Path $env:LOCALAPPDATA 'AgentPocket\host-config.json'
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
@@ -44,7 +18,9 @@ if ([string]::IsNullOrWhiteSpace($attachmentsPath)) {
 if (-not [IO.Path]::IsPathRooted($attachmentsPath)) { throw '附件临时目录必须是绝对路径。' }
 $attachmentsPath = [IO.Path]::GetFullPath($attachmentsPath)
 New-Item -ItemType Directory -Force -Path $attachmentsPath | Out-Null
-$codexCommand = Resolve-CodexCommand ([string]$config.codexCommand)
+try { $codexCommand = Resolve-CodexCommand ([string]$config.codexCommand) }
+catch { $codexCommand = 'codex'; Write-Warning 'Codex CLI 尚未就绪；Host 将继续提供其他 Agent。' }
+if (-not [string]::IsNullOrWhiteSpace([string]$config.grokCommand)) { $env:AGENT_POCKET_GROK = [string]$config.grokCommand }
 $env:AGENT_POCKET_PORT = '0'
 $env:AGENT_POCKET_DB = Join-Path $stateDir 'bridge-v2.db'
 $env:AGENT_POCKET_ATTACHMENTS_DIR = $attachmentsPath

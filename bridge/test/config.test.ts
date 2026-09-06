@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertAllowedCwd, loadConfig } from "../src/config.ts";
+import { assertAllowedCwd, listProjects, loadConfig } from "../src/config.ts";
 import { RpcError } from "../src/protocol.ts";
 
 test("project roots must be configured explicitly", () => {
@@ -68,4 +68,16 @@ test("cwd must stay inside a canonical project root", () => {
 test("cwd must be absolute and exist", () => {
   assert.throws(() => assertAllowedCwd("relative", [tmpdir()]));
   assert.throws(() => assertAllowedCwd(join(tmpdir(), "definitely-missing-agent-pocket"), [tmpdir()]));
+});
+
+test("project discovery includes ordinary roots and nested repos without traversing links", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agent-pocket-project-scan-"));
+  const root = join(base, "allowed");
+  const nested = join(root, "repo");
+  const outside = join(base, "outside");
+  mkdirSync(join(nested, ".git"), { recursive: true });
+  mkdirSync(join(outside, ".git"), { recursive: true });
+  symlinkSync(outside, join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
+  const projects = await listProjects([root]);
+  assert.deepEqual(new Set(projects.map((project) => project.cwd)), new Set([root, nested]));
 });

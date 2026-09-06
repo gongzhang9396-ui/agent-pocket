@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -29,6 +30,8 @@ import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -38,7 +41,9 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
-import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -59,9 +64,14 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -70,8 +80,6 @@ import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.data.model.TimelineItem
-import com.agentpocket.app.ui.components.AgentBadge
-import com.agentpocket.app.ui.components.AgentRegistry
 import com.agentpocket.app.ui.components.PendingAttachmentStrip
 import com.agentpocket.app.ui.components.PendingFileList
 import com.agentpocket.app.ui.components.ThreadStatusChip
@@ -82,6 +90,8 @@ import com.agentpocket.app.ui.theme.AgentPocketTheme
 import com.agentpocket.app.ui.theme.StatusColors
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+
+private data class HistoryScrollAnchor(val key: Any, val offset: Int, val firstItemId: String?)
 
 /**
  * 会话详情：流式消息、计划、命令/测试卡、提问卡、审批卡（允许一次/拒绝/取消）、
@@ -100,30 +110,39 @@ fun SessionDetailScreen(
     val actionError by repo.actionError.collectAsState()
     val refreshingThreads by repo.refreshingThreads.collectAsState()
     val threadHostId = remember(threadId) { runCatching { ThreadRef.parse(threadId).hostId }.getOrNull() }
-    val attachmentsSupported = repo.hostSupports("attachments-v1", threadHostId)
+    val attachmentsSupported = detail.execution.attachments && repo.hostSupports("attachments-v1", threadHostId)
     val planSupported = repo.hostSupports("plan-v1", threadHostId)
     val goalSupported = repo.hostSupports("goal-v1", threadHostId)
+    val handoffSupported = repo.hostSupports("handoff-v1", threadHostId)
     val refreshing = threadId in refreshingThreads
     var goalDialogOpen by remember { mutableStateOf(false) }
     var goalCurrent by remember { mutableStateOf<String?>(null) }
     var goalDraft by remember { mutableStateOf("") }
     var goalLoading by remember { mutableStateOf(false) }
+    var menuOpen by remember { mutableStateOf(false) }
+    var handoffDialogOpen by remember { mutableStateOf(false) }
+    var handingOff by remember(threadId) { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
-    var initialScrollDone by rememberSaveable(threadId) { mutableStateOf(false) }
     var followTail by rememberSaveable(threadId) { mutableStateOf(true) }
-    var forceScrollRequest by rememberSaveable(threadId) { mutableStateOf(0) }
-    val desktopOwned = detail.status == ThreadStatus.DesktopOwned
-    val readOnly = detail.status == ThreadStatus.ExternalBusy
-    val running = detail.activeTurnId != null
-    val tailVersion = when (val tail = detail.items.lastOrNull()) {
-        is TimelineItem.Message -> "${tail.id}:${tail.text.length}:${tail.status}"
-        is TimelineItem.Command -> "${tail.id}:${tail.output.length}:${tail.status}"
-        is TimelineItem.Plan -> "${tail.id}:${tail.steps.hashCode()}:${tail.status}"
-        is TimelineItem.Question -> "${tail.id}:${tail.selectedOption}"
-        is TimelineItem.Approval -> "${tail.id}:${tail.decision}"
-        null -> ""
+    var historyAnchor by remember(threadId) { mutableStateOf<HistoryScrollAnchor?>(null) }
+    val tailScrollConnection = remember(threadId) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && available.y != 0f) {
+                    historyAnchor = null
+                    if (available.y > 0) followTail = false
+                }
+                return Offset.Zero
+            }
+        }
     }
+    val endIndex = detail.items.size + (if (detail.hasEarlierMessages) 1 else 0) +
+        (if (detail.items.isNotEmpty() && detail.loadError != null) 1 else 0)
+    val execution = detail.execution
+    val desktopOwned = execution.backend == "desktop" || detail.status == ThreadStatus.DesktopOwned
+    val readOnly = !execution.send || detail.status == ThreadStatus.ExternalBusy
+    val running = detail.activeTurnId != null
 
     fun openGoalDialog() {
         goalDialogOpen = true
@@ -136,31 +155,52 @@ fun SessionDetailScreen(
     }
 
     LaunchedEffect(threadId) { repo.clearActionError() }
-    LaunchedEffect(threadId, desktopOwned) {
-        if (!desktopOwned) repo.threadGoal(threadId) { goalCurrent = it }
+    LaunchedEffect(threadId, execution.goal, goalSupported, detail.loading) {
+        if (execution.goal && goalSupported && !detail.loading && detail.loadError == null) repo.threadGoal(threadId) { goalCurrent = it }
     }
     DisposableEffect(threadId) {
         repo.setActiveThread(threadId)
         onDispose { repo.setActiveThread(null) }
     }
     LaunchedEffect(listState) {
-        snapshotFlow {
-            val layout = listState.layoutInfo
-            val lastVisible = layout.visibleItemsInfo.lastOrNull()?.index ?: -1
-            listState.isScrollInProgress to (
-                layout.totalItemsCount == 0 || lastVisible >= layout.totalItemsCount - 2
-            )
-        }.distinctUntilChanged().collect { (scrolling, nearBottom) ->
-            if (scrolling) followTail = nearBottom
+        snapshotFlow { listState.canScrollForward }.distinctUntilChanged().collect { canScrollForward ->
+            if (!canScrollForward) followTail = true
         }
     }
-    LaunchedEffect(threadId, detail.items.size, tailVersion, forceScrollRequest) {
-        if (detail.items.isEmpty()) return@LaunchedEffect
-        if (!initialScrollDone || followTail) {
-            // The extra anchor is after the final timeline card, so this lands at
-            // the actual bottom even when the last message is taller than a screen.
-            listState.scrollToItem(detail.items.size)
-            initialScrollDone = true
+    LaunchedEffect(threadId, detail.loadingEarlier, detail.items.firstOrNull()?.id) {
+        if (detail.loadingEarlier) return@LaunchedEffect
+        val anchor = historyAnchor ?: return@LaunchedEffect
+        historyAnchor = null
+        if (anchor.firstItemId == detail.items.firstOrNull()?.id) return@LaunchedEffect
+        val index = detail.items.indexOfFirst { "${it::class.simpleName}:${it.id}" == anchor.key }
+        if (index >= 0 && !followTail) {
+            withFrameNanos { }
+            if (!listState.isScrollInProgress) {
+                val headers = (if (detail.hasEarlierMessages) 1 else 0) + (if (detail.loadError != null) 1 else 0)
+                listState.scrollToItem(index + headers, -anchor.offset)
+            }
+        }
+    }
+    LaunchedEffect(threadId, followTail, detail.items.isNotEmpty()) {
+        if (!followTail || detail.items.isEmpty()) return@LaunchedEffect
+        // Markdown and expandable cards can grow after their text was delivered.
+        // Follow measured layout, so asynchronous rendering and keyboard insets
+        // keep the last card visible too. An upward gesture cancels this collector.
+        snapshotFlow {
+            val layout = listState.layoutInfo
+            val last = layout.visibleItemsInfo.lastOrNull()
+            listOf(
+                layout.totalItemsCount, layout.viewportEndOffset,
+                last?.index, last?.offset, last?.size,
+                listState.canScrollForward, listState.isScrollInProgress,
+            )
+        }.collect {
+            if (followTail && listState.canScrollForward && !listState.isScrollInProgress) {
+                withFrameNanos { }
+                if (followTail && !listState.isScrollInProgress) {
+                    listState.scrollToItem((listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
+                }
+            }
         }
     }
 
@@ -171,8 +211,6 @@ fun SessionDetailScreen(
                     title = {
                         Column {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                AgentBadge(AgentRegistry.codex)
-                                Spacer(Modifier.width(6.dp))
                                 Text(
                                     detail.title,
                                     style = MaterialTheme.typography.titleSmall,
@@ -180,17 +218,20 @@ fun SessionDetailScreen(
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.weight(1f, fill = false),
                                 )
-                                Spacer(Modifier.width(8.dp))
-                                ThreadStatusChip(detail.status)
                             }
-                            Text(
-                                detail.cwd,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (execution.backend == "grok" && execution.owner == "external") {
+                                    Text("电脑会话 · 仅查看", style = MaterialTheme.typography.labelSmall, color = StatusColors.external)
+                                } else ThreadStatusChip(detail.status)
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    detail.cwd.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\'),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
                         }
                     },
                     navigationIcon = {
@@ -199,18 +240,35 @@ fun SessionDetailScreen(
                         }
                     },
                     actions = {
-                        if (!desktopOwned && goalSupported) {
-                            IconButton(onClick = { openGoalDialog() }) {
-                                Icon(Icons.Filled.Flag, contentDescription = "任务目标")
+                        IconButton(onClick = { repo.refreshThread(threadId) }, enabled = !refreshing) {
+                            if (refreshing || handingOff) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                            else Icon(Icons.Filled.Refresh, contentDescription = "刷新会话")
+                        }
+                        Box {
+                            IconButton(onClick = { menuOpen = true }) {
+                                Icon(Icons.Filled.MoreVert, contentDescription = "任务操作")
+                            }
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                if (execution.handoff && !desktopOwned && handoffSupported) DropdownMenuItem(
+                                    text = { Text(if (handingOff) "正在交接…" else "在电脑继续") },
+                                    leadingIcon = { Icon(Icons.Filled.DesktopWindows, contentDescription = null) },
+                                    enabled = !running && !detail.loading && !handingOff,
+                                    onClick = { menuOpen = false; handoffDialogOpen = true },
+                                )
+                                if (execution.goal && !desktopOwned && goalSupported) DropdownMenuItem(
+                                    text = { Text("任务目标") },
+                                    leadingIcon = { Icon(Icons.Filled.Flag, contentDescription = null) },
+                                    onClick = { menuOpen = false; openGoalDialog() },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("查看变更") },
+                                    leadingIcon = { Icon(Icons.Filled.Difference, contentDescription = null) },
+                                    onClick = { menuOpen = false; onOpenDiff(threadId) },
+                                )
                             }
                         }
-                        IconButton(onClick = { repo.refreshThread(threadId) }, enabled = !refreshing) {
-                            Icon(Icons.Filled.Refresh, contentDescription = "重新同步会话")
-                        }
-                        IconButton(onClick = { onOpenDiff(threadId) }) {
-                            Icon(Icons.Filled.Difference, contentDescription = "查看变更")
-                        }
                     },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
                 )
                 goalCurrent?.takeIf { it.isNotBlank() }?.let { goal ->
                     Surface(
@@ -236,31 +294,36 @@ fun SessionDetailScreen(
                         }
                     }
                 }
-                if (refreshing) LinearProgressIndicator(Modifier.fillMaxWidth())
             }
         },
         bottomBar = {
+            key(threadId) {
             Composer(
                 running = running,
                 desktopOwned = desktopOwned,
                 readOnly = readOnly,
+                readOnlyReason = execution.readOnlyReason,
+                statusMessage = execution.statusMessage,
+                busy = handingOff,
+                canSteer = execution.steer,
+                canInterrupt = execution.interrupt,
                 attachmentsSupported = attachmentsSupported,
-                planSupported = planSupported,
+                planSupported = planSupported && execution.plan,
                 errorMessage = actionError,
                 onSend = { text, planMode, images, files ->
                     followTail = true
                     repo.sendSteer(threadId, text, planMode, images, files)
-                    forceScrollRequest += 1
                 },
                 onInterrupt = { repo.interruptTurn(threadId) },
             )
+            }
         },
         floatingActionButton = {
             if (detail.items.isNotEmpty() && listState.canScrollForward) {
                 SmallFloatingActionButton(
                     onClick = {
                         followTail = true
-                        coroutineScope.launch { listState.animateScrollToItem(detail.items.size) }
+                        coroutineScope.launch { listState.animateScrollToItem(endIndex) }
                     },
                 ) {
                     Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "回到最新消息")
@@ -268,15 +331,39 @@ fun SessionDetailScreen(
             }
         },
     ) { padding ->
-        // keyed LazyColumn：后续接入 50 ms delta 合并时只需替换列表项，无需改动渲染层。
+        // Stable keys preserve the reading position across refreshes and older pages.
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
+                .nestedScroll(tailScrollConnection)
                 .padding(padding),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             state = listState,
         ) {
+            if (detail.hasEarlierMessages) {
+                item(key = "__agent_pocket_earlier__", contentType = "history") {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        TextButton(
+                            onClick = {
+                                followTail = false
+                                // The history button may disappear on the final page.
+                                // Anchor a message, rather than that temporary header.
+                                historyAnchor = listState.layoutInfo.visibleItemsInfo
+                                    .firstOrNull { !it.key.toString().startsWith("__agent_pocket_") }
+                                    ?.let { HistoryScrollAnchor(it.key, it.offset, detail.items.firstOrNull()?.id) }
+                                repo.loadEarlierMessages(threadId)
+                            },
+                            enabled = !refreshing && !detail.loadingEarlier,
+                        ) { Text(if (detail.loadingEarlier) "正在加载…" else "加载更早的消息") }
+                    }
+                }
+            }
+            if (detail.items.isNotEmpty() && detail.loadError != null) {
+                item(key = "__agent_pocket_load_error__", contentType = "notice") {
+                    Text(detail.loadError!!, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
             if (detail.items.isEmpty()) {
                 item(key = "__agent_pocket_thread_empty__", contentType = "empty") {
                     Surface(
@@ -316,12 +403,9 @@ fun SessionDetailScreen(
             }
             itemsIndexed(
                 detail.items,
-                key = { index, item ->
-                    // Desktop history occasionally contains missing or reused IDs.
-                    // Include the position and type so Compose never receives a
-                    // duplicate key and aborts the whole Activity.
-                    "$index:${item::class.simpleName}:${item.id}"
-                },
+                // Repository merges de-duplicate IDs. Position-free keys keep the
+                // visible message and expanded cards anchored when history is prepended.
+                key = { _, item -> "${item::class.simpleName}:${item.id}" },
                 contentType = { _, item ->
                     when (item) {
                         is TimelineItem.Message -> "message"
@@ -334,7 +418,11 @@ fun SessionDetailScreen(
             ) { _, item ->
                 TimelineItemContent(
                     item = item,
-                    actionsEnabled = !desktopOwned && !readOnly,
+                    actionsEnabled = !handingOff && when (item) {
+                        is TimelineItem.Question -> execution.question
+                        is TimelineItem.Approval -> execution.approval
+                        else -> true
+                    },
                     onAnswerQuestion = { requestId, questionId, option ->
                         repo.answerQuestion(threadId, requestId, questionId, option)
                     },
@@ -347,6 +435,22 @@ fun SessionDetailScreen(
                 Spacer(Modifier.height(1.dp))
             }
         }
+    }
+
+    if (handoffDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { handoffDialogOpen = false },
+            title = { Text("在电脑继续") },
+            text = { Text("释放当前任务后，可以在 Codex Desktop 打开同一个任务。手机仍可追加消息；中断、审批和问题回答转到电脑处理。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    handoffDialogOpen = false
+                    handingOff = true
+                    repo.handoffThread(threadId) { handingOff = false }
+                }) { Text("交接任务") }
+            },
+            dismissButton = { TextButton(onClick = { handoffDialogOpen = false }) { Text("取消") } },
+        )
     }
 
     if (goalDialogOpen) {
@@ -403,6 +507,11 @@ private fun Composer(
     running: Boolean,
     desktopOwned: Boolean,
     readOnly: Boolean,
+    readOnlyReason: String?,
+    statusMessage: String?,
+    busy: Boolean,
+    canSteer: Boolean,
+    canInterrupt: Boolean,
     attachmentsSupported: Boolean,
     planSupported: Boolean,
     errorMessage: String?,
@@ -420,18 +529,21 @@ private fun Composer(
     val pickFiles = rememberFilePicker { picked ->
         fileAttachments = (fileAttachments + picked).distinct().take((3 - imageAttachments.size).coerceAtLeast(0))
     }
-    Surface(tonalElevation = 3.dp) {
-        Column(Modifier.imePadding()) {
+    Surface(color = MaterialTheme.colorScheme.surface) {
+        Column(Modifier.imePadding().navigationBarsPadding()) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            if (busy) Text("正在交接任务…", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
+            if (running && !canSteer) Text(statusMessage ?: "Grok 正在执行；完成或中断后可以继续发送。", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
             if (desktopOwned) {
                 Text(
-                    "该任务由 Codex Desktop 持有。你可以从手机追加文字、图片和文件；中断、审批和问题回答仍需在电脑端处理。",
+                    "由 Desktop 执行 · 可追加消息，审批与中断在电脑处理",
                     style = MaterialTheme.typography.labelSmall,
                     color = StatusColors.external,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 )
             } else if (readOnly) {
                 Text(
-                    "该任务被外部进程占用，移动端仅可查看，无法发送或强制接管。",
+                    readOnlyReason ?: "当前执行连接暂不可写；可继续查看任务，恢复后再发送。",
                     style = MaterialTheme.typography.labelSmall,
                     color = StatusColors.external,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -453,12 +565,12 @@ private fun Composer(
                     FilterChip(
                         selected = !planMode,
                         onClick = { planMode = false },
-                        label = { Text("Execute · 执行") },
+                        label = { Text("执行") },
                     )
                     FilterChip(
                         selected = planMode,
                         onClick = { planMode = true },
-                        label = { Text("Plan · 先规划") },
+                        label = { Text("先规划") },
                     )
                 }
             }
@@ -516,10 +628,10 @@ private fun Composer(
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
-                    enabled = !readOnly,
+                    enabled = !readOnly && !busy,
                     placeholder = {
                         Text(
-                            if (desktopOwned) "通过 Desktop 追加指令…" else if (running) "追加指令以调整当前任务…" else "继续对话…",
+                            if (running && !canSteer) "先写下下一条消息…" else if (running) "补充想法，调整当前任务…" else "继续对话…",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     },
@@ -529,7 +641,7 @@ private fun Composer(
                     modifier = Modifier.weight(1f),
                 )
                 Spacer(Modifier.width(8.dp))
-                if (running && !desktopOwned && !readOnly) {
+                if (running && canInterrupt && !busy) {
                     FilledIconButton(
                         onClick = onInterrupt,
                         colors = IconButtonDefaults.filledIconButtonColors(
@@ -551,7 +663,7 @@ private fun Composer(
                             fileAttachments = emptyList()
                         }
                     },
-                    enabled = !readOnly && (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()),
+                    enabled = !readOnly && !busy && (!running || canSteer) && (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }
@@ -560,7 +672,7 @@ private fun Composer(
     }
 }
 
-@Preview(showBackground = true, backgroundColor = 0xFF0B0E13)
+@Preview(showBackground = true, backgroundColor = 0xFFFAF8F3)
 @Composable
 private fun SessionDetailScreenPreview() {
     AgentPocketTheme {

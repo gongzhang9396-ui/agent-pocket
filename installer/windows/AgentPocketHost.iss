@@ -30,6 +30,9 @@ VersionInfoVersion={#MyAppVersion}
 [Files]
 Source: "payload\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[Tasks]
+Name: "desktopintegration"; Description: "同时连接 Codex Desktop（可选，API 模式无需此项）"; Check: IsFirstInstall
+
 [Icons]
 Name: "{group}\Agent Pocket 配对助手"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\pairing-assistant.ps1"""
 Name: "{group}\检查 Agent Pocket Host 更新"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\check-host-update.ps1"" -InstallDir ""{app}"" -Interactive"
@@ -144,10 +147,10 @@ begin
   begin
     if ExistingConfig then
     begin
-      Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\install-desktop-plugin.ps1') +
+      Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\update-desktop-integration.ps1') +
         '" -InstallDir "' + ExpandConstant('{app}') + '"';
       if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-        RaiseException('Desktop Attach 插件升级失败。请确认 Codex Desktop 已安装。');
+        RaiseException('无法更新 Desktop 集成配置。请检查 Host 本地配置文件。');
       Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\register-host-tasks.ps1') +
         '" -InstallDir "' + ExpandConstant('{app}') + '" -OnlyIfMissing -StartHost';
       if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
@@ -157,6 +160,7 @@ begin
     Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\configure-host.ps1') +
       '" -InstallDir "' + ExpandConstant('{app}') + '" -RelayUrl "' + RelayPage.Values[0] +
       '" -ProjectRoots "' + RootsPage.Values[0] + '" -AttachmentsPath "' + AttachmentsPage.Values[0] + '"';
+    if not WizardIsTaskSelected('desktopintegration') then Params := Params + ' -SkipDesktopAttach';
     if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
       RaiseException('Agent Pocket Host 配置失败。请检查 Relay 地址、项目目录、附件目录和 Codex CLI。');
   end;

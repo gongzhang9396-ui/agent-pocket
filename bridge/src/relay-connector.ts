@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { WebSocket } from "ws";
-import { toRpcError, type BridgeEvent } from "./protocol.ts";
+import { RpcError, toRpcError, type BridgeEvent } from "./protocol.ts";
 import type { BridgeServer } from "./server.ts";
 import type { BridgeStore } from "./store.ts";
 import {
@@ -43,6 +43,10 @@ function delay(ms: number) {
 const SNAPSHOT_DEBOUNCE_MS = 1_000;
 const SNAPSHOT_RETRY_MS = 15_000;
 const SNAPSHOT_REFRESH_MS = 60_000;
+// The Relay accepts at most 2 MiB of Base64 ciphertext. Keep plaintext
+// comfortably below that after secretstream, Base64, and JSON framing.
+const MAX_INNER_RESPONSE_BYTES = 1024 * 1024;
+const MAX_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
 
 function eventType(event: BridgeEvent): "attention" | "completed" | "status" {
   if (event.type === "approval.request" || event.type === "question.request") return "attention";
@@ -179,13 +183,17 @@ export class RelayConnector extends EventEmitter {
   private request(method: string, params: unknown, timeoutMs = 30_000) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Relay 当前离线"));
     const id = this.requestId++;
+    const frame = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    if (Buffer.byteLength(frame, "utf8") > MAX_RELAY_REQUEST_BYTES) {
+      return Promise.reject(new RpcError("RESPONSE_TOO_LARGE", "消息超过 Relay 单帧大小，已停止发送以保留连接"));
+    }
     return new Promise<any>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Relay 请求超时: ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.socket!.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      this.socket!.send(frame);
     });
   }
 
@@ -266,7 +274,14 @@ export class RelayConnector extends EventEmitter {
     } catch (error) {
       response = { jsonrpc: "2.0", id: request.id, error: toRpcError(error).toJson() };
     }
-    await this.request("channel/data", { envelope: channel.encrypt(JSON.stringify(response)) });
+    let plaintext = JSON.stringify(response);
+    if (Buffer.byteLength(plaintext, "utf8") > MAX_INNER_RESPONSE_BYTES) {
+      plaintext = JSON.stringify({ jsonrpc: "2.0", id: request.id,
+        error: new RpcError("RESPONSE_TOO_LARGE", "此请求返回的内容过大，请缩小范围或在电脑查看；连接仍然可用").toJson() });
+    }
+    // Validate before encryption: a rejected packet must not advance the
+    // secretstream counter and desynchronize all subsequent responses.
+    await this.request("channel/data", { envelope: channel.encrypt(plaintext) });
   }
 
   private async closeChannel(params: any) {

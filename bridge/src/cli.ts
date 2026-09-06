@@ -4,9 +4,11 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "./config.ts";
-import { CodexAppServer } from "./codex.ts";
+import { CodexThreadPool } from "./codex-pool.ts";
 import { DesktopAttachClient } from "./desktop-attach.ts";
 import { FcmNotifier } from "./fcm.ts";
+import { GrokAgent, resolveGrokCommand } from "./grok.ts";
+import { GrokNativeCatalog } from "./grok-native-catalog.ts";
 import { checkForHostUpdate } from "./host-updater.ts";
 import { BridgeServer } from "./server.ts";
 import { BridgeStore } from "./store.ts";
@@ -220,18 +222,19 @@ export async function main(argv = process.argv.slice(2)) {
     throw new Error(`未知命令：${command}`);
   }
 
-  const codex = new CodexAppServer({
+  const codex = new CodexThreadPool({
     command: config.codexCommand,
     codexHome: config.codexHome,
     minVersion: config.minCodexVersion,
   });
-  const status = await codex.start();
+  const status = await startCodexForHost(codex);
   const bridge = new BridgeServer(
     config,
     store,
     codex,
     new FcmNotifier(config.firebaseServiceAccount),
     new DesktopAttachClient(),
+    new GrokAgent(store, config.projectRoots, resolveGrokCommand(config.grokCommand), undefined, new GrokNativeCatalog(config.projectRoots)),
   );
   await bridge.start();
   const relayIdentity = loadHostIdentity(config.relayIdentityPath);
@@ -273,6 +276,17 @@ export async function main(argv = process.argv.slice(2)) {
   };
   process.once("SIGINT", () => void stop().finally(() => process.exit(0)));
   process.once("SIGTERM", () => void stop().finally(() => process.exit(0)));
+}
+
+/** One missing agent must not prevent the Host or another agent from starting. */
+export async function startCodexForHost(codex: CodexThreadPool) {
+  try { return await codex.start(); }
+  catch {
+    codex.stop();
+    codex.readOnly = true;
+    codex.compatibilityError = "Codex CLI 尚未就绪；已安装的其他 Agent 仍可使用";
+    return { version: codex.version, readOnly: true, error: codex.compatibilityError };
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {

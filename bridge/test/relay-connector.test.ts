@@ -6,6 +6,45 @@ import test from "node:test";
 import { RelayConnector } from "../src/relay-connector.ts";
 import { createHostIdentity, loadHostIdentity } from "../src/relay-crypto.ts";
 
+test("the wire budget rejects an oversized frame without sending or retaining a pending request", async () => {
+  const identity = { hostId: "host", accountId: "account", hostToken: "token", contentKey: "key" } as any;
+  const connector = new RelayConnector("http://127.0.0.1", "unused", identity, {} as any, {} as any);
+  let sends = 0;
+  (connector as any).socket = { readyState: 1, send: (frame: string) => {
+    sends++;
+    const id = JSON.parse(frame).id;
+    queueMicrotask(() => void (connector as any).onMessage(JSON.stringify({ id, result: { ok: true } })));
+  } };
+  await assert.rejects((connector as any).request("channel/data", { ciphertext: "x".repeat(2 * 1024 * 1024) }),
+    (error: any) => error.nameCode === "RESPONSE_TOO_LARGE");
+  assert.equal(sends, 0);
+  assert.equal((connector as any).pending.size, 0);
+  assert.deepEqual(await (connector as any).request("relay/hello", {}), { ok: true });
+  assert.equal(sends, 1);
+});
+
+test("oversized RPC results become a small error before advancing channel encryption", async () => {
+  const identity = { hostId: "host", accountId: "account", hostToken: "token", contentKey: "key" } as any;
+  const bridge = { dispatchRelay: async (_peer: string, method: string) => method === "large" ? "中".repeat(900_000) : { ok: true } } as any;
+  const connector = new RelayConnector("http://127.0.0.1", "unused", identity, bridge, {} as any);
+  let method = "large";
+  const encrypted: any[] = [];
+  const sent: any[] = [];
+  (connector as any).channels.set("channel", {
+    peer: { id: "device" },
+    decrypt: () => JSON.stringify({ jsonrpc: "2.0", id: 1, method }),
+    encrypt: (value: string) => { encrypted.push(JSON.parse(value)); return { ciphertext: value }; },
+  });
+  (connector as any).request = async (_method: string, params: any) => sent.push(params);
+  await (connector as any).handleChannelData({ envelope: { channelId: "channel" } });
+  assert.equal(encrypted.length, 1, "an oversized response must never consume a secretstream counter");
+  assert.equal(encrypted[0].error?.data.name, "RESPONSE_TOO_LARGE");
+  assert.ok(Buffer.byteLength(JSON.stringify(sent[0])) < 4096);
+  method = "small";
+  await (connector as any).handleChannelData({ envelope: { channelId: "channel" } });
+  assert.deepEqual(encrypted[1].result, { ok: true });
+});
+
 test("Relay outbox reuses identical event and snapshot ciphertext after lost acknowledgements", {
   skip: process.platform !== "win32",
 }, async () => {

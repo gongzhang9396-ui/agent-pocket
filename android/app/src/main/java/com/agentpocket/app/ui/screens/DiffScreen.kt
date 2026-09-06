@@ -143,7 +143,7 @@ private fun DiffFileCard(file: DiffFile) {
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
-                        .background(androidx.compose.ui.graphics.Color(0xFF0A0D11))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                         .horizontalScroll(rememberScrollState()),
                 ) {
                     hunk.lines.forEach { line -> DiffLineRow(line) }

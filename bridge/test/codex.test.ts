@@ -3,6 +3,20 @@ import test from "node:test";
 import { CodexAppServer, mapCodexBusy } from "../src/codex.ts";
 import { ErrorName, RpcError } from "../src/protocol.ts";
 
+test("executor initializes without querying unrelated model/history directories", async () => {
+  const program = `const lines = require('node:readline').createInterface({input:process.stdin});
+    lines.on('line', line => { const message=JSON.parse(line); if(message.id == null)return;
+      process.stdout.write(JSON.stringify({id:message.id, ...(message.method==='initialize' ? {result:{}} : {error:{code:-32601,message:'Catalog unavailable'}})})+'\\n'); });`;
+  const codex = new CodexAppServer({ command: process.execPath, args: ["-e", program], codexHome: ".", minVersion: "1" });
+  try {
+    assert.equal((await codex.start()).readOnly, false);
+    await assert.rejects(codex.request("model/list", {}), /Catalog unavailable/);
+    assert.equal(codex.readOnly, false);
+    await codex.closeGracefully();
+    assert.equal(codex.readOnly, true);
+  } finally { codex.stop(); }
+});
+
 function fakeServer(thread: any) {
   const codex = new CodexAppServer({
     command: "fake",

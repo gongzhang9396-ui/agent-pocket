@@ -49,8 +49,8 @@ object AgentRegistry {
         kind = AgentKind.Grok,
         displayName = "Grok",
         accent = AgentAccents.grok,
-        available = false,
-        capabilities = "Host 适配器尚未接入",
+        available = true,
+        capabilities = "Grok CLI · 文本任务、实时进度、单次审批与中断",
     )
     val kimi = AgentProfile(
         kind = AgentKind.Kimi,
@@ -61,6 +61,7 @@ object AgentRegistry {
     )
 
     val all = listOf(codex, grok, kimi)
+    fun forBackend(backend: String) = if (backend == "grok") grok else codex
 }
 
 @Composable

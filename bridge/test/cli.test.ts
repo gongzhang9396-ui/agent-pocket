@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizePublicUrl } from "../src/cli.ts";
+import { normalizePublicUrl, startCodexForHost } from "../src/cli.ts";
+import { CodexThreadPool } from "../src/codex-pool.ts";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 test("normalizes a secure relay URL with a private path", () => {
   assert.equal(
@@ -20,4 +23,12 @@ test("rejects insecure or ambiguous relay URLs", () => {
   ]) {
     assert.throws(() => normalizePublicUrl(value));
   }
+});
+
+test("Host starts with Codex unavailable so a Grok-only installation remains usable", async () => {
+  const codex = new CodexThreadPool({ command: join(tmpdir(), "ap-missing-codex-executable"), codexHome: tmpdir(), minVersion: "1" });
+  const status = await startCodexForHost(codex);
+  assert.equal(status.readOnly, true);
+  assert.match(status.error!, /其他 Agent/);
+  assert.equal(codex.child, undefined);
 });

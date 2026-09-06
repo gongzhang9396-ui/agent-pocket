@@ -22,6 +22,9 @@ data class HostRuntime(
     val attachReady: Boolean = false,
     val processRunning: Boolean = false,
     val canWake: Boolean = false,
+    /** null means an older Host has not advertised executor health. */
+    val bridgeReady: Boolean? = null,
+    val bridgeVersion: String? = null,
 )
 
 data class Device(
@@ -66,9 +69,33 @@ data class ModelOption(
     val label: String,
     val description: String,
     val reasoningOptions: List<ReasoningOption>,
+    val agentId: String = "codex",
 )
 
+data class AgentAvailability(val id: String, val available: Boolean, val error: String? = null, val version: String? = null)
+
 enum class ThreadStatus { Active, NeedsAttention, Completed, Idle, DesktopOwned, ExternalBusy }
+
+/** Execution is independent of lifecycle. A running Desktop task is still Active. */
+data class ThreadExecution(
+    val backend: String = "bridge",
+    val owner: String? = null,
+    val send: Boolean = true,
+    val interrupt: Boolean = true,
+    val approval: Boolean = true,
+    val question: Boolean = true,
+    val plan: Boolean = true,
+    val goal: Boolean = true,
+    val handoff: Boolean = true,
+    val steer: Boolean = true,
+    val attachments: Boolean = true,
+    val readOnlyReason: String? = null,
+    val statusMessage: String? = null,
+) {
+    companion object {
+        fun desktop(owner: String? = null) = ThreadExecution("desktop", owner, true, false, false, false, false, false, false)
+    }
+}
 
 data class ThreadSummary(
     val id: String,
@@ -84,6 +111,7 @@ data class ThreadSummary(
     val updatedAtEpoch: Long = 0,
     /** Defensive marker for older Hosts or cached snapshots that include archived rows. */
     val archived: Boolean = false,
+    val execution: ThreadExecution = ThreadExecution(),
 )
 
 enum class Role { User, Assistant, System }
@@ -163,6 +191,10 @@ data class ThreadDetail(
     val preview: String = "",
     val loading: Boolean = false,
     val loadError: String? = null,
+    val hasEarlierMessages: Boolean = false,
+    val loadingEarlier: Boolean = false,
+    val execution: ThreadExecution = ThreadExecution(),
+    val historyRevision: String? = null,
 )
 
 enum class DiffFileStatus { Added, Modified, Deleted, Renamed }

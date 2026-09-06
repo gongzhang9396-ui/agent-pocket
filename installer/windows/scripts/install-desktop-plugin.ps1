@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$InstallDir
 )
 
@@ -24,9 +24,10 @@ function Invoke-CodexJson([string[]]$Arguments, [string]$FailureMessage) {
     }
 }
 
-$codex = Get-Command codex -ErrorAction SilentlyContinue
-if (-not $codex) { throw '没有找到 Codex CLI。请先安装并登录 Codex Desktop。' }
-$script:CodexPath = $codex.Source
+. (Join-Path $PSScriptRoot 'resolve-codex.ps1')
+$configPath = Join-Path $env:LOCALAPPDATA 'AgentPocket\host-config.json'
+$configuredCommand = if (Test-Path -LiteralPath $configPath) { (Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json).codexCommand } else { $null }
+$script:CodexPath = Resolve-CodexCommand $configuredCommand
 
 $marketplacePath = Normalize-LocalPath (Join-Path $InstallDir 'marketplace')
 if (-not (Test-Path -LiteralPath (Join-Path $marketplacePath '.agents\plugins\marketplace.json') -PathType Leaf)) {

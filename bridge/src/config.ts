@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RpcError, ErrorName } from "./protocol.ts";
@@ -10,6 +11,7 @@ export type BridgeConfig = {
   attachmentsPath?: string;
   codexHome: string;
   codexCommand: string;
+  grokCommand?: string;
   minCodexVersion: string;
   projectRoots: string[];
   firebaseServiceAccount?: string;
@@ -50,6 +52,7 @@ export function loadConfig(
     attachmentsPath,
     codexHome: resolve(env.CODEX_HOME || join(homedir(), ".codex")),
     codexCommand: env.AGENT_POCKET_CODEX || "codex",
+    grokCommand: env.AGENT_POCKET_GROK,
     minCodexVersion: env.AGENT_POCKET_MIN_CODEX || "0.150.0-alpha.8",
     projectRoots: roots,
     firebaseServiceAccount: env.AGENT_POCKET_FIREBASE_SERVICE_ACCOUNT,
@@ -82,24 +85,29 @@ export function assertAllowedCwd(input: unknown, roots: string[]) {
   return cwd;
 }
 
-export function listProjects(roots: string[], maxDepth = 3) {
+export async function listProjects(roots: string[], maxDepth = 3) {
   const found = new Map<string, { id: string; name: string; cwd: string }>();
-  const visit = (path: string, depth: number) => {
-    if (depth > maxDepth || !existsSync(path)) return;
-    let stat;
-    try { stat = statSync(path); } catch { return; }
-    if (!stat.isDirectory()) return;
-    if (existsSync(join(path, ".git"))) {
-      const cwd = realpathSync.native(path);
-      found.set(cwd.toLowerCase(), { id: cwd, name: basename(cwd), cwd });
+  let visited = 0;
+  const visit = async (path: string, depth: number): Promise<void> => {
+    if (depth > maxDepth || visited++ >= 2_000) return;
+    const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
+    if (entries.some((entry) => entry.name === ".git")) {
+      const cwd = assertAllowedCwd(path, roots);
+      found.set(process.platform === "win32" ? cwd.toLowerCase() : cwd, { id: cwd, name: basename(cwd), cwd });
       return;
     }
     if (depth === maxDepth) return;
-    for (const entry of readdirSync(path, { withFileTypes: true })) {
-      if (entry.isDirectory() && !entry.name.startsWith(".")) visit(join(path, entry.name), depth + 1);
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(".")) await visit(join(path, entry.name), depth + 1);
     }
   };
-  for (const root of roots) visit(root, 0);
+  for (const root of roots) {
+    // A permitted working directory is usable even when it is not a Git repo.
+    if (!(await stat(root).catch(() => null))?.isDirectory()) continue;
+    const cwd = assertAllowedCwd(root, roots);
+    found.set(process.platform === "win32" ? cwd.toLowerCase() : cwd, { id: cwd, name: basename(cwd), cwd });
+    await visit(root, 0);
+  }
   return [...found.values()].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
 }
 

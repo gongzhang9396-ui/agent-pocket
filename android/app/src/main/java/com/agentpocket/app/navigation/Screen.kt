@@ -6,7 +6,7 @@ sealed interface Screen {
 
     data object Inbox : Screen
 
-    data object NewTask : Screen
+    data class NewTask(val agentId: String = "codex") : Screen
 
     data class Detail(val threadId: String) : Screen
 

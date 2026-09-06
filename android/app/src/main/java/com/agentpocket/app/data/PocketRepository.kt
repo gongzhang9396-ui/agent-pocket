@@ -2,6 +2,7 @@ package com.agentpocket.app.data
 
 import android.net.Uri
 import com.agentpocket.app.data.model.ApprovalDecision
+import com.agentpocket.app.data.model.AgentAvailability
 import com.agentpocket.app.data.model.Device
 import com.agentpocket.app.data.model.DiffFile
 import com.agentpocket.app.data.model.Host
@@ -34,6 +35,9 @@ interface PocketRepository {
     val projectsLoading: StateFlow<Boolean>
     val projectsError: StateFlow<String?>
     val models: StateFlow<List<ModelOption>>
+    val agents: StateFlow<List<AgentAvailability>>
+    val modelsLoading: StateFlow<Boolean>
+    val modelsError: StateFlow<String?>
     val actionError: StateFlow<String?>
     val creatingTask: StateFlow<Boolean>
 
@@ -43,7 +47,7 @@ interface PocketRepository {
     /** Human-readable progress line for the running sync, null when idle. */
     val syncStatus: StateFlow<String?>
 
-    /** Encoded thread refs whose full history is being fetched right now. */
+    /** Encoded thread refs with a history page being fetched right now. */
     val refreshingThreads: StateFlow<Set<String>>
 
     fun threadDetail(threadId: String): StateFlow<ThreadDetail>
@@ -58,8 +62,14 @@ interface PocketRepository {
     /** Manually re-runs the full sync pipeline (hosts, devices, snapshots, events, thread lists). */
     fun refreshAll()
 
-    /** Manually re-reads one thread's full history from its host. */
+    /** Refreshes the latest history page while retaining already displayed content. */
     fun refreshThread(threadId: String)
+
+    /** Fetch one older page without replacing the visible conversation. */
+    fun loadEarlierMessages(threadId: String)
+
+    /** Release an idle Host writer and route future mobile messages through Desktop. */
+    fun handoffThread(threadId: String, onResult: (Boolean) -> Unit)
 
     /**
      * Marks the thread the user is currently viewing (null when leaving).
@@ -82,7 +92,7 @@ interface PocketRepository {
      * first turn in Codex's native Plan collaboration mode (bridge only):
      * the model produces a plan document without touching files.
      */
-    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, goal: String?, images: List<Uri>, files: List<Uri>, onCreated: (String) -> Unit)
+    fun createTask(projectId: String, modelId: String, reasoningId: String, prompt: String, target: String, planMode: Boolean, goal: String?, images: List<Uri>, files: List<Uri>, onCreated: (String) -> Unit, agentId: String = "codex")
 
     /** Reads the thread's persisted goal objective (bridge tasks only); null when unset. */
     fun threadGoal(threadId: String, onResult: (String?) -> Unit)

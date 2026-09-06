@@ -1,31 +1,27 @@
-# Windows Bridge
+# Windows Host / Bridge
 
-运行时依赖 Node.js 24、`ws` 和可选的 `firebase-admin`；状态使用 Node 内置 SQLite。
-
-`qrcode` 和 `qrcode-terminal` 是可选的本地 CLI 依赖。`pair` 会优先在 `%LOCALAPPDATA%\AgentPocket\pairing-<id>.png` 生成 1024px PNG 并尝试用 Windows 图片查看器打开，同时在终端绘制二维码；二维码内容不会上传到第三方服务。依赖缺失时会回退到系统 `qrencode`，再没有则使用手动配对码。
+Host 连接本机 Codex CLI 与 Relay。运行时需要 Node.js 24；安装包自带 Node，状态使用内置 SQLite。源码开发：
 
 ```powershell
-npm install --ignore-scripts
+npm ci --ignore-scripts
 npm test
-npm run desktop-probe
 npm start
 ```
 
-`desktop-probe` 是 Desktop Attach 的只读诊断命令。它读取 `%LOCALAPPDATA%\AgentPocket\desktop-attach.json`，通过随机 Windows named pipe 和随机令牌连接已运行的插件，并仅调用 `attach/probe` 与 `thread/list`。输出只包含能力名称和结果项数量，不打印任务正文或本地令牌。Desktop-owned 任务的 `thread/list`、`thread/read` 和续写全部走 Codex Desktop 原生工具；Bridge-owned 任务才会交给独立 app-server，二者不会互相回退。
+启动前配置 `AGENT_POCKET_PROJECT_ROOTS`（Windows 以分号分隔的绝对目录）、`AGENT_POCKET_RELAY_URL` 与本机身份。完整安装、扫码绑定和恢复步骤见 [使用说明](../docs/USAGE.md)。v2 Host 主动连接 Relay，不需要每台电脑的 SSH 反向隧道。安装器将本机监听限制在 loopback 的随机端口；独立 CLI 开发默认端口为 8787。
 
-隧道部署后，`pair` 会自动读取 `%LOCALAPPDATA%\AgentPocket\tunnel\tunnel.json` 中保存的 WSS endpoint；也可以显式传入 endpoint 覆盖它。
+Codex 可以使用本机已配置的兼容模型 API，不要求 GPT 账户。安装器识别原生 CLI、npm 的 Windows 启动脚本对应的原生程序，以及 Desktop 附带的 CLI。Desktop Attach 是可选集成，安装失败不会阻止 API 模式的 Host 启动；安装状态记录在本机 `desktop-integration-status.json`。
 
-Bridge 固定监听 `127.0.0.1:8787`。外部连接必须经过 OCI Caddy 与 Windows 主动建立的 SSH reverse tunnel；不要把 Bridge 改为 `0.0.0.0`，也不要直接开放 Windows 防火墙端口。协议不兼容时 Bridge 自动进入只读状态，不会更新 Codex 或批准写操作。
+任务身份和历史来自原生 Codex 存储。catalog 只调用读取接口，按项目白名单过滤，查询所有 provider 的顶层任务。详情用 `thread/turns/list` 分页；只在 CLI 明确不支持该方法时退回完整读取。浏览不会创建 worker 或登记 owner。Desktop Attach 作为读取兼容路径。
 
-中继相关脚本：
+写入路由单独记录：Bridge 根任务各有一个 app-server worker，Desktop 任务交由 Attach 写入。读取后端与写入路由没有绑定关系；不会因为 Attach 写入失败而自动启动另一个 writer。显式交接需要任务空闲和 worker 正常退出证据。协议与验证边界见 [Host 基础契约](../docs/HOST-FOUNDATION.md) 和 [接续改造记录](../docs/CONTINUITY-REDESIGN.md)。
 
-- `new-oci-tunnel-key.ps1`：创建 Agent Pocket 专用 Ed25519 密钥。
-- `deploy-oci-relay.ps1`：钉扎 OCI 主机指纹、部署受限账号和 Caddy 精确路径、安装隧道计划任务。
-- `install-oci-tunnel.ps1`：只安装 Windows SSH tunnel 任务。
-- `run-oci-tunnel.ps1`：由计划任务调用，保持 SSH reverse tunnel 并在断开后自动重连。
-- `uninstall-oci-tunnel.ps1`：移除隧道任务，保留密钥以便恢复。
-- `provision-oci-relay.sh`：只管理 OCI 上 Agent Pocket 自己的用户、密钥和 Caddy 标记 block。
+`npm run desktop-probe` 是可选的只读 Attach 诊断，输出能力和数量，不输出任务正文或令牌。FCM 也是可选项，关闭它不影响 WSS 实时连接；通知仅含定位信息。
 
-完整 WSS 地址包含高熵路径，等同于敏感配置。`pair` 会把它放入五分钟二维码；Android 会将 endpoint、deviceId 和设备令牌一起用 Keystore AES-GCM 加密保存。
+隔离验证（临时 CODEX_HOME、loopback Responses 服务，无真实模型或账户）：
 
-Firebase 服务账号是可选项。未配置时仅关闭 FCM；WSS 实时功能不受影响。FCM 发送前会强制裁剪为 `hostId/sessionId/eventId/type`。
+```powershell
+node --experimental-strip-types scripts/probe-thread-sharing.mjs --pool
+```
+
+本页 catalog、执行池、可选 Desktop 安装等描述对应当前开发代码，尚未发布到已安装的 0.3.2。
