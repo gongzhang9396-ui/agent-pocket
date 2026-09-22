@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { appendFileSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,15 +28,33 @@ function setup(messages: any[] = [{ type: "user", content: "desktop question" },
   const catalog = new GrokNativeCatalog([project], sessions);
   const clients: SharedClient[] = [], calls: any[] = [];
   let version = "1.0.13";
+  let modelError = false, externalBusy = false, delayedModelNotice = false, rewriteOnLoad = false;
+  const modelState = () => ({ currentModelId: JSON.parse(readFileSync(join(directory, "summary.json"), "utf8")).current_model_id,
+    availableModels: ["grok-fixture", "grok-next"].map(modelId => ({ modelId, name: modelId, _meta: { reasoningEffort: "low", reasoningEfforts: [{ id: "low" }, { id: "high" }] } })) });
   class SharedClient extends EventEmitter {
     closed = false; environment?: NodeJS.ProcessEnv; prompt: any; resolvePrompt?: (value: any) => void;
     start() {}
     async request(method: string, params: any) {
       calls.push({ method, params });
-      if (method === "initialize") return { protocolVersion: 1, agentCapabilities: { loadSession: true }, _meta: { agentVersion: version } };
+      if (method === "initialize") return { protocolVersion: 1, agentCapabilities: { loadSession: true }, _meta: { agentVersion: version, modelState: modelState() } };
       if (method === "session/load") {
+        if (rewriteOnLoad) writeFileSync(history, JSON.stringify({ type: "assistant", content: "normalized desktop history" }) + "\n");
         this.emit("notification", { method: "session/update", params: { sessionId: nativeId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "REPLAY" } } } });
-        return {};
+        if (externalBusy) this.queue("desktop-running");
+        return { models: modelState() };
+      }
+      if (method === "session/set_model") {
+        if (modelError) return { _meta: { model: { Err: "not applied" } } };
+        const summaryPath = join(directory, "summary.json");
+        writeFileSync(summaryPath, JSON.stringify({ ...JSON.parse(readFileSync(summaryPath, "utf8")), current_model_id: params.modelId, reasoning_effort: params._meta.reasoningEffort }));
+        const notice = { method: "_x.ai/session_notification", params: { sessionId: nativeId, update: {
+          sessionUpdate: "model_changed", model_id: params.modelId, reasoning_effort: params._meta.reasoningEffort,
+        } } };
+        if (delayedModelNotice) {
+          this.emit("notification", { ...notice, params: { ...notice.params, update: { ...notice.params.update, reasoning_effort: "low" } } });
+          setTimeout(() => this.emit("notification", notice), 35);
+        } else this.emit("notification", notice);
+        return { _meta: { model: { Ok: params.modelId } } };
       }
       if (method === "session/prompt") {
         this.prompt = params;
@@ -66,8 +84,58 @@ function setup(messages: any[] = [{ type: "user", content: "desktop question" },
     calls.push({ args }); const client = new SharedClient(); clients.push(client); return client as unknown as AcpClient;
   };
   const grok = new GrokAgent(store, [project], "fixture", factory, catalog);
-  return { root, project, sessions, directory, history, id: `grok:${nativeId}`, nativeId, store, catalog, grok, clients, calls, db, factory, setVersion: (value: string) => { version = value; } };
+  return { root, project, sessions, directory, history, id: `grok:${nativeId}`, nativeId, store, catalog, grok, clients, calls, db, factory,
+    setVersion: (value: string) => { version = value; }, setModelError: () => { modelError = true; }, setExternalBusy: () => { externalBusy = true; },
+    delayModelNotice: () => { delayedModelNotice = true; }, rewriteOnLoad: () => { rewriteOnLoad = true; } };
 }
+
+test("model controls read native settings without loading, then apply and preserve one shared session", async () => {
+  const c = setup();
+  c.delayModelNotice();
+  try {
+    const before = await c.grok.modelOptions(c.id);
+    assert.equal(before.controlScope, "shared"); assert.equal(before.currentModel, "grok-fixture");
+    assert.equal(c.calls.filter(call => call.method === "session/load").length, 0);
+    const result = await c.grok.start(c.id, "selected model", "model-once", { model: "grok-next", effort: "high" });
+    await until(() => c.clients.some(client => Boolean(client.prompt)));
+    const client = c.clients.find(client => client.prompt)!;
+    assert.equal(client.prompt.sessionId, c.nativeId);
+    const load = c.calls.find(call => call.method === "session/load");
+    assert.equal(load.params._meta.yoloMode, false); assert.equal(load.params._meta.autoMode, false);
+    const switched = c.calls.findIndex(call => call.method === "session/set_model");
+    assert.ok(switched < c.calls.findIndex(call => call.method === "session/prompt"));
+    assert.equal(c.grok.tasks.get(c.id)?.effort, "high");
+    assert.equal((await c.grok.start(c.id, "duplicate", "model-once", { model: "grok-fixture" })).turn.id, result.turn.id);
+    assert.equal(c.calls.filter(call => call.method === "session/set_model").length, 1);
+    client.finish(); await until(() => !c.grok.active.size);
+    const after = await c.grok.modelOptions(c.id);
+    assert.equal(after.currentModel, "grok-next"); assert.equal(after.currentEffort, "high");
+    const continued = await c.grok.start(c.id, "inherit", "model-inherit");
+    await until(() => Boolean(c.clients.at(-1)?.prompt));
+    assert.equal(c.calls.filter(call => call.method === "session/set_model").length, 1);
+    assert.equal(c.grok.active.get(c.id)?.task.effort, "high");
+    c.clients.at(-1)!.finish(); await until(() => !c.grok.active.size);
+    assert.ok(continued.turn.id);
+  } finally { await c.grok.stop(); c.store.close(); }
+});
+
+test("invalid, unconfirmed, or externally busy Grok model changes never send the prompt", async () => {
+  for (const scenario of ["model", "effort", "unconfirmed", "busy"]) {
+    const c = setup();
+    try {
+      if (scenario === "unconfirmed") c.setModelError();
+      if (scenario === "busy") c.setExternalBusy();
+      await assert.rejects(c.grok.start(c.id, "not sent", `invalid-${scenario}`, {
+        model: scenario === "model" ? "missing" : "grok-next", effort: scenario === "effort" ? "ultra" : "high",
+      }));
+      assert.equal(c.calls.filter(call => call.method === "session/prompt").length, 0);
+      assert.equal(c.grok.tasks.latestTurn(c.id), undefined);
+      assert.equal(c.grok.active.size, 0);
+      assert.ok(c.clients.every(client => client.closed));
+      if (scenario === "busy") assert.equal(c.calls.filter(call => call.method === "session/set_model").length, 0);
+    } finally { await c.grok.stop(); c.store.close(); }
+  }
+});
 
 test("desktop continuation keeps one native ID and canonical history, including later terminal edits and restart", async () => {
   const c = setup();
@@ -127,6 +195,62 @@ test("active shared history paginates both old native content and live output wi
     c.clients[0].finish(current); await until(() => !c.grok.active.size);
     await assert.rejects(c.grok.read(c.id, oldLiveCursor), /刷新/);
   } finally { await c.grok.stop(); c.store.close(); }
+});
+
+test("session load rewrites cannot invalidate the live history boundary or hide approvals", async () => {
+  const c = setup(); c.rewriteOnLoad();
+  try {
+    await c.grok.start(c.id, "one mobile prompt", "load-rewrite");
+    await until(() => Boolean(c.clients[0]?.prompt));
+    c.clients[0].emit("request", { id: 42, method: "session/request_permission", params: { sessionId: c.nativeId,
+      toolCall: { toolCallId: "own-tool", title: "Read fixture" }, options: [{ kind: "allow_once", optionId: "once" }] } });
+    const requestId = [...c.grok.permissions.keys()][0]; assert.ok(requestId);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const page = await c.grok.read(c.id);
+      assert.deepEqual(items(page).filter((i: any) => i.type !== "pocketApproval").map(text), ["normalized desktop history", "one mobile prompt"]);
+      assert.equal(items(page).filter((i: any) => i.requestId === requestId).length, 1);
+    }
+    assert.equal(c.calls.filter(call => call.method === "session/prompt").length, 1);
+    assert.equal(c.calls.filter(call => call.reply).length, 0);
+  } finally { await c.grok.stop(); c.store.close(); }
+});
+
+test("a mid-turn rewrite, truncation or missing history preserves live controls without replaying the prompt", async () => {
+  for (const change of ["rewrite", "truncate", "missing"]) {
+    const c = setup();
+    try {
+      const oldCursor = (await c.catalog.read(c.id)).page.startCursor!;
+      await c.grok.start(c.id, "keep current turn", `mid-turn-${change}`);
+      await until(() => Boolean(c.clients[0]?.prompt));
+      const client = c.clients[0];
+      client.chunk("live output"); c.grok.flush(c.grok.active.get(c.id)!);
+      client.emit("request", { id: 43, method: "session/request_permission", params: { sessionId: c.nativeId,
+        toolCall: { toolCallId: "own-tool", title: "Read fixture" }, options: [{ kind: "allow_once", optionId: "once" }] } });
+      const requestId = [...c.grok.permissions.keys()][0]; assert.ok(requestId);
+      const before = await c.grok.read(c.id);
+      if (change === "missing") unlinkSync(c.history);
+      else writeFileSync(c.history, change === "truncate" ? "" : JSON.stringify({ type: "assistant", content: "rewritten history ".repeat(30) }) + "\n");
+      const controls = await c.grok.interactions(c.id);
+      assert.equal(controls.items.length, 1);
+      assert.equal(controls.items[0].requestId, requestId); assert.equal(controls.items[0].available, true);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const page = await c.grok.read(c.id);
+        assert.notEqual(page.page.revision, before.page.revision);
+        assert.equal(page.page.nextCursor, null);
+        assert.equal(items(page).filter((i: any) => i.requestId === requestId).length, 1);
+        assert.equal(items(page).filter((i: any) => text(i) === "keep current turn").length, 1);
+        assert.ok(items(page).some((i: any) => text(i) === "live output"));
+      }
+      // Explicit stale pagination still fails; only the internal boundary degrades.
+      await assert.rejects(c.grok.read(c.id, oldCursor));
+      assert.equal(c.calls.filter(call => call.method === "session/prompt").length, 1);
+      assert.equal(c.calls.filter(call => call.reply).length, 0);
+      c.grok.respond(requestId, "allowOnce");
+      assert.deepEqual(c.calls.find(call => call.reply === 43)?.result, { outcome: { outcome: "selected", optionId: "once" } });
+      const confirmed = await c.grok.interactions(c.id);
+      assert.equal(confirmed.items[0].decision, "allowOnce"); assert.equal(confirmed.items[0].available, false);
+    } finally { await c.grok.stop(); c.store.close(); }
+  }
 });
 
 test("shared cancellation and permission responses are scoped to the owned prompt", async () => {

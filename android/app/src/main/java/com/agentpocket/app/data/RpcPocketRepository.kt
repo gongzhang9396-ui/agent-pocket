@@ -34,6 +34,7 @@ import com.agentpocket.app.data.model.Role
 import com.agentpocket.app.data.model.StepStatus
 import com.agentpocket.app.data.model.ThreadDetail
 import com.agentpocket.app.data.model.ThreadExecution
+import com.agentpocket.app.data.model.ThreadModelOptions
 import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadSummary
@@ -173,6 +174,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val loadingProjects = mutableSetOf<String>()
     private val loadingModels = mutableSetOf<String>()
     private val metadataMutexes = mutableMapOf<String, Mutex>()
+    private val metadataSyncJobs = mutableMapOf<String, Job>()
     private val hostSyncMutexes = mutableMapOf<String, Mutex>()
     private val channels = mutableMapOf<String, ChannelState>()
     private val channelMutexes = mutableMapOf<String, Mutex>()
@@ -180,6 +182,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val ownedTurns = mutableMapOf<String, String>()
     private val questionCounts = mutableMapOf<String, Int>()
     private val pendingAnswers = mutableMapOf<String, MutableMap<String, String>>()
+    private val submittingInteractions = mutableSetOf<String>()
     private val deltaBuffers = mutableMapOf<Pair<String, String>, StringBuilder>()
     private val deltaJobs = mutableMapOf<Pair<String, String>, Job>()
     private val notificationRefs = mutableMapOf<String, String>()
@@ -193,6 +196,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val historySeenCursors = mutableMapOf<String, MutableSet<String>>()
     private val historyItemIds = mutableMapOf<String, Set<String>>()
     private val threadStateVersions = mutableMapOf<String, Long>()
+    private val interactionEventVersions = mutableMapOf<String, Long>()
+    private val approvalRecoveryAttempts = mutableMapOf<String, Long>()
     private val pendingThreadRefreshes = mutableSetOf<String>()
     private val unreadCounts = mutableMapOf<String, Int>()
     private var activeThreadKey: String? = null
@@ -560,6 +565,22 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         activeThreadKey?.let { key -> if (unreadCounts.remove(key) != null) refreshUnread(key) }
     }
 
+    override suspend fun refreshInteractions(threadId: String) {
+        val ref = runCatching { ThreadRef.parse(threadId) }.getOrNull() ?: return
+        if (hostInfos[ref.hostId]?.online != true || !hostSupports("interaction-snapshot-v1", ref.hostId)) return
+        try {
+            val result = innerCall(ref.hostId, "thread/interactions", obj("threadId" to ref.threadId)).requireObject("读取交互")
+            val flow = details[ref.encoded()] ?: return
+            val incoming = result.array("items").mapNotNull { it.asObject()?.let(::interactionFromJson) }
+            val replacements = incoming.associateBy { it.id }
+            val existingIds = flow.value.items.mapTo(mutableSetOf()) { it.id }
+            val updated = flow.value.items.map { item -> replacements[item.id]?.let { mergeInteractionSnapshot(item, it) } ?: item } +
+                incoming.filter { it.id !in existingIds }
+            flow.value = flow.value.copy(items = updated, execution = result.obj("execution")?.let { threadExecution(obj("execution" to it)) } ?: flow.value.execution)
+        } catch (error: CancellationException) { throw error }
+        catch (_: Throwable) { /* The connection and normal history refresh own recovery messages. */ }
+    }
+
     private fun bumpUnread(ref: ThreadRef) {
         val key = ref.encoded()
         if (key == activeThreadKey) return
@@ -708,18 +729,33 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         }
     }
 
-    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>) {
+    override suspend fun threadModelOptions(threadId: String): ThreadModelOptions {
+        val ref = resolveThreadRef(threadId, _selectedHostId.value) ?: error("任务缺少电脑上下文，请重新打开任务。")
+        if (!hostSupports("model-control-v1", ref.hostId)) return ThreadModelOptions(reason = "这台电脑尚未提供模型控制，请先更新 Host。")
+        val result = innerCall(ref.hostId, "thread/model-options", obj("threadId" to ref.threadId)).requireObject("读取会话模型")
+        return parseThreadModelOptions(result, if (ref.threadId.startsWith("grok:")) "grok" else "codex")
+    }
+
+    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>, modelId: String?, reasoningId: String?, onResult: (Boolean) -> Unit) {
         val ref = resolveThreadRef(threadId, _selectedHostId.value) ?: run {
             _actionError.value = "发送失败：任务缺少电脑上下文，请从任务列表重新打开"
+            onResult(false)
             return
         }
         val key = ref.encoded()
+        if ((modelId != null || reasoningId != null) && !hostSupports("model-control-v1", ref.hostId)) {
+            _actionError.value = "发送失败：请先更新这台电脑的 Host，再切换模型"
+            onResult(false)
+            return
+        }
         if ((images.isNotEmpty() || files.isNotEmpty()) && !hostSupports("attachments-v1", ref.hostId)) {
             _actionError.value = "发送失败：这台 Windows Host 版本过旧，不支持附件；请先覆盖更新 Host"
+            onResult(false)
             return
         }
         if (planMode && !hostSupports("plan-v1", ref.hostId)) {
             _actionError.value = "发送失败：这台 Windows Host 版本过旧，不支持 Plan 模式；请先覆盖更新 Host"
+            onResult(false)
             return
         }
         val effectiveText = text.ifBlank {
@@ -750,17 +786,18 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             runCatching {
                 val encoded = encodeAttachments(images, files)
                 val turnId = details[key]?.value?.activeTurnId
+                val overrides = turnModelOverride(modelId, reasoningId, turnId != null)
                 if (turnId == null) innerCall(
                     ref.hostId,
                     "turn/start",
-                    obj(
+                    JsonObject(obj(
                         "threadId" to ref.threadId,
                         "text" to effectiveText,
                         "mode" to (if (planMode) "plan" else null),
                         "images" to encoded.images,
                         "files" to encoded.files,
                         "clientMessageId" to messageId,
-                    ),
+                    ) + overrides),
                 )
                 else innerCall(
                     ref.hostId,
@@ -774,7 +811,11 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                         "clientMessageId" to messageId,
                     ),
                 )
-            }.onSuccess { updateMessageStatus(ref, messageId, MessageStatus.Done) }
+            }.onSuccess {
+                updateMessageStatus(ref, messageId, MessageStatus.Done)
+                scheduleThreadRefresh(ref)
+                onResult(true)
+            }
                 .onFailure { error ->
                     val currentStatus = details[key]?.value?.items
                         ?.filterIsInstance<TimelineItem.Message>()
@@ -784,6 +825,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                         updateMessageStatus(ref, messageId, MessageStatus.Failed)
                         _actionError.value = actionError("发送", error)
                     }
+                    onResult(!shouldMarkSendFailed(currentStatus))
                 }
         }
     }
@@ -796,30 +838,58 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     override fun resolveApproval(threadId: String, requestId: String, decision: ApprovalDecision) {
         val ref = ThreadRef.parse(threadId)
+        val actionKey = "${ref.encoded()}:$requestId"
+        if (!submittingInteractions.add(actionKey)) return
+        updateItem(ref, requestId) { if (it is TimelineItem.Approval) it.copy(submitting = true) else it }
         val value = when (decision) {
             ApprovalDecision.AllowOnce -> "allowOnce"
             ApprovalDecision.Deny -> "deny"
             ApprovalDecision.Cancel -> "cancel"
         }
         scope.launch {
-            runCatching { innerCall(ref.hostId, "approval/respond", obj("requestId" to requestId, "decision" to value)) }
-                .onSuccess { updateItem(ref, requestId) { (it as TimelineItem.Approval).copy(decision = decision) } }
+            try {
+                val result = innerCall(ref.hostId, "approval/respond", obj("requestId" to requestId, "decision" to value)).asObject()
+                val accepted = when (result?.string("decision")) { "allowOnce" -> ApprovalDecision.AllowOnce; "deny" -> ApprovalDecision.Deny; "cancel" -> ApprovalDecision.Cancel; else -> decision }
+                updateItem(ref, requestId) { if (it is TimelineItem.Approval) it.copy(decision = accepted, submitting = false) else it }
+                scheduleThreadRefresh(ref)
+            } catch (error: Throwable) {
+                updateItem(ref, requestId) { if (it is TimelineItem.Approval) it.copy(submitting = false) else it }
+                _actionError.value = actionError("提交审批", error)
+            } finally { submittingInteractions.remove(actionKey) }
         }
     }
 
     override fun answerQuestion(threadId: String, requestId: String, questionId: String, option: String) {
         val ref = ThreadRef.parse(threadId)
         val answerKey = "${ref.hostId}:$requestId"
+        val actionKey = "${ref.encoded()}:$requestId"
+        if (actionKey in submittingInteractions || option.isBlank() || option.length > 4000) return
         val collected = pendingAnswers.getOrPut(answerKey) { mutableMapOf() }
         collected[questionId] = option
         updateItem(ref, requestId) { item ->
-            if (item is TimelineItem.Question && item.questionId == questionId) item.copy(selectedOption = option) else item
+            if (item is TimelineItem.Question && item.questionId == questionId) item.copy(pendingOption = option) else item
         }
-        if (collected.size < (questionCounts[answerKey] ?: 1)) return
+        val questions = details[ref.encoded()]?.value?.items?.filterIsInstance<TimelineItem.Question>().orEmpty().filter { it.requestId == requestId }
+        if (questions.any { it.questionId !in collected }) return
+        submittingInteractions.add(actionKey)
+        updateItem(ref, requestId) { if (it is TimelineItem.Question) it.copy(submitting = true) else it }
+        val submitted = collected.toMap()
         val answers = buildJsonObject {
-            collected.forEach { (id, answer) -> put(id, buildJsonObject { put("answers", buildJsonArray { add(JsonPrimitive(answer)) }) }) }
+            submitted.forEach { (id, answer) -> put(id, buildJsonObject { put("answers", buildJsonArray { add(JsonPrimitive(answer)) }) }) }
         }
-        scope.launch { runCatching { innerCall(ref.hostId, "question/respond", buildJsonObject { put("requestId", requestId); put("answers", answers) }) } }
+        scope.launch {
+            try {
+                val result = innerCall(ref.hostId, "question/respond", buildJsonObject { put("threadId", ref.threadId); put("requestId", requestId); put("answers", answers) }).asObject()
+                updateItem(ref, requestId) { if (it is TimelineItem.Question) it.copy(selectedOption = result?.string("answer")?.takeIf { questions.size == 1 }
+                    ?: result?.obj("answers")?.obj(it.questionId)?.array("answers")?.mapNotNull { a -> (a as? JsonPrimitive)?.contentOrNull }?.joinToString("\n")
+                    ?: submitted[it.questionId], pendingOption = null, submitting = false) else it }
+                pendingAnswers.remove(answerKey)
+                scheduleThreadRefresh(ref)
+            } catch (error: Throwable) {
+                updateItem(ref, requestId) { if (it is TimelineItem.Question) it.copy(submitting = false) else it }
+                _actionError.value = actionError("提交回答", error)
+            } finally { submittingInteractions.remove(actionKey) }
+        }
     }
 
     override fun pairManually(wssUrl: String, pairingCode: String) {
@@ -851,6 +921,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         historySeenCursors.clear()
         historyItemIds.clear()
         threadStateVersions.clear()
+        interactionEventVersions.clear()
+        approvalRecoveryAttempts.clear()
         refreshJobs.forEach { it.cancel() }
         pendingThreadRefreshes.clear()
         unreadCounts.clear()
@@ -873,6 +945,9 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         modelErrorsByHost.clear()
         loadingProjects.clear()
         loadingModels.clear()
+        val metadataJobs = metadataSyncJobs.values.toList()
+        metadataSyncJobs.clear()
+        metadataJobs.forEach { it.cancel() }
         _projectsLoading.value = false
         _modelsLoading.value = false
         _projectsError.value = null
@@ -1023,8 +1098,9 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private suspend fun performFullSync() {
         _syncing.value = true
         try {
-            _syncStatus.value = "正在获取电脑与设备列表…"
+            _syncStatus.value = "正在获取电脑列表…"
             syncHosts()
+            _syncStatus.value = "正在同步任务列表…"
             val activeHost = activeThreadKey?.let { runCatching { ThreadRef.parse(it).hostId }.getOrNull() }
             val ids = hostInfos.keys.sortedBy { if (it == activeHost) 0 else 1 }
             supervisorScope {
@@ -1094,10 +1170,11 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             activeThreadKey?.let { runCatching { ThreadRef.parse(it) }.getOrNull() }
                 ?.takeIf { it.hostId == hostId }?.let { scheduleThreadRefresh(it, delayMs = 0) }
             retryPendingThreadRefreshes(hostId)
-            supervisorScope {
-                launch { attempt { syncThreads(hostId) } }
-                launch { attempt { syncHostMetadata(hostId) } }
-            }
+            // Project/model/runtime discovery is useful for task creation and
+            // settings, but it must not hold the inbox's global refresh spinner.
+            // It has its own loading/error state and continues in the background.
+            scheduleHostMetadataSync(hostId)
+            if (!attempt { syncThreads(hostId) }) return
             val action = "同步 ${hostInfos[hostId]?.name ?: "目标电脑"}"
             failure?.let { _actionError.value = "$action 失败：${it.message}" }
                 ?: clearActionError(action)
@@ -1114,6 +1191,19 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             capabilitiesByHost[hostId] = hello.array("capabilities")
                 .mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
                 .toSet()
+    }
+
+    private fun scheduleHostMetadataSync(hostId: String) {
+        if (metadataSyncJobs[hostId]?.isActive == true) return
+        metadataSyncJobs[hostId] = scope.launch {
+            try {
+                syncHostMetadata(hostId)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                _actionError.value = actionError("读取电脑信息", error)
+            }
+        }
     }
 
     private suspend fun syncHostMetadata(hostId: String) = metadataMutexes.getOrPut(hostId) { Mutex() }.withLock {
@@ -1298,12 +1388,27 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     }
 
     private suspend fun syncThreads(hostId: String) {
-        if (hostSupports("grok-native-v1", hostId)) {
+        if (hostSupports("agents-v1", hostId)) {
             supervisorScope {
                 val codexJob = launch {
                     try {
-                        val result = innerCall(hostId, "thread/list", obj("agentId" to "codex")).requireObject("Codex 任务列表")
-                        val codex = result.array("data").mapNotNull { it.asObject()?.let { value -> summaryFromJson(hostId, value) } }.filterNot { it.archived }
+                        val codex = collectCatalogPages(
+                            label = "Codex",
+                            loadPage = { cursor ->
+                                val result = innerCall(hostId, "thread/list", buildJsonObject {
+                                    put("agentId", "codex")
+                                    put("limit", 200)
+                                    cursor?.let { put("cursor", it) }
+                                }).requireObject("Codex 任务列表")
+                                CatalogPage(
+                                    rows = result.array("data")
+                                        .mapNotNull { it.asObject()?.let { value -> summaryFromJson(hostId, value) } }
+                                        .filterNot { it.archived },
+                                    nextCursor = result.string("nextCursor"),
+                                )
+                            },
+                            keyOf = { it.id },
+                        )
                         threadLists[hostId] = threadLists[hostId].orEmpty().filter { it.execution.backend == "grok" } + codex
                         updateVisibleThreads()
                     } catch (error: CancellationException) { throw error }
@@ -1313,28 +1418,45 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             }
             return
         }
-        val result = innerCall(hostId, "thread/list").requireObject("任务列表")
-        threadLists[hostId] = result.array("data")
-            .mapNotNull { it.asObject()?.let { value -> summaryFromJson(hostId, value) } }
-            .filterNot { it.archived }
+        val rows = collectCatalogPages(
+            label = "任务",
+            loadPage = { cursor ->
+                val result = innerCall(hostId, "thread/list", buildJsonObject {
+                    put("limit", 200)
+                    cursor?.let { put("cursor", it) }
+                }).requireObject("任务列表")
+                CatalogPage(
+                    rows = result.array("data")
+                        .mapNotNull { it.asObject()?.let { value -> summaryFromJson(hostId, value) } }
+                        .filterNot { it.archived },
+                    nextCursor = result.string("nextCursor"),
+                )
+            },
+            keyOf = { it.id },
+        )
+        threadLists[hostId] = rows
         updateVisibleThreads()
     }
 
     private suspend fun syncGrokThreads(hostId: String) = grokListMutexes.getOrPut(hostId) { Mutex() }.withLock {
-        val rows = mutableListOf<ThreadSummary>()
-        val seen = mutableSetOf<String>()
-        var cursor: String? = null
-        do {
-            val result = innerCall(hostId, "thread/list", buildJsonObject {
-                put("agentId", "grok"); put("limit", 200)
-                cursor?.let { put("cursor", it) }
-            }).requireObject("Grok 任务列表")
-            rows += result.array("data").mapNotNull { it.asObject()?.let { value -> summaryFromJson(hostId, value) } }
-                .filter { !it.archived && it.execution.backend == "grok" }
-            cursor = result.string("nextCursor")?.takeIf { it.isNotBlank() }
-            if (cursor != null && (!seen.add(cursor!!) || seen.size > 60)) error("Grok 目录分页异常，请刷新重试")
-        } while (cursor != null)
-        threadLists[hostId] = threadLists[hostId].orEmpty().filter { it.execution.backend != "grok" } + rows.distinctBy { it.id }
+        val rows = collectCatalogPages(
+            label = "Grok",
+            loadPage = { cursor ->
+                val result = innerCall(hostId, "thread/list", buildJsonObject {
+                    put("agentId", "grok")
+                    put("limit", 200)
+                    cursor?.let { put("cursor", it) }
+                }).requireObject("Grok 任务列表")
+                CatalogPage(
+                    rows = result.array("data")
+                        .mapNotNull { it.asObject()?.let { value -> summaryFromJson(hostId, value) } }
+                        .filter { !it.archived && it.execution.backend == "grok" },
+                    nextCursor = result.string("nextCursor"),
+                )
+            },
+            keyOf = { it.id },
+        )
+        threadLists[hostId] = threadLists[hostId].orEmpty().filter { it.execution.backend != "grok" } + rows
         updateVisibleThreads()
     }
 
@@ -1372,7 +1494,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         val baselineItems = flow.value.items
         val baselineStatus = flow.value.status
         val baselineTurn = flow.value.activeTurnId
-        val baselineStateVersion = threadStateVersions[key] ?: 0
+        val baselineStateVersion = threadStateVersions[key] ?: 0L
         _refreshingThreads.value = _refreshingThreads.value + key
         try {
             // Only one page per request. The newest messages become usable as
@@ -1412,7 +1534,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 if (!earlier) historySeenCursors.remove(key)
                 cursor?.let { historySeenCursors.getOrPut(key) { mutableSetOf() }.add(it) }
             }
-            val stateChangedDuringRead = (threadStateVersions[key] ?: 0) != baselineStateVersion ||
+            val stateChangedDuringRead = !sameThreadVersion(baselineStateVersion, threadStateVersions[key]) ||
                 current.status != baselineStatus || current.activeTurnId != baselineTurn
             flow.value = ThreadDetail(
                 id = ref.threadId,
@@ -1436,9 +1558,13 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         } catch (error: Throwable) {
             val transient = isTransientConnectionFailure(error) || hostInfos[ref.hostId]?.online != true
             if (transient) pendingThreadRefreshes += key
-            val message = if (transient) "连接暂时中断，正在自动恢复任务内容…" else actionError("读取任务", error)
+            if (ref.threadId.startsWith("grok:")) android.util.Log.i("PocketRecovery", "history error code=${(error as? BridgeRpcException)?.nameCode} transient=$transient")
+            val recovered = !transient && ref.threadId.startsWith("grok:") && error is BridgeRpcException &&
+                error.nameCode in setOf("HISTORY_CHANGED", "HISTORY_UNAVAILABLE", "INVALID_REQUEST") && recoverLegacyGrokApprovals(ref)
+            val message = if (recovered) "旧版 Host 暂时无法读取这段历史，待处理审批已恢复，可在下方操作。"
+                else if (transient) "连接暂时中断，正在自动恢复任务内容…" else actionError("读取任务", error)
             flow.value = flow.value.copy(loading = false, loadError = message)
-            if (!transient) _actionError.value = message
+            if (recovered) clearActionError("读取任务") else if (!transient) _actionError.value = message
         } finally {
             flow.value = flow.value.copy(loading = false, loadingEarlier = false)
             _refreshingThreads.value = _refreshingThreads.value - key
@@ -1450,6 +1576,40 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             .mapNotNull { runCatching { ThreadRef.parse(it) }.getOrNull() }
             .filter { it.hostId == hostId }
             .forEach { scheduleThreadRefresh(it, delayMs = 0) }
+    }
+
+    private suspend fun recoverLegacyGrokApprovals(ref: ThreadRef): Boolean {
+        val key = ref.encoded()
+        fun hasPending() = details[key]?.value?.items?.any { it is TimelineItem.Approval && it.available && it.decision == null } == true
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - (approvalRecoveryAttempts[key] ?: -10_000L) < 10_000) return hasPending()
+        approvalRecoveryAttempts[key] = now
+        val credentials = secure.load()?.takeIf { it.approved } ?: return false
+        val version = interactionEventVersions[key] ?: 0L
+        try {
+            // Older hosts have no independent interaction snapshot. The retained
+            // encrypted events can restore controls without rewinding lastSeq or
+            // appending ordinary streaming messages a second time.
+            val stored = outerCall("event/replay", obj("hostId" to ref.hostId, "lastSeq" to 0)) as? JsonArray ?: return false
+            android.util.Log.i("PocketRecovery", "retained events=${stored.size}")
+            val recovered = withContext(Dispatchers.Default) {
+                recoverEncryptedGrokApprovals(credentials.accountId, ref.hostId, ref.threadId, stored) { envelope ->
+                    RelayCrypto.decryptAccountEnvelope(envelope, credentials.contentKey!!)
+                }
+            }
+            if (!sameThreadVersion(version, interactionEventVersions[key]) || secure.load()?.accountId != credentials.accountId) {
+                android.util.Log.i("PocketRecovery", "snapshot superseded by newer state")
+                return hasPending()
+            }
+            val flow = details[key] ?: return false
+            flow.value = flow.value.copy(items = mergeRecoveredGrokApprovals(flow.value.items, recovered))
+            android.util.Log.i("PocketRecovery", "recovered controls=${recovered.size} pending=${hasPending()}")
+            return hasPending()
+        } catch (error: CancellationException) { throw error }
+        catch (error: Throwable) {
+            android.util.Log.w("PocketRecovery", "recovery failed type=${error.javaClass.simpleName} code=${(error as? BridgeRpcException)?.nameCode} site=${error.stackTrace.firstOrNull()}")
+            return hasPending()
+        }
     }
 
     private suspend fun ensureChannel(hostId: String): ChannelState = channelMutexes.getOrPut(hostId) { Mutex() }.withLock {
@@ -1525,7 +1685,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 val id = response.long("id") ?: return
                 val pending = innerPending.remove(envelope.channelId to id) ?: return
                 response.obj("error")?.let { error ->
-                    pending.completeExceptionally(BridgeRpcException(error.string("message") ?: "Host 请求失败", error.string("code") ?: error.obj("data")?.string("name")))
+                    pending.completeExceptionally(bridgeRpcError(error, "Host 请求失败"))
                 } ?: pending.complete(response["result"] ?: JsonNull)
             }
             "channel/close" -> params.string("channelId")?.let { channelId ->
@@ -1634,6 +1794,18 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         val ref = rawThreadId?.let { ThreadRef(hostId, it) }
         val turnId = event.string("turnId")
         val payload = event.obj("payload") ?: JsonObject(emptyMap())
+        if (ref != null && type in grokInteractionEventTypes) {
+            val key = ref.encoded()
+            interactionEventVersions[key] = (interactionEventVersions[key] ?: 0L) + 1
+            if (ref.threadId.startsWith("grok:") && (type == "sync.required" && payload.string("reason") == "approval-resolved" ||
+                    type == "turn.status" && payload.string("status") in setOf("completed", "idle", "failed", "interrupted", "systemError"))) {
+                val requestId = if (type == "sync.required") payload.string("requestId") else null
+                details[key]?.let { flow -> flow.value = flow.value.copy(items = flow.value.items.map { item ->
+                    if (item is TimelineItem.Approval && (requestId == null || item.requestId == requestId))
+                        closeRecoveredApproval(item, if (type == "sync.required") payload.string("decision") else null) else item
+                }) }
+            }
+        }
         when (type) {
             "grok.catalog.updated" -> {
                 scheduleGrokListSync(hostId)
@@ -1650,7 +1822,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             "turn.status" -> if (ref != null) applyTurnStatus(ref, turnId, payload)
             // 全量拉取不再阻塞事件游标：改为防抖后的后台校正。
             "sync.required" -> if (ref != null) {
-                if (payload.string("source") == "desktop") setThreadExecution(ref, ThreadExecution.desktop("desktop"))
+                if (payload.string("source") == "desktop" && details[ref.encoded()]?.value?.execution?.backend != "desktop") setThreadExecution(ref, ThreadExecution.desktop("desktop"))
                 scheduleThreadRefresh(ref)
             } else scheduleHostSync(hostId)
         }
@@ -1735,7 +1907,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private fun applyApproval(ref: ThreadRef, payload: JsonObject) {
         val requestId = payload.string("requestId") ?: return
-        upsert(ref, TimelineItem.Approval(payload.string("id") ?: requestId, requestId, payload.string("reason") ?: "Agent 请求允许一次", payload.commandText().orEmpty(), payload.string("cwd").orEmpty()))
+        val native = interactionFromJson(payload) as? TimelineItem.Approval
+        upsert(ref, native ?: TimelineItem.Approval(requestId, requestId, payload.string("reason") ?: "Agent 请求允许一次", payload.commandText().orEmpty(), payload.string("cwd").orEmpty()))
         setThreadStatus(ref, ThreadStatus.NeedsAttention)
     }
 
@@ -1755,7 +1928,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         val key = ref.encoded()
         val status = payload.string("status") ?: payload.obj("status")?.string("type")
         val flow = details.getOrPut(key) { MutableStateFlow(emptyDetail(ref)) }
-        if (payload.string("source") == "desktop") setThreadExecution(ref, ThreadExecution.desktop("desktop"))
+        if (payload.string("source") == "desktop" && flow.value.execution.backend != "desktop") setThreadExecution(ref, ThreadExecution.desktop("desktop"))
         val desktopOwned = flow.value.execution.backend == "desktop"
         when (status) {
             "started", "active" -> {
@@ -1807,6 +1980,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             if (turn.string("status") == "inProgress") activeTurn = turn.string("id")
             turn.array("items").forEach { item -> item.asObject()?.let { itemFromJson(it)?.let(items::add) } }
         }
+        thread.array("interactionItems").forEach { item -> item.asObject()?.let { interactionFromJson(it)?.let(items::add) } }
         return ParsedThreadDetail(
             title = thread.string("name") ?: "未命名任务",
             cwd = thread.string("cwd").orEmpty(),
@@ -1818,9 +1992,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     }
 
     private fun itemFromJson(item: JsonObject): TimelineItem? = when (item.string("type")) {
-        "pocketApproval" -> TimelineItem.Approval(item.string("id").orEmpty(), item.string("requestId").orEmpty(),
-            item.string("summary").orEmpty(), item.string("command").orEmpty(), item.string("cwd").orEmpty(),
-            when (item.string("decision")) { "allowOnce" -> ApprovalDecision.AllowOnce; "deny" -> ApprovalDecision.Deny; "cancel" -> ApprovalDecision.Cancel; else -> null })
+        "pocketApproval", "pocketQuestion" -> interactionFromJson(item)
         "userMessage" -> TimelineItem.Message(item.string("id").orEmpty(), Role.User, displayUserText(item.array("content").mapNotNull { it.asObject()?.string("text") }.joinToString("\n")), MessageStatus.Done)
         "agentMessage" -> TimelineItem.Message(item.string("id").orEmpty(), Role.Assistant, item.string("text").orEmpty(), MessageStatus.Done)
         // Plan 文档是完整 markdown，按助手消息渲染而不是居中系统提示。
@@ -1834,7 +2006,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private fun upsert(ref: ThreadRef, item: TimelineItem) {
         val flow = details.getOrPut(ref.encoded()) { MutableStateFlow(emptyDetail(ref)) }
-        flow.value = flow.value.copy(items = if (flow.value.items.any { it.id == item.id }) flow.value.items.map { if (it.id == item.id) item else it } else flow.value.items + item)
+        flow.value = flow.value.copy(items = if (flow.value.items.any { it.id == item.id }) flow.value.items.map { if (it.id == item.id) mergeInteractionEvent(it, item) else it } else flow.value.items + item)
     }
 
     private fun updateItem(ref: ThreadRef, requestId: String, transform: (TimelineItem) -> TimelineItem) {
@@ -1852,7 +2024,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private fun setThreadStatus(ref: ThreadRef, status: ThreadStatus) {
         val key = ref.encoded()
-        threadStateVersions[key] = (threadStateVersions[key] ?: 0) + 1
+        threadStateVersions[key] = (threadStateVersions[key] ?: 0L) + 1
         threadLists[ref.hostId] = threadLists[ref.hostId].orEmpty().map { if (it.id == ref.threadId) it.copy(status = status) else it }
         details[ref.encoded()]?.let { it.value = it.value.copy(status = status) }
         updateVisibleThreads()
@@ -2210,15 +2382,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         updateVisibleThreads()
     }
 
-    private fun modelFromJson(element: JsonElement): ModelOption? {
-        val model = element.asObject() ?: return null
-        val efforts = model.array("supportedReasoningEfforts").mapNotNull { it.asObject() }.map {
-            val id = it.string("reasoningEffort").orEmpty()
-            ReasoningOption(id, effortLabel(id), it.string("description").orEmpty())
-        }
-        if (model.string("id").isNullOrBlank()) return null
-        return ModelOption(model.string("id").orEmpty(), model.string("displayName") ?: model.string("id").orEmpty(), model.string("description").orEmpty(), efforts, model.string("agentId") ?: "codex")
-    }
+    private fun modelFromJson(element: JsonElement): ModelOption? = modelOptionFromJson(element)
 
     private fun parseDiff(text: String, truncated: Boolean): List<DiffFile> {
         data class MutableFile(var path: String, var status: DiffFileStatus = DiffFileStatus.Modified, val hunks: MutableList<DiffHunk> = mutableListOf())

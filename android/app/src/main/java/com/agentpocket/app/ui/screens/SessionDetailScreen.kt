@@ -83,7 +83,13 @@ import com.agentpocket.app.data.model.TimelineItem
 import com.agentpocket.app.ui.components.PendingAttachmentStrip
 import com.agentpocket.app.ui.components.PendingFileList
 import com.agentpocket.app.ui.components.ThreadStatusChip
+import com.agentpocket.app.ui.components.ThreadModelControl
 import com.agentpocket.app.ui.components.TimelineItemContent
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import com.agentpocket.app.ui.components.rememberFilePicker
 import com.agentpocket.app.ui.components.rememberImagePicker
 import com.agentpocket.app.ui.theme.AgentPocketTheme
@@ -143,6 +149,16 @@ fun SessionDetailScreen(
     val desktopOwned = execution.backend == "desktop" || detail.status == ThreadStatus.DesktopOwned
     val readOnly = !execution.send || detail.status == ThreadStatus.ExternalBusy
     val running = detail.activeTurnId != null
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val interactionSupported = repo.hostSupports("interaction-snapshot-v1", threadHostId)
+    LaunchedEffect(repo, threadId, lifecycleOwner, interactionSupported) {
+        if (interactionSupported) lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive) {
+                repo.refreshInteractions(threadId)
+                delay(4_000)
+            }
+        }
+    }
 
     fun openGoalDialog() {
         goalDialogOpen = true
@@ -299,6 +315,8 @@ fun SessionDetailScreen(
         bottomBar = {
             key(threadId) {
             Composer(
+                repo = repo,
+                threadId = threadId,
                 running = running,
                 desktopOwned = desktopOwned,
                 readOnly = readOnly,
@@ -310,9 +328,9 @@ fun SessionDetailScreen(
                 attachmentsSupported = attachmentsSupported,
                 planSupported = planSupported && execution.plan,
                 errorMessage = actionError,
-                onSend = { text, planMode, images, files ->
+                onSend = { text, planMode, images, files, modelId, reasoningId, onResult ->
                     followTail = true
-                    repo.sendSteer(threadId, text, planMode, images, files)
+                    repo.sendSteer(threadId, text, planMode, images, files, modelId, reasoningId, onResult)
                 },
                 onInterrupt = { repo.interruptTurn(threadId) },
             )
@@ -441,7 +459,7 @@ fun SessionDetailScreen(
         AlertDialog(
             onDismissRequest = { handoffDialogOpen = false },
             title = { Text("在电脑继续") },
-            text = { Text("释放当前任务后，可以在 Codex Desktop 打开同一个任务。手机仍可追加消息；中断、审批和问题回答转到电脑处理。") },
+            text = { Text("释放当前任务后，可以在 Codex Desktop 打开同一个任务。手机仍可追加消息、回答异步提问；中断和执行审批需在电脑处理。") },
             confirmButton = {
                 TextButton(onClick = {
                     handoffDialogOpen = false
@@ -504,6 +522,8 @@ fun SessionDetailScreen(
 
 @Composable
 private fun Composer(
+    repo: PocketRepository,
+    threadId: String,
     running: Boolean,
     desktopOwned: Boolean,
     readOnly: Boolean,
@@ -515,11 +535,14 @@ private fun Composer(
     attachmentsSupported: Boolean,
     planSupported: Boolean,
     errorMessage: String?,
-    onSend: (String, Boolean, List<Uri>, List<Uri>) -> Unit,
+    onSend: (String, Boolean, List<Uri>, List<Uri>, String?, String?, (Boolean) -> Unit) -> Unit,
     onInterrupt: () -> Unit,
 ) {
     var text by rememberSaveable { mutableStateOf("") }
     var planMode by rememberSaveable { mutableStateOf(false) }
+    var modelId by rememberSaveable { mutableStateOf<String?>(null) }
+    var reasoningId by rememberSaveable { mutableStateOf<String?>(null) }
+    var sending by remember { mutableStateOf(false) }
     var attachmentMenuOpen by remember { mutableStateOf(false) }
     var imageAttachments by rememberSaveable { mutableStateOf(listOf<Uri>()) }
     var fileAttachments by rememberSaveable { mutableStateOf(listOf<Uri>()) }
@@ -532,11 +555,16 @@ private fun Composer(
     Surface(color = MaterialTheme.colorScheme.surface) {
         Column(Modifier.imePadding().navigationBarsPadding()) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            ThreadModelControl(repo, threadId, running, busy || sending, readOnly, desktopOwned, modelId, reasoningId) { model, effort ->
+                modelId = model; reasoningId = effort
+            }
+            if (running && modelId != null) Text("所选模型将在本轮结束后发送时使用；选择“沿用会话”可继续追加指令。",
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
             if (busy) Text("正在交接任务…", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
             if (running && !canSteer) Text(statusMessage ?: "Grok 正在执行；完成或中断后可以继续发送。", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
             if (desktopOwned) {
                 Text(
-                    "由 Desktop 执行 · 可追加消息，审批与中断在电脑处理",
+                    "电脑执行 · 可回答异步提问，执行审批与中断需在电脑处理",
                     style = MaterialTheme.typography.labelSmall,
                     color = StatusColors.external,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -628,7 +656,7 @@ private fun Composer(
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
-                    enabled = !readOnly && !busy,
+                    enabled = !readOnly && !busy && !sending,
                     placeholder = {
                         Text(
                             if (running && !canSteer) "先写下下一条消息…" else if (running) "补充想法，调整当前任务…" else "继续对话…",
@@ -656,16 +684,24 @@ private fun Composer(
                 FilledIconButton(
                     onClick = {
                         if (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()) {
-                            onSend(text.trim(), planMode, imageAttachments, fileAttachments)
-                            text = ""
-                            planMode = false
-                            imageAttachments = emptyList()
-                            fileAttachments = emptyList()
+                            sending = true
+                            onSend(text.trim(), planMode, imageAttachments, fileAttachments, modelId, reasoningId) { accepted ->
+                                sending = false
+                                if (accepted) {
+                                    text = ""
+                                    planMode = false
+                                    imageAttachments = emptyList()
+                                    fileAttachments = emptyList()
+                                    modelId = null
+                                    reasoningId = null
+                                }
+                            }
                         }
                     },
-                    enabled = !readOnly && !busy && (!running || canSteer) && (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()),
+                    enabled = !readOnly && !busy && !sending && (!running || (canSteer && modelId == null)) && (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()),
                 ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+                    if (sending) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }
             }
         }

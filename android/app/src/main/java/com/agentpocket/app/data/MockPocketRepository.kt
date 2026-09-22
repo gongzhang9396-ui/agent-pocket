@@ -653,7 +653,11 @@ object MockPocketRepository : PocketRepository {
         onCreated(id)
     }
 
-    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>) {
+    override suspend fun threadModelOptions(threadId: String) = com.agentpocket.app.data.model.ThreadModelOptions(
+        models = models.value, currentModelId = models.value.firstOrNull()?.id, currentReasoningId = "high", controlScope = "thread",
+    )
+
+    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>, modelId: String?, reasoningId: String?, onResult: (Boolean) -> Unit) {
         updateDetail(threadId) { detail ->
             val n = detail.items.size
             detail.copy(
@@ -673,6 +677,7 @@ object MockPocketRepository : PocketRepository {
                 ),
             )
         }
+        onResult(true)
     }
 
     override fun interruptTurn(threadId: String) {

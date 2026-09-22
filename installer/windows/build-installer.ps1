@@ -110,6 +110,7 @@ $bridgeFiles = @(
     'src\codex-pool.ts',
     'src\config.ts',
     'src\desktop-attach.ts',
+    'src\desktop-questions.ts',
     'src\fcm.ts',
     'src\host-updater.ts',
     'src\protocol.ts',
@@ -133,6 +134,7 @@ Copy-AllowlistedFiles (Join-Path $repoRoot 'desktop-attach-plugin') $pluginStage
     '.codex-plugin\plugin.json',
     '.mcp.json',
     'hooks\hooks.json',
+    'rollout-reader.mjs',
     'server.mjs'
 )
 $scriptsStage = Join-Path $payload 'scripts'

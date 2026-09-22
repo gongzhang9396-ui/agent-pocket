@@ -93,6 +93,7 @@ fun InboxScreen(
     val agents by repo.agents.collectAsState()
     val syncing by repo.syncing.collectAsState()
     val syncStatus by repo.syncStatus.collectAsState()
+    val showInitialSync = syncing && threads.isEmpty()
     val filteredThreads = remember(threads, selectedAgentId) {
         threads.filter { selectedAgentId == null || AgentRegistry.forBackend(it.execution.backend).kind.id == selectedAgentId }
     }
@@ -123,8 +124,9 @@ fun InboxScreen(
                         }
                     },
                     actions = {
-                        if (syncing) {
-                            // 刷新中的小反馈：不占布局、不推挤列表。
+                        if (showInitialSync) {
+                            // 仅在没有任何可用缓存时使用持续动画。已有列表
+                            // 时保留静态刷新按钮，避免后台校正看起来像卡死。
                             CircularProgressIndicator(
                                 modifier = Modifier
                                     .padding(horizontal = 14.dp)
@@ -132,8 +134,8 @@ fun InboxScreen(
                                 strokeWidth = 2.dp,
                             )
                         } else {
-                            IconButton(onClick = { repo.refreshAll() }) {
-                                Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                            IconButton(onClick = { repo.refreshAll() }, enabled = !syncing) {
+                                Icon(Icons.Filled.Refresh, contentDescription = if (syncing) "正在刷新" else "刷新")
                             }
                         }
                         IconButton(onClick = onOpenSettings) {
@@ -165,7 +167,7 @@ fun InboxScreen(
                 .padding(padding),
         ) {
             PullToRefreshBox(
-                isRefreshing = syncing,
+                isRefreshing = showInitialSync,
                 onRefresh = { repo.refreshAll() },
                 modifier = Modifier
                     .fillMaxSize(),

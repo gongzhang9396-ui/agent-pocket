@@ -33,7 +33,7 @@ const IPC_PROTOCOL_VERSION = 1;
 const PLUGIN_VERSION = "0.3.2";
 const BRIDGE_HOST_MODE = process.argv.includes("--bridge-host");
 const SERVER_PATH = fileURLToPath(import.meta.url);
-const BRIDGE_CAPABILITIES = ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/wait"];
+const BRIDGE_CAPABILITIES = ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/send-model-v1", "thread/wait"];
 const DESKTOP_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 let host;
@@ -241,13 +241,16 @@ function readDesktopTask(threadId, turnLimit, cursor, context) {
   );
 }
 
-async function sendDesktopMessage(threadId, text, context) {
-  if (process.env.AGENT_POCKET_CODEX_QUEUE_DISABLED !== "1") {
-    await queueCodexMessage(threadId, text);
-    return [{ type: "inputText", text: JSON.stringify({ queued: true }) }];
+async function sendDesktopMessage(threadId, text, model, effort, context) {
+  if (model || effort || process.env.AGENT_POCKET_CODEX_QUEUE_DISABLED === "1") {
+    const sendContext = await desktopCallerContext(threadId, context, "send");
+    const args = { threadId, prompt: text };
+    if (model) args.model = model;
+    if (effort) args.thinking = effort;
+    return callDesktopTool("send_message_to_thread", args, sendContext);
   }
-  const sendContext = await desktopCallerContext(threadId, context, "send");
-  return callDesktopTool("send_message_to_thread", { threadId, prompt: text }, sendContext);
+  await queueCodexMessage(threadId, text);
+  return [{ type: "inputText", text: JSON.stringify({ queued: true }) }];
 }
 
 function queueCodexMessage(threadId, text) {
@@ -255,7 +258,8 @@ function queueCodexMessage(threadId, text) {
     return Promise.reject(new Error(`Desktop message must not exceed ${MAX_CODEX_QUEUE_MESSAGE_CHARS} characters`));
   }
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn("codex", ["queue", "--thread", threadId, "--message", text], {
+    const args = ["queue", "--thread", threadId, "--message", text];
+    const child = spawn("codex", args, {
       cwd: dirname(SERVER_PATH),
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -335,9 +339,9 @@ async function createDesktopThread(cwd, text, model, effort, workspaceMode, cont
   // fail on third-party HTTP model channels (previous_response_id needs the
   // official Responses WebSocket v2), sometimes recovering by itself and
   // sometimes staying dead. The thread exists either way, so never throw:
-  // confirm the failure with a second sample, then re-deliver the prompt as
-  // a standard queued user turn — the stateless path that works on any
-  // channel — instead of returning a dead task.
+  // confirm the failure with a second sample, then re-deliver the prompt
+  // through the same routing rules as a follow-up turn instead of returning
+  // a dead task. This preserves an explicit per-turn model selection.
   const verification = await waitDesktopThread(
     threadId,
     undefined,
@@ -359,10 +363,16 @@ async function createDesktopThread(cwd, text, model, effort, workspaceMode, cont
         : false;
     if (!recovered) {
       try {
-        await queueCodexMessage(threadId, text);
-        warning = "Desktop bootstrap turn failed; the prompt was re-queued as a standard user turn and should run shortly";
+        await sendDesktopMessage(
+          threadId,
+          text,
+          model,
+          effort,
+          subcallContext(context, "create-recover"),
+        );
+        warning = "Desktop bootstrap turn failed; the prompt was re-delivered as a follow-up turn and should run shortly";
       } catch (error) {
-        warning = `Desktop bootstrap turn failed and automatic re-queue also failed: ${error instanceof Error ? error.message : error}`;
+        warning = `Desktop bootstrap turn failed and automatic re-delivery also failed: ${error instanceof Error ? error.message : error}`;
       }
     }
   }
@@ -972,14 +982,19 @@ async function handleBridgeMessage(socket, line, token, isAuthenticated, markAut
     if (message.method === "thread/send") {
       const threadId = message.params?.threadId;
       const text = message.params?.text;
+      const model = optionalTrimmedString(message.params?.model, "model", 200);
+      const effort = optionalTrimmedString(message.params?.effort, "effort", 32);
       if (typeof threadId !== "string" || !threadId.trim() || threadId.length > 128) {
         throw new Error("threadId is required");
       }
       if (typeof text !== "string" || !text.trim() || text.length > MAX_PROMPT_CHARS) {
         throw new Error("text is required and must not exceed 1 MiB");
       }
+      if (effort && !DESKTOP_REASONING_EFFORTS.has(effort)) {
+        throw new Error("effort is not supported by Codex Desktop");
+      }
       return writeBridgeResult(socket, message.id, {
-        contentItems: await sendDesktopMessage(threadId.trim(), text.trim(), context),
+        contentItems: await sendDesktopMessage(threadId.trim(), text.trim(), model, effort, context),
       });
     }
     if (message.method === "thread/wait") {

@@ -19,6 +19,8 @@ import com.agentpocket.app.data.model.Role
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.data.model.ThreadExecution
 import com.agentpocket.app.data.model.ModelOption
+import com.agentpocket.app.data.model.ReasoningOption
+import com.agentpocket.app.data.model.ThreadModelOptions
 import com.agentpocket.app.data.model.AgentAvailability
 import com.agentpocket.app.data.model.HostRuntime
 import com.agentpocket.app.data.model.DesktopRuntimeState
@@ -41,12 +43,14 @@ class UiPreviewActivity : ComponentActivity() {
         val apiPreview = intent.getStringExtra("screen") == "api"
         val grokPreview = intent.getStringExtra("screen") == "grok"
         val grokInboxPreview = intent.getStringExtra("screen") == "grok-inbox"
-        val repository = if (streaming) StreamingPreviewRepository(lifecycleScope) else if (grokPreview || grokInboxPreview) GrokPreviewRepository else if (apiPreview) ApiPreviewRepository else MockPocketRepository
+        val grokModelsPreview = intent.getStringExtra("screen") == "grok-models"
+        val interactionPreview = intent.getStringExtra("screen") == "interactions"
+        val repository = if (interactionPreview) InteractionPreviewRepository(lifecycleScope) else if (streaming) StreamingPreviewRepository(lifecycleScope) else if (grokPreview || grokInboxPreview || grokModelsPreview) GrokPreviewRepository else if (apiPreview) ApiPreviewRepository else MockPocketRepository
         setContent {
             var selectedAgentId by remember { mutableStateOf<String?>(null) }
             var newTaskAgentId by remember { mutableStateOf<String?>(null) }
             var thread by remember {
-                mutableStateOf(if (streaming || intent.getStringExtra("screen") == "chat") "t-payment-tests" else null)
+                mutableStateOf(if (grokModelsPreview) "grok:preview" else if (interactionPreview || streaming || intent.getStringExtra("screen") == "chat") "t-payment-tests" else null)
             }
             BackHandler(enabled = thread != null || newTaskAgentId != null) {
                 if (newTaskAgentId != null) newTaskAgentId = null else thread = null
@@ -88,6 +92,25 @@ private object ApiPreviewRepository : PocketRepository by MockPocketRepository {
     )))
 }
 
+private class InteractionPreviewRepository(private val scope: CoroutineScope) : PocketRepository by MockPocketRepository {
+    private val state = MutableStateFlow(MockPocketRepository.threadDetail("t-payment-tests").value.copy(
+        title = "Desktop 问答界面验证", activeTurnId = "preview-turn", status = ThreadStatus.Active,
+        execution = ThreadExecution.desktop("desktop").copy(question = true),
+        items = listOf(
+            TimelineItem.Approval("preview-approval", "preview-approval", "Desktop 执行审批需要在电脑处理", "echo preview", "C:/Preview", available = false),
+            TimelineItem.Question("preview-question", "preview-question", "q", "接下来的模型控制，你希望怎样设置？", listOf("沿用当前会话", "发送时选择模型")),
+        ),
+    ))
+    override fun threadDetail(threadId: String) = state
+    override fun answerQuestion(threadId: String, requestId: String, questionId: String, option: String) {
+        scope.launch {
+            state.value = state.value.copy(items = state.value.items.map { if (it is TimelineItem.Question) it.copy(submitting = true) else it })
+            delay(500)
+            state.value = state.value.copy(items = state.value.items.map { if (it is TimelineItem.Question) it.copy(selectedOption = option, submitting = false) else it })
+        }
+    }
+}
+
 private object GrokPreviewRepository : PocketRepository by MockPocketRepository {
     override val agents = MutableStateFlow(listOf(AgentAvailability("codex", true), AgentAvailability("grok", true, version = "fixture")))
     override val models = MutableStateFlow(MockPocketRepository.models.value + ModelOption("grok-fixture", "Grok 测试模型", "界面假数据，不会调用模型", emptyList(), "grok"))
@@ -106,6 +129,12 @@ private object GrokPreviewRepository : PocketRepository by MockPocketRepository 
         items = listOf(TimelineItem.Message("grok-preview-reply", Role.Assistant, "Grok 项目与对话入口可用。这是本地界面预览。", MessageStatus.Done)),
     ))
     override fun threadDetail(threadId: String) = if (threadId.substringAfter('\u001f') == grokThread.id) grokDetail else MockPocketRepository.threadDetail(threadId)
+    override suspend fun threadModelOptions(threadId: String) = ThreadModelOptions(
+        models = listOf(
+            ModelOption("grok-model-a", "Grok 模型 A", "界面测试模型，不会调用真实服务", listOf(ReasoningOption("low", "低", ""), ReasoningOption("high", "高", "")), "grok", "high"),
+            ModelOption("grok-model-b", "Grok 模型 B", "这个测试模型不提供推理档位", emptyList(), "grok"),
+        ), currentModelId = "grok-model-a", currentReasoningId = "low", controlScope = "shared",
+    )
 }
 
 /** Controlled layout exercise: delayed history reads and one growing Markdown reply. */
@@ -140,14 +169,15 @@ private class StreamingPreviewRepository(private val scope: CoroutineScope) : Po
         state.value = state.value.copy(execution = ThreadExecution.desktop("desktop"))
         onResult(true)
     }
-    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>) {
-        if (state.value.activeTurnId != null) return
+    override fun sendSteer(threadId: String, text: String, planMode: Boolean, images: List<Uri>, files: List<Uri>, modelId: String?, reasoningId: String?, onResult: (Boolean) -> Unit) {
+        if (state.value.activeTurnId != null) { onResult(false); return }
         scope.launch {
             val replyId = "reply-${state.value.items.size}"
             state.value = state.value.copy(status = ThreadStatus.Active, activeTurnId = "preview-turn", items = state.value.items + listOf(
                 TimelineItem.Message("user-$replyId", Role.User, text, MessageStatus.Done),
                 TimelineItem.Message(replyId, Role.Assistant, "正在逐段回复。\n", MessageStatus.Streaming),
             ))
+            onResult(true)
             repeat(60) { index ->
                 delay(400)
                 state.value = state.value.copy(items = state.value.items.map {

@@ -17,6 +17,7 @@ mkdirSync(desktopProjectPath, { recursive: true });
 const desktopSockets = new Set();
 let desktopSendCount = 0;
 const desktopSendCallerThreadIds = [];
+const desktopSendArgs = [];
 let desktopWaitCount = 0;
 const desktopWaitCallerThreadIds = [];
 let desktopReadCount = 0;
@@ -115,6 +116,7 @@ const desktop = net.createServer((socket) => {
         };
       } else if (message.method === "tools/call" && message.params?.tool === "send_message_to_thread") {
         desktopSendCallerThreadIds.push(message.params.threadId);
+        desktopSendArgs.push(message.params.arguments);
         desktopSendCount += 1;
         result = message.params.arguments?.prompt === "http websocket regression"
           ? {
@@ -179,7 +181,6 @@ const child = spawn(process.execPath, [join(pluginRoot, "server.mjs")], {
     LOCALAPPDATA: stateRoot,
     CODEX_APP_TOOLS_PIPE_PATH: desktopPipe,
     AGENT_POCKET_DESKTOP_HOST_PIPE: bridgeHostPipe,
-    AGENT_POCKET_CODEX_QUEUE_DISABLED: "1",
     CODEX_THREAD_ID: "caller-thread",
     CODEX_SESSION_ID: "",
   },
@@ -252,6 +253,7 @@ try {
   assert.ok(hello.capabilities.includes("project/list"));
   assert.ok(hello.capabilities.includes("thread/create"));
   assert.ok(hello.capabilities.includes("thread/send"));
+  assert.ok(hello.capabilities.includes("thread/send-model-v1"));
   assert.ok(hello.capabilities.includes("thread/wait"));
   const projects = await bridgeRequest("project/list", {});
   assert.equal(projects.contentItems.length, 1);
@@ -285,20 +287,56 @@ try {
   const failedBootstrap = await bridgeRequest("thread/create", {
     cwd: desktopProjectPath,
     text: "failing Desktop task",
+    model: "gpt-test",
+    effort: "low",
     workspaceMode: "local",
   });
   assert.equal(failedBootstrap.source, "desktop");
   assert.equal(failedBootstrap.thread.id, "failed-created-thread");
   assert.match(failedBootstrap.warning, /Desktop bootstrap turn failed/);
+  assert.deepEqual(desktopSendArgs.at(-1), {
+    threadId: "failed-created-thread",
+    prompt: "failing Desktop task",
+    model: "gpt-test",
+    thinking: "low",
+  });
   await assert.rejects(bridgeRequest("thread/send", {
     threadId: "example-thread",
     text: "http websocket regression",
+    model: "gpt-test",
+    effort: "high",
   }), /function_call_output requires call_id/);
-  const sent = await bridgeRequest("thread/send", { threadId: "example-thread", text: "example prompt" });
-  assert.equal(sent.contentItems.length, 1);
-  const selfSent = await bridgeRequest("thread/send", { threadId: "caller-thread", text: "self prompt" });
+  await assert.rejects(bridgeRequest("thread/send", {
+    threadId: "example-thread",
+    text: "x".repeat(24_001),
+  }), /must not exceed 24000 characters/);
+  const selected = await bridgeRequest("thread/send", {
+    threadId: "example-thread",
+    text: "selected prompt",
+    model: "gpt-test",
+    effort: "high",
+  });
+  assert.equal(selected.contentItems.length, 1);
+  assert.deepEqual(desktopSendArgs.at(-1), {
+    threadId: "example-thread",
+    prompt: "selected prompt",
+    model: "gpt-test",
+    thinking: "high",
+  });
+  const selfSent = await bridgeRequest("thread/send", {
+    threadId: "caller-thread",
+    text: "self prompt",
+    model: "gpt-test",
+    effort: "low",
+  });
   assert.equal(selfSent.contentItems.length, 1);
   assert.equal(desktopSendCallerThreadIds.at(-1), "example-thread");
+  assert.deepEqual(desktopSendArgs.at(-1), {
+    threadId: "caller-thread",
+    prompt: "self prompt",
+    model: "gpt-test",
+    thinking: "low",
+  });
   const changed = await bridgeRequest("thread/wait", { threadId: "example-thread", afterCursor: baseline.cursor, timeoutMs: 8_000 });
   assert.deepEqual(changed, {
     cursor: "completed:2",
@@ -325,7 +363,7 @@ try {
   await assert.rejects(bridgeRequest("thread/create", { cwd: join(stateRoot, "missing"), text: "blocked", workspaceMode: "local" }), /does not exist/);
   assert.equal(desktopCreateCount, 3);
   assert.equal(desktopReadCount, 2);
-  assert.equal(desktopSendCount, 3);
+  assert.equal(desktopSendCount, 4);
   assert.equal(desktopWaitCount, 6);
   bridge.destroy();
   bridge = undefined;

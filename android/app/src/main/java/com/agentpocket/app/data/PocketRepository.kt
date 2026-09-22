@@ -11,6 +11,7 @@ import com.agentpocket.app.data.model.ModelOption
 import com.agentpocket.app.data.model.Project
 import com.agentpocket.app.data.model.ThreadDetail
 import com.agentpocket.app.data.model.ThreadSummary
+import com.agentpocket.app.data.model.ThreadModelOptions
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -51,6 +52,7 @@ interface PocketRepository {
     val refreshingThreads: StateFlow<Set<String>>
 
     fun threadDetail(threadId: String): StateFlow<ThreadDetail>
+    suspend fun threadModelOptions(threadId: String): ThreadModelOptions
     fun threadDiff(threadId: String): StateFlow<List<DiffFile>>
     fun openNotification(hostId: String, eventId: String, onResolved: (String?) -> Unit)
 
@@ -77,6 +79,7 @@ interface PocketRepository {
      * entering a thread clears it.
      */
     fun setActiveThread(threadId: String?)
+    suspend fun refreshInteractions(threadId: String) {}
 
     fun selectHost(hostId: String?)
 
@@ -104,7 +107,7 @@ interface PocketRepository {
     fun clearThreadGoal(threadId: String, onResult: (String?) -> Unit)
 
     /** Appends a user steer message to a running turn. */
-    fun sendSteer(threadId: String, text: String, planMode: Boolean = false, images: List<Uri> = emptyList(), files: List<Uri> = emptyList())
+    fun sendSteer(threadId: String, text: String, planMode: Boolean = false, images: List<Uri> = emptyList(), files: List<Uri> = emptyList(), modelId: String? = null, reasoningId: String? = null, onResult: (Boolean) -> Unit = {})
 
     fun interruptTurn(threadId: String)
     fun resolveApproval(threadId: String, requestId: String, decision: ApprovalDecision)

@@ -26,6 +26,15 @@ internal class BridgeRpcException(
     cause: Throwable? = null,
 ) : Exception(message, cause)
 
+internal fun bridgeRpcError(error: JsonObject, defaultMessage: String): BridgeRpcException {
+    val data = error["data"] as? JsonObject
+    // JSON-RPC's numeric code is a category; recovery uses the Host's named
+    // error. Relay responses can instead carry that name directly in code.
+    val name = (data?.get("name") as? JsonPrimitive)?.contentOrNull
+        ?: (error["code"] as? JsonPrimitive)?.contentOrNull
+    return BridgeRpcException((error["message"] as? JsonPrimitive)?.contentOrNull ?: defaultMessage, name)
+}
+
 private const val RPC_TIMEOUT_MS = 30_000L
 internal const val CONNECTION_LOST_CODE = "CONNECTION_LOST"
 internal const val CHANNEL_CLOSED_CODE = "CHANNEL_CLOSED"
@@ -122,14 +131,7 @@ internal class BridgeRpcClient(
         val deferred = pending.remove(id) ?: return
         val error = message["error"] as? JsonObject
         if (error != null) {
-            val data = error["data"] as? JsonObject
-            deferred.completeExceptionally(
-                BridgeRpcException(
-                    (error["message"] as? JsonPrimitive)?.contentOrNull ?: "Bridge 请求失败",
-                    (error["code"] as? JsonPrimitive)?.contentOrNull
-                        ?: (data?.get("name") as? JsonPrimitive)?.contentOrNull,
-                ),
-            )
+            deferred.completeExceptionally(bridgeRpcError(error, "Bridge 请求失败"))
         } else {
             val result = message["result"]
             if (result == null) {

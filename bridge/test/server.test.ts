@@ -137,6 +137,10 @@ class FakeDesktopAttach {
   maxActiveWaits = 0;
   threadIds = ["desktop-thread"];
   threadCwd = "";
+  modelControl = true;
+  supportsWritableCapability(capability: string) {
+    return this.modelControl && capability === "thread/send-model-v1";
+  }
   async listThreadsNormalized(limit: number, search?: string) {
     this.calls.push({ limit, search });
     if (this.fail) throw new Error("plugin unavailable");
@@ -173,10 +177,10 @@ class FakeDesktopAttach {
       },
     };
   }
-  async sendMessage(threadId: string, text: string) {
+  async sendMessage(threadId: string, text: string, model?: string, effort?: string) {
     if (this.sendError) throw this.sendError;
     if (this.failSend) throw new Error("desktop send failed");
-    this.sent.push({ threadId, text });
+    this.sent.push({ threadId, text, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
     return { accepted: true };
   }
   async waitThread(threadId: string, afterCursor?: string, timeoutMs = 8_000) {
@@ -1168,6 +1172,7 @@ test("resumes Plan with the app-server's effective model and reasoning settings"
       // ThreadResumeResponse puts effective settings beside thread, not inside it.
       return { thread: { id: params.threadId }, model: "custom-api-model", modelProvider: "custom-api", reasoningEffort: "high" };
     }
+    if (method === "model/list") return { data: [{ id: "chosen-model", supportedReasoningEfforts: [{ reasoningEffort: "low" }] }] };
     return request(method, params);
   };
   store.setThreadOwner("bridge-thread", "bridge");
@@ -1195,6 +1200,69 @@ test("resumes Plan with the app-server's effective model and reasoning settings"
   } finally {
     store.close();
   }
+});
+
+test("thread model controls validate and route overrides to the active owner without acquiring a writer", async () => {
+  const { server, store, codex, desktop } = continuityFixture();
+  codex.nativeCwd = server.config.projectRoots[0];
+  const original = codex.request.bind(codex);
+  codex.request = async (method: string, params: any) => {
+    if (["model/list", "config/read", "thread/resume"].includes(method)) codex.calls.push({ method, params });
+    if (method === "model/list") return { data: [
+      { id: "vendor-a", model: "vendor-a", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+      { id: "vendor-b", model: "vendor-b", supportedReasoningEfforts: [{ reasoningEffort: "medium" }], defaultReasoningEffort: "medium" },
+    ] };
+    if (method === "config/read") return { config: { model: "vendor-a", model_provider: "custom", model_reasoning_effort: "high" } };
+    if (method === "thread/resume") return { thread: { id: params.threadId }, model: "vendor-a", reasoningEffort: "high" };
+    return original(method, params);
+  };
+  try {
+    const before = await server.threadModelOptions("thread-1");
+    assert.equal(before.controlScope, "thread");
+    assert.equal(before.currentModel, undefined, "do not present a global default as this thread's actual model");
+    assert.equal(before.data[0].model, "vendor-a");
+    assert.equal(codex.calls.some(call => call.method === "thread/resume"), false);
+    await server.startTurn({ threadId: "thread-1", text: "switch", model: "vendor-b", effort: "medium" });
+    const sent = codex.calls.find(call => call.method === "turn/start").params;
+    assert.equal(sent.model, "vendor-b"); assert.equal(sent.effort, "medium");
+    assert.equal((await server.threadModelOptions("thread-1")).currentModel, "vendor-b");
+    codex.clearTurn("thread-1");
+    await assert.rejects(server.startTurn({ threadId: "thread-1", text: "invalid", model: "vendor-b", effort: "xhigh" }), /推理档位/);
+    await assert.rejects(server.startTurn({ threadId: "thread-1", text: "invalid", model: "gone" }), /模型/);
+    await assert.rejects(server.steerTurn({ threadId: "thread-1", expectedTurnId: "turn", text: "not ignored", model: "vendor-b" }), /本轮结束/);
+    assert.equal(codex.calls.filter(call => call.method === "turn/start").length, 1);
+    store.setThreadOwner("thread-1", "desktop");
+    const desktopOptions = await server.threadModelOptions("thread-1");
+    assert.equal(desktopOptions.controlScope, "desktop");
+    assert.equal(desktopOptions.data[1].model, "vendor-b");
+    await server.startTurn({ threadId: "thread-1", text: "desktop switch", model: "vendor-b", effort: "medium" });
+    assert.deepEqual(desktop.sent.at(-1), { threadId: "thread-1", text: "desktop switch", model: "vendor-b", effort: "medium" });
+    assert.equal(codex.calls.filter(call => call.method === "turn/start").length, 1);
+    await assert.rejects(server.startTurn({ threadId: "thread-1", text: "invalid", model: "vendor-b", effort: "xhigh" }), /推理档位/);
+    desktop.modelControl = false;
+    const legacy = await server.threadModelOptions("thread-1");
+    assert.equal(legacy.controlScope, "none");
+    assert.equal(legacy.data.length, 0);
+    await assert.rejects(server.startTurn({ threadId: "thread-1", text: "must not be ignored", model: "vendor-b" }),
+      (error: any) => error?.nameCode === "VERSION_UNSUPPORTED" && /消息尚未发送/.test(error.message));
+    assert.equal(desktop.sent.length, 1);
+  } finally { await server.stop(); store.close(); }
+});
+
+test("Grok model options and continuation overrides never route through Codex", async () => {
+  const { server, store, codex } = continuityFixture();
+  let received: any;
+  server.grok = {
+    modelOptions: async (id: string) => ({ id, controlScope: "shared", data: [] }),
+    start: async (...args: any[]) => { received = args; return { turn: { id: "grok-turn" } }; },
+    stop: async () => {}, active: new Map(),
+  } as any;
+  try {
+    assert.equal((await server.dispatchUnchecked({} as any, "thread/model-options", { threadId: "grok:native" })).controlScope, "shared");
+    await server.dispatchUnchecked({} as any, "turn/start", { threadId: "grok:native", text: "next", model: "grok-next", effort: "high", clientMessageId: "once" });
+    assert.deepEqual(received, ["grok:native", "next", "once", { model: "grok-next", effort: "high" }]);
+    assert.equal(codex.calls.length, 0);
+  } finally { store.close(); }
 });
 
 test("uses the selected model and full collaboration mode for Plan tasks", async () => {

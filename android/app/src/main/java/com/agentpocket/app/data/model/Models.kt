@@ -61,7 +61,7 @@ data class ReasoningOption(
 )
 
 /**
- * A selectable Codex model. [reasoningOptions] varies per model, so the
+ * A selectable agent model. [reasoningOptions] varies per model, so the
  * reasoning selector in the new-task screen is shaped dynamically from here.
  */
 data class ModelOption(
@@ -70,7 +70,19 @@ data class ModelOption(
     val description: String,
     val reasoningOptions: List<ReasoningOption>,
     val agentId: String = "codex",
+    val defaultReasoningId: String? = null,
 )
+
+data class ThreadModelOptions(
+    val models: List<ModelOption> = emptyList(),
+    val currentModelId: String? = null,
+    val currentReasoningId: String? = null,
+    val controlScope: String = "none",
+    val reason: String? = null,
+    val warning: String? = null,
+) {
+    val canControl: Boolean get() = controlScope == "thread" || controlScope == "shared" || controlScope == "desktop"
+}
 
 data class AgentAvailability(val id: String, val available: Boolean, val error: String? = null, val version: String? = null)
 
@@ -169,6 +181,10 @@ sealed interface TimelineItem {
         val prompt: String,
         val options: List<String>,
         val selectedOption: String? = null,
+        val available: Boolean = true,
+        val unavailableReason: String? = null,
+        val pendingOption: String? = null,
+        val submitting: Boolean = false,
     ) : TimelineItem
 
     data class Approval(
@@ -178,6 +194,9 @@ sealed interface TimelineItem {
         val command: String,
         val cwd: String,
         val decision: ApprovalDecision? = null,
+        val available: Boolean = true,
+        val unavailableReason: String? = null,
+        val submitting: Boolean = false,
     ) : TimelineItem
 }
 

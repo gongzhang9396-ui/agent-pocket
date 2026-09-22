@@ -8,9 +8,11 @@ import com.agentpocket.app.data.model.Role
 import com.agentpocket.app.data.model.StepStatus
 import com.agentpocket.app.data.model.TimelineItem
 import java.net.SocketTimeoutException
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class SyncLogicTest {
@@ -42,6 +44,56 @@ class SyncLogicTest {
         assertEquals(true, isArchivedThread(archived = null, isArchived = true, archivedAtPresent = false))
         assertEquals(true, isArchivedThread(archived = false, isArchived = false, archivedAtPresent = true))
         assertEquals(false, isArchivedThread(archived = false, isArchived = false, archivedAtPresent = false))
+    }
+
+    @Test
+    fun catalogPaginationCollectsAllPagesAndDeduplicatesStableIds() = runBlocking {
+        val requested = mutableListOf<String?>()
+        val rows = collectCatalogPages(
+            label = "Codex",
+            loadPage = { cursor ->
+                requested += cursor
+                when (cursor) {
+                    null -> CatalogPage(listOf("a", "b"), "page-2")
+                    "page-2" -> CatalogPage(listOf("b", "c"), "page-3")
+                    else -> CatalogPage(listOf("d"), null)
+                }
+            },
+            keyOf = { it },
+        )
+        assertEquals(listOf(null, "page-2", "page-3"), requested)
+        assertEquals(listOf("a", "b", "c", "d"), rows)
+    }
+
+    @Test
+    fun failedLaterCatalogPageLeavesPreviousVisibleSnapshotUntouched() = runBlocking {
+        var visible = listOf("cached-a", "cached-b")
+        runCatching {
+            visible = collectCatalogPages(
+                label = "Codex",
+                loadPage = { cursor ->
+                    if (cursor == null) CatalogPage(listOf("fresh-a"), "page-2")
+                    else throw BridgeRpcException("第二页失败", "REQUEST_TIMEOUT")
+                },
+                keyOf = { it },
+            )
+        }
+        assertEquals(listOf("cached-a", "cached-b"), visible)
+    }
+
+    @Test
+    fun repeatedCatalogCursorFailsInsteadOfLoopingForever() = runBlocking {
+        try {
+            collectCatalogPages(
+                label = "Codex",
+                loadPage = { CatalogPage(listOf("a"), "same-cursor") },
+                keyOf = { it },
+            )
+            fail("Expected repeated cursor failure")
+        } catch (error: BridgeRpcException) {
+            assertEquals("INVALID_REQUEST", error.nameCode)
+            assertTrue(error.message.orEmpty().contains("游标重复"))
+        }
     }
 
     @Test

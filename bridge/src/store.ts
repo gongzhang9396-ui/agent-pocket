@@ -199,12 +199,17 @@ export class BridgeStore {
       .run(threadId, owner, this.now());
   }
 
-  addPending(codexId: string | number, method: string, params: unknown) {
+  addPending(codexId: string | number, method: string, params: unknown, requestId = randomUUID()) {
     this.db.prepare("DELETE FROM pending_requests WHERE created_at < ?").run(this.now() - EVENT_MAX_AGE_MS);
-    const requestId = randomUUID();
-    this.db.prepare(`INSERT INTO pending_requests(request_id,codex_id,method,params_json,created_at)
+    this.db.prepare(`INSERT OR IGNORE INTO pending_requests(request_id,codex_id,method,params_json,created_at)
       VALUES(?,?,?,?,?)`).run(requestId, String(codexId), method, JSON.stringify(params ?? {}), this.now());
     return requestId;
+  }
+
+  interactionsForThread(threadId: string) {
+    return (this.db.prepare(`SELECT * FROM pending_requests WHERE json_extract(params_json,'$.threadId')=?
+      AND created_at>=? ORDER BY created_at DESC LIMIT 100`).all(threadId, this.now() - EVENT_MAX_AGE_MS) as any[])
+      .reverse().map((row) => ({ ...row, params: JSON.parse(row.params_json), response: row.response_json ? JSON.parse(row.response_json) : undefined }));
   }
 
   pending(requestId: string) {

@@ -209,6 +209,15 @@ export class DesktopAttachClient {
     return parseDesktopAttachRegistration(value);
   }
 
+  supportsWritableCapability(capability: string) {
+    try {
+      const registration = this.registration();
+      return !registration.readOnly && registration.capabilities.includes(capability);
+    } catch {
+      return false;
+    }
+  }
+
   probe() {
     return this.request("attach/probe", {});
   }
@@ -246,8 +255,14 @@ export class DesktopAttachClient {
     return this.request("thread/create", params, { write: true });
   }
 
-  sendMessage(threadId: string, text: string) {
-    return this.request("thread/send", { threadId, text }, { write: true });
+  sendMessage(threadId: string, text: string, model?: string, effort?: string) {
+    const params: Record<string, unknown> = { threadId, text };
+    if (model) params.model = model;
+    if (effort) params.effort = effort;
+    return this.request("thread/send", params, {
+      write: true,
+      ...(model || effort ? { capability: "thread/send-model-v1" } : {}),
+    });
   }
 
   waitThread(threadId: string, afterCursor?: string, timeoutMs = 8_000): Promise<DesktopWaitSummary> {
@@ -258,10 +273,13 @@ export class DesktopAttachClient {
     });
   }
 
-  async request(method: string, params: Record<string, unknown>, options: { write?: boolean; timeoutMs?: number } = {}) {
+  async request(method: string, params: Record<string, unknown>, options: { write?: boolean; timeoutMs?: number; capability?: string } = {}) {
     const registration = this.registration();
     if (!registration.capabilities.includes(method)) {
       return Promise.reject(new Error(`Desktop Attach 当前不支持：${method}`));
+    }
+    if (options.capability && !registration.capabilities.includes(options.capability)) {
+      return Promise.reject(new Error(`Desktop Attach 当前不支持：${options.capability}`));
     }
     if (options.write && registration.readOnly) {
       return Promise.reject(new Error("Desktop Attach 当前处于只读模式"));
@@ -316,6 +334,10 @@ export class DesktopAttachClient {
             const handshakeCapabilities = Array.isArray(message.result?.capabilities) ? message.result.capabilities : [];
             if (!handshakeCapabilities.includes(method)) {
               finish(new Error(`Desktop Attach 握手未声明能力：${method}`));
+              return;
+            }
+            if (options.capability && !handshakeCapabilities.includes(options.capability)) {
+              finish(new Error(`Desktop Attach 握手未声明能力：${options.capability}`));
               return;
             }
             if (options.write && message.result?.readOnly !== false) {

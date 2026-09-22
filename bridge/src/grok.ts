@@ -11,7 +11,7 @@ import type { BridgeStore } from "./store.ts";
 import { ErrorName, RpcError, newEvent, truncateUtf8 } from "./protocol.ts";
 
 type GrokInput = { cwd: string; text: string; model?: string; effort?: string; clientMessageId?: string };
-type Running = { task: AgentTask; client: AcpClient; turnId: string; loading: boolean; shared: boolean; promptFinished?: boolean; currentPromptId?: string; queueVersion?: number; cancelKey?: string; historyCursor?: string | null; historyRevision?: string; interruptRequested?: boolean; lastText?: any; buffered: string; tools: Map<string, any>; timer?: NodeJS.Timeout; done?: Promise<void> };
+type Running = { task: AgentTask; client: AcpClient; turnId: string; loading: boolean; shared: boolean; promptFinished?: boolean; currentPromptId?: string; queueVersion?: number; cancelKey?: string; historyCursor?: string | null; historyRevision?: string; historyDetached?: boolean; interruptRequested?: boolean; lastText?: any; buffered: string; tools: Map<string, any>; timer?: NodeJS.Timeout; done?: Promise<void> };
 type Permission = { run: Running; id: string | number; options: any[]; item: any };
 const caps = { send: true, interrupt: true, approval: true, question: false, plan: false, goal: false, handoff: false, steer: false, attachments: false };
 const CLIENT_ID = "agent-pocket";
@@ -117,7 +117,7 @@ export class GrokAgent extends EventEmitter {
     const latest = this.tasks.latestTurn(task.id);
     const capabilities = { ...caps, send: !this.stopped && this.health?.value.available !== false };
     return { id: task.id, agentId: "grok", name: task.title, preview: task.title, cwd: task.cwd,
-      model: task.model, createdAt: Math.floor(task.createdAt / 1000), updatedAt: Math.floor(task.updatedAt / 1000),
+      model: task.model, reasoningEffort: task.effort, createdAt: Math.floor(task.createdAt / 1000), updatedAt: Math.floor(task.updatedAt / 1000),
       status: { type: run ? "active" : latest?.status === "completed" ? "completed" : latest?.status === "failed" ? "systemError" : "idle", activeFlags: waiting ? ["waitingOnApproval"] : [] },
       source: "grok", execution: { backend: "grok", owner: task.historySource === "native" ? "shared" : "host", capabilities,
         statusMessage: run?.shared ? run.loading ? "正在连接电脑上的 Grok 会话…" : run.currentPromptId === run.turnId ? undefined : "已排队，等待 Grok 开始这一轮…" : undefined }, capabilities };
@@ -137,6 +137,13 @@ export class GrokAgent extends EventEmitter {
     const nativeIds = new Set(native.map(row => row.id));
     return [...managed.filter(row => !nativeIds.has(row.id)), ...native.map(row => this.describeNative(row))]
       .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+  }
+  async modelOptions(id: string) {
+    const task = this.native ? await this.native.metadata(id) : this.requireTask(id);
+    const agent = await this.probe();
+    return { data: agent.models, currentModel: task.model, currentEffort: task.effort,
+      controlScope: agent.available && !this.stopped ? this.native ? "shared" : "thread" : "none",
+      reason: agent.error || (this.stopped ? "Host 正在关闭，请稍后重试。" : undefined) };
   }
   async listPage(cursor: string | undefined, search: string | undefined, limit: number) {
     const prefix = "ap-grok-list-v1:"; let token: string, offset = 0;
@@ -172,6 +179,22 @@ export class GrokAgent extends EventEmitter {
     const task = this.requireTask(id); const page = this.tasks.read(id, cursor);
     return { thread: { ...this.describe(task), turns: page.turns }, page: page.page };
   }
+  async interactions(id: string) {
+    const task = this.tasks.get(id);
+    const row = task || !this.native ? this.describe(this.requireTask(id)) : this.describeNative(await this.native.metadata(id));
+    const latest = this.tasks.latestTurn(id);
+    const items = new Map<string, any>();
+    if (latest) for (const item of this.tasks.read(id, undefined, String(latest.id)).turns.flatMap(turn => turn.items)) {
+      if (item.type === "pocketApproval") items.set(item.requestId, { ...item, available: this.permissions.has(item.requestId),
+        ...(!item.decision && !this.permissions.has(item.requestId) ? { unavailableReason: "这项审批已结束" } : {}) });
+    }
+    // Pending controls must be available even when a long output has pushed
+    // them out of the current history page, or native history cannot be read.
+    for (const [requestId, permission] of this.permissions) if (permission.run.task.id === id) {
+      items.set(requestId, { ...permission.item, available: true });
+    }
+    return { items: [...items.values()], execution: row.execution };
+  }
   private async readNative(id: string, cursor?: string) {
     const run = this.active.get(id);
     if (!run) {
@@ -186,10 +209,10 @@ export class GrokAgent extends EventEmitter {
       }
       return result;
     }
-    const revision = `${run.historyRevision ?? "new"}:live:${run.turnId}`;
+    const revision = () => `${run.historyRevision ?? "new"}:live:${run.turnId}${run.historyDetached ? ":detached" : ""}`;
     if (cursor && !cursor.startsWith(LIVE_CURSOR)) {
       const result = await this.native!.read(id, cursor);
-      return { thread: { ...result.thread, ...this.describeNative(result.thread) }, page: { ...result.page, revision } };
+      return { thread: { ...result.thread, ...this.describeNative(result.thread) }, page: { ...result.page, revision: revision() } };
     }
     let inner: string | undefined;
     if (cursor) {
@@ -204,11 +227,24 @@ export class GrokAgent extends EventEmitter {
     if (!live.page.hasMore && run.historyCursor) {
       const count = turns.reduce((n, t) => n + t.items.length, 0);
       if (count < 100) {
-        const old = await this.native!.read(id, run.historyCursor, { maxBytes: 240 * 1024, maxItems: 100 - count });
-        turns = [...old.thread.turns, ...turns]; nextCursor = old.page.nextCursor;
+        try {
+          const old = await this.native!.read(id, run.historyCursor, { maxBytes: 240 * 1024, maxItems: 100 - count });
+          turns = [...old.thread.turns, ...turns]; nextCursor = old.page.nextCursor;
+        } catch (error) {
+          if (!(error instanceof RpcError) || !["HISTORY_CHANGED", "HISTORY_UNAVAILABLE", "INVALID_REQUEST"].includes(error.nameCode)) throw error;
+          // A CLI rewrite invalidates our internal boundary, not the live turn.
+          // Taking a new boundary here would duplicate the prompt/output already
+          // appended by that turn. Keep its controls usable until native history
+          // becomes canonical again at completion.
+          run.historyCursor = null; run.historyDetached = true; nextCursor = null;
+        }
       }
     }
-    return { thread: { ...this.describe(run.task), turns }, page: { order: "oldest_first", hasMore: nextCursor !== null, nextCursor, revision } };
+    if (run.historyDetached && !inner) turns = [{ id: `grok-history-notice-${run.turnId}`, status: "completed", items: [{
+      id: `grok-history-notice-${run.turnId}`, type: "agentMessage",
+      text: "电脑历史暂时无法合并，当前轮次和审批仍可操作；本轮结束后会重新同步历史。",
+    }] }, ...turns];
+    return { thread: { ...this.describe(run.task), turns }, page: { order: "oldest_first", hasMore: nextCursor !== null, nextCursor, revision: revision() } };
   }
   validate(input: GrokInput) {
     assertAllowedCwd(input.cwd, this.roots);
@@ -245,7 +281,7 @@ export class GrokAgent extends EventEmitter {
       return { thread: this.describe(task), turn: { id: turn.turnId, status: "inProgress" } };
     } catch (error) { await client.stop(); throw error; }
   }
-  async start(id: string, text: string, clientId?: string) {
+  async start(id: string, text: string, clientId?: string, selection: { model?: string; effort?: string } = {}) {
     const duplicate = this.tasks.duplicate(id, clientId);
     if (duplicate) return { turn: duplicate, duplicate: true };
     const inFlight = this.startFlights.get(id);
@@ -265,12 +301,76 @@ export class GrokAgent extends EventEmitter {
       }
       task ??= this.requireTask(id);
       const client = this.client(task);
-      const run = this.run(task, text, clientId, client, true, baseline?.page);
-      return { turn: { id: run.turnId, status: "inProgress" } };
+      let prepared = false;
+      try {
+        if (selection.model || selection.effort) {
+          await this.prepareModel(client, task, selection);
+          if (this.native) baseline = await this.native.read(id);
+          prepared = true;
+        }
+        if (this.stopped) throw new RpcError("AGENT_OFFLINE", "Host 正在关闭，消息尚未发送");
+        const run = this.run(task, text, clientId, client, !prepared, baseline?.page);
+        return { turn: { id: run.turnId, status: "inProgress" } };
+      } catch (error) { await client.stop(); throw error; }
     })();
     this.startFlights.set(id, { clientId, work }); this.creations.add(work);
     try { return await work; }
     finally { this.creating--; this.startFlights.delete(id); this.creations.delete(work); }
+  }
+  private async prepareModel(client: AcpClient, task: AgentTask, selection: { model?: string; effort?: string }) {
+    let foreignBusy = false;
+    const actual: { value?: { model?: string; effort?: string } } = {};
+    let changed: (() => void) | undefined;
+    const observe = (message: any) => {
+      if (message.params?.sessionId !== task.nativeId) return;
+      if (message.method === "_x.ai/queue/changed") foreignBusy = Boolean(message.params.runningPromptId || message.params.entries?.length);
+      const update = message.params.update;
+      if (message.method === "_x.ai/session_notification" && update?.sessionUpdate === "model_changed") {
+        actual.value = { model: update.model_id, effort: update.reasoning_effort };
+        changed?.();
+      }
+    };
+    client.on("notification", observe);
+    // An attached client's permissions belong to its own prompt. Never reject a
+    // broadcast from another terminal during this settings preflight.
+    try {
+      await this.initialize(client);
+      const loaded = await client.request("session/load", { sessionId: task.nativeId, cwd: task.cwd, mcpServers: [],
+        _meta: { yoloMode: false, autoMode: false, clientIdentifier: CLIENT_ID } });
+      const model = selection.model || loaded.models?.currentModelId;
+      const option = loaded.models?.availableModels?.find((m: any) => m.modelId === model);
+      if (!model || !option) throw new RpcError(ErrorName.INVALID_REQUEST, "所选 Grok 模型已不可用，请刷新模型列表；消息尚未发送");
+      if (selection.effort && !(option._meta?.reasoningEfforts || []).some((r: any) => r.id === selection.effort)) {
+        throw new RpcError(ErrorName.INVALID_REQUEST, "所选 Grok 模型不支持这个推理档位；消息尚未发送");
+      }
+      if (this.stopped || foreignBusy) throw new RpcError(ErrorName.THREAD_BUSY, "Grok 会话正在执行或排队，请等电脑上的任务结束后再切换模型；消息尚未发送");
+      // This is the CLI's shared session preference, not a prompt-scoped
+      // override or a global account setting. Concurrent native clients follow
+      // Grok's own last-change semantics; we do not claim a separate writer lock.
+      actual.value = undefined;
+      const result = await client.request("session/set_model", { sessionId: task.nativeId, modelId: model,
+        _meta: { reasoningEffort: selection.effort } });
+      const returned = result._meta?.model;
+      const applied = typeof returned === "string" ? returned : returned?.Ok;
+      if (returned?.Err || (applied !== model && actual.value?.model !== model)) {
+        throw new RpcError("MODEL_CHANGE_FAILED", "Grok 未确认所选模型，消息尚未发送；请刷新会话设置后重试");
+      }
+      // The leader's RPC response and broadcast use different queues. A delayed
+      // load notification can precede the change notice even after set_model
+      // returns. Wait for the requested values, never accept that stale notice.
+      const confirmed = () => actual.value?.model === model && (!selection.effort || actual.value?.effort === selection.effort);
+      if (!confirmed()) await new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, 2500);
+        changed = () => { if (confirmed()) { clearTimeout(timer); resolve(); } };
+      });
+      task.model = actual.value?.model || applied;
+      task.effort = actual.value?.model === model ? actual.value.effort : undefined;
+      this.tasks.setModel(task.id, task.model!, task.effort);
+      if (selection.effort && !confirmed()) {
+        throw new RpcError("MODEL_CHANGE_FAILED", "尚未确认 Grok 的新推理档位，消息尚未发送；请刷新会话设置后重试");
+      }
+      this.emit("event", newEvent("grok.catalog.updated", { threadIds: [task.id] }));
+    } finally { changed = undefined; client.off("notification", observe); }
   }
   run(task: AgentTask, text: string, clientId: string | undefined, client: AcpClient, resume: boolean, baseline?: any) {
     const turnId = this.tasks.beginTurn(task.id, clientId);
@@ -299,6 +399,12 @@ export class GrokAgent extends EventEmitter {
           await this.initialize(client);
           if (run.interruptRequested) throw new RpcError("AGENT_CANCELLED", "任务已中断");
           await client.request("session/load", { sessionId: task.nativeId, cwd: task.cwd, mcpServers: [], _meta: { yoloMode: false, autoMode: false, clientIdentifier: CLIENT_ID } });
+          // Loading may normalize or rewrite chat_history.jsonl. Capture the
+          // boundary after load and before this turn writes its native prompt.
+          if (this.native) {
+            const { page } = await this.native.read(task.id);
+            run.historyCursor = page.startCursor; run.historyRevision = page.revision; run.historyDetached = false;
+          }
           run.loading = false;
         }
         if (run.interruptRequested) throw new RpcError("AGENT_CANCELLED", "任务已中断");
@@ -409,7 +515,7 @@ export class GrokAgent extends EventEmitter {
     this.permissions.delete(requestId);
     this.tasks.put(permission.run.task.id, permission.run.turnId, { ...permission.item, decision });
     this.store.resolvePending(requestId, { decision });
-    this.event("sync.required", permission.run, { reason: "approval-resolved" });
+    this.event("sync.required", permission.run, { reason: "approval-resolved", requestId, decision });
   }
   respond(requestId: string, decision: string) {
     if (!["allowOnce", "deny", "cancel"].includes(decision)) throw new RpcError(ErrorName.INVALID_REQUEST, "无效的审批决定");

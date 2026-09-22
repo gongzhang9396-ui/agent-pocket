@@ -32,6 +32,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -372,6 +373,8 @@ private fun QuestionCard(
     actionsEnabled: Boolean,
     onAnswer: (requestId: String, questionId: String, option: String) -> Unit,
 ) {
+    var customAnswer by rememberSaveable(question.id) { mutableStateOf("") }
+    val canAnswer = actionsEnabled && question.available && question.selectedOption == null && !question.submitting
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(14.dp),
@@ -387,7 +390,7 @@ private fun QuestionCard(
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    "Codex 需要确认",
+                    "需要你的回答",
                     style = MaterialTheme.typography.labelMedium,
                     color = StatusColors.attention,
                 )
@@ -396,10 +399,10 @@ private fun QuestionCard(
             Text(question.prompt, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(8.dp))
             question.options.forEach { option ->
-                val selected = question.selectedOption == option
+                val selected = (question.selectedOption ?: question.pendingOption) == option
                 OutlinedButton(
                     onClick = { onAnswer(question.requestId, question.questionId, option) },
-                    enabled = actionsEnabled && question.selectedOption == null,
+                    enabled = canAnswer,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 2.dp),
@@ -410,8 +413,19 @@ private fun QuestionCard(
                     )
                 }
             }
-            if (!actionsEnabled && question.selectedOption == null) {
-                Text("请在 Codex Desktop 中回答", style = MaterialTheme.typography.labelSmall, color = StatusColors.external)
+            if (question.selectedOption != null) {
+                Text("已回答：${question.selectedOption}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+            } else if (question.submitting) {
+                Text("正在提交回答…", style = MaterialTheme.typography.labelSmall)
+            } else if (!actionsEnabled || !question.available) {
+                Text(question.unavailableReason ?: "请在 Codex Desktop 中回答", style = MaterialTheme.typography.labelSmall, color = StatusColors.external)
+            } else {
+                OutlinedTextField(value = customAnswer, onValueChange = { if (it.length <= 4000) customAnswer = it },
+                    label = { Text(if (question.options.isEmpty()) "输入回答" else "或填写自己的回答") },
+                    modifier = Modifier.fillMaxWidth(), minLines = 1, maxLines = 5, enabled = canAnswer)
+                TextButton(onClick = { onAnswer(question.requestId, question.questionId, customAnswer.trim()) },
+                    enabled = canAnswer && customAnswer.isNotBlank()) { Text("提交回答") }
+                if (question.pendingOption != null) Text("已选择；请完成其他问题。提交失败时，可再次点选重试。", style = MaterialTheme.typography.labelSmall)
             }
         }
     }
@@ -443,7 +457,7 @@ private fun ApprovalCard(
             Spacer(Modifier.height(8.dp))
             MonoBlock(text = "$ ${approval.command}\n${approval.cwd}")
             Spacer(Modifier.height(10.dp))
-            if (approval.decision == null && actionsEnabled) {
+            if (approval.decision == null && actionsEnabled && approval.available && !approval.submitting) {
                 // Exactly three choices: allow once / deny / cancel. No permanent approval.
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { onResolve(approval.requestId, ApprovalDecision.AllowOnce) }) {
@@ -456,6 +470,8 @@ private fun ApprovalCard(
                         Text("取消任务")
                     }
                 }
+            } else if (approval.submitting) {
+                Text("正在提交审批…", style = MaterialTheme.typography.labelSmall)
             } else if (approval.decision != null) {
                 val (label, color) = when (approval.decision) {
                     ApprovalDecision.AllowOnce -> "已允许一次" to StatusColors.running
@@ -464,7 +480,7 @@ private fun ApprovalCard(
                 }
                 Text(label, style = MaterialTheme.typography.labelMedium, color = color)
             } else {
-                Text("请在 Codex Desktop 中处理审批", style = MaterialTheme.typography.labelSmall, color = StatusColors.external)
+                Text(approval.unavailableReason ?: "请在 Codex Desktop 中处理审批", style = MaterialTheme.typography.labelSmall, color = StatusColors.external)
             }
         }
     }

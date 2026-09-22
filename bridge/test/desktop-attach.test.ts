@@ -47,7 +47,7 @@ function fakeDesktopAttach(options: { readOnly?: boolean } = {}) {
           socket.write(`${JSON.stringify({
             jsonrpc: "2.0",
             id: message.id,
-            result: { protocolVersion: 1, readOnly, capabilities: ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/wait"] },
+            result: { protocolVersion: 1, readOnly, capabilities: ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/send-model-v1", "thread/wait"] },
           })}\n`);
           continue;
         }
@@ -124,7 +124,7 @@ function fakeDesktopAttach(options: { readOnly?: boolean } = {}) {
     pid: process.pid,
     startedAt: new Date().toISOString(),
     readOnly,
-    capabilities: ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/wait"],
+    capabilities: ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/send-model-v1", "thread/wait"],
   }));
   return { server, pipe, registrationPath, calls };
 }
@@ -214,6 +214,7 @@ test("authenticates and calls Desktop Attach read and restricted send methods", 
   });
   try {
     const client = new DesktopAttachClient({ registrationPath: fake.registrationPath, timeoutMs: 2_000 });
+    assert.equal(client.supportsWritableCapability("thread/send-model-v1"), true);
     const probe = await client.probe();
     assert.equal(probe.ok, true);
     const projects = await client.listProjectsNormalized();
@@ -245,6 +246,11 @@ test("authenticates and calls Desktop Attach read and restricted send methods", 
       method: "thread/send",
       params: { threadId: "desktop-thread", text: "continue safely" },
     });
+    await client.sendMessage("desktop-thread", "switch safely", "gpt-test", "high");
+    assert.deepEqual(fake.calls.at(-1), {
+      method: "thread/send",
+      params: { threadId: "desktop-thread", text: "switch safely", model: "gpt-test", effort: "high" },
+    });
     const baseline = await client.waitThread("desktop-thread", undefined, 0);
     assert.equal(baseline.cursor, "cursor:1");
     assert.equal(baseline.changed, false);
@@ -268,6 +274,7 @@ test("rejects Desktop writes when registration and handshake are read-only", asy
   });
   try {
     const client = new DesktopAttachClient({ registrationPath: fake.registrationPath, timeoutMs: 2_000 });
+    assert.equal(client.supportsWritableCapability("thread/send-model-v1"), false);
     const projects = await client.listProjectsNormalized();
     assert.equal(projects.data.length, 1);
     await assert.rejects(client.createThread("C:\\Projects\\demo", "blocked"), /只读模式/);

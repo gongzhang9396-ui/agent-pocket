@@ -57,10 +57,10 @@ export class AgentTaskStore {
     }
     this.db.exec("SAVEPOINT adopt_native_task");
     try {
-      this.db.prepare(`INSERT INTO agent_tasks(id,native_id,cwd,model,title,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET cwd=excluded.cwd, model=excluded.model,
+      this.db.prepare(`INSERT INTO agent_tasks(id,native_id,cwd,model,effort,title,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET cwd=excluded.cwd, model=excluded.model, effort=excluded.effort,
         title=excluded.title, updated_at=MAX(agent_tasks.updated_at,excluded.updated_at)`)
-        .run(task.id, task.nativeId, task.cwd, task.model ?? null, task.title, task.createdAt, task.updatedAt);
+        .run(task.id, task.nativeId, task.cwd, task.model ?? null, task.effort ?? null, task.title, task.createdAt, task.updatedAt);
       this.db.prepare("INSERT OR IGNORE INTO agent_native_tasks VALUES(?)").run(task.id);
       this.db.exec("RELEASE adopt_native_task");
     } catch (error) { this.db.exec("ROLLBACK TO adopt_native_task; RELEASE adopt_native_task"); throw error; }
@@ -70,6 +70,9 @@ export class AgentTaskStore {
     const id = randomUUID();
     this.db.prepare("INSERT INTO agent_turns VALUES(?,?,?,?,?)").run(id, threadId, clientId ?? null, "inProgress", Date.now());
     return id;
+  }
+  setModel(threadId: string, model: string, effort?: string) {
+    this.db.prepare("UPDATE agent_tasks SET model=?,effort=? WHERE id=?").run(model, effort ?? null, threadId);
   }
   duplicate(threadId: string, clientId?: string) {
     return clientId ? this.db.prepare("SELECT id,status FROM agent_turns WHERE thread_id=? AND client_message_id=?").get(threadId, clientId) : undefined;

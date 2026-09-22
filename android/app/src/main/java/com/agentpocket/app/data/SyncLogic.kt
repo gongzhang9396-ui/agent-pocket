@@ -23,6 +23,43 @@ internal fun eventSeqDecision(lastSeq: Long, seq: Long): EventSeqDecision = when
 internal fun isArchivedThread(archived: Boolean?, isArchived: Boolean?, archivedAtPresent: Boolean): Boolean =
     archived == true || isArchived == true || archivedAtPresent
 
+internal data class CatalogPage<T>(
+    val rows: List<T>,
+    val nextCursor: String?,
+)
+
+/**
+ * Builds one complete catalog in memory before callers replace visible state.
+ * A failed later page therefore cannot collapse a previously complete list to
+ * the first page. Cursors are opaque, but repeats and runaway pagination are
+ * rejected so a broken Host cannot keep the phone refreshing forever.
+ */
+internal suspend fun <T> collectCatalogPages(
+    label: String,
+    maxPages: Int = 60,
+    loadPage: suspend (cursor: String?) -> CatalogPage<T>,
+    keyOf: (T) -> String,
+): List<T> {
+    require(maxPages > 0)
+    val collected = linkedMapOf<String, T>()
+    val seenCursors = mutableSetOf<String>()
+    var cursor: String? = null
+    repeat(maxPages) {
+        val page = loadPage(cursor)
+        page.rows.forEach { row ->
+            val key = keyOf(row)
+            if (key.isNotBlank()) collected[key] = row
+        }
+        val next = page.nextCursor?.takeIf { it.isNotBlank() }
+            ?: return collected.values.toList()
+        if (!seenCursors.add(next)) {
+            throw BridgeRpcException("$label 目录分页游标重复，请刷新重试", "INVALID_REQUEST")
+        }
+        cursor = next
+    }
+    throw BridgeRpcException("$label 目录分页过多，请缩小范围后重试", "INVALID_REQUEST")
+}
+
 /** Failures that should be repaired by reconnecting or rebuilding the channel. */
 internal fun isTransientConnectionFailure(error: Throwable): Boolean =
     error is IOException || (

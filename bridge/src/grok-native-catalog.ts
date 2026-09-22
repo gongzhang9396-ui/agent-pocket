@@ -13,7 +13,7 @@ const MAX_LINE = 16 * 1024 * 1024;
 const PAGE_BYTES = 512 * 1024;
 const READ_ONLY_REASON = "电脑终端的 Grok 会话已同步，可查看历史与后续更新；请在原终端继续发送，手机暂不接管此会话。";
 const readOnlyCaps = { send: false, interrupt: false, approval: false, question: false, plan: false, goal: false, handoff: false, steer: false, attachments: false };
-type Entry = { id: string; nativeId: string; cwd: string; dir: string; title: string; createdAt: number; updatedAt: number; model?: string; fingerprint: string };
+type Entry = { id: string; nativeId: string; cwd: string; dir: string; title: string; createdAt: number; updatedAt: number; model?: string; effort?: string; fingerprint: string };
 type Line = { start: number; end: number; bytes?: Buffer; oversized?: boolean };
 type Revision = { identity: string; size: number; mtime: number; digest?: string; revision: string };
 const samePath = (a: string, b: string) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
@@ -180,6 +180,7 @@ export class GrokNativeCatalog extends EventEmitter {
           next.set(id, { id, nativeId: session.name, cwd, dir,
             title: truncateUtf8(typeof summary.generated_title === "string" && summary.generated_title.trim() ? summary.generated_title : "Grok 电脑会话", 500).value,
             model: typeof summary.current_model_id === "string" ? summary.current_model_id.slice(0, 200) : undefined,
+            effort: typeof summary.reasoning_effort === "string" ? summary.reasoning_effort.slice(0, 32) : undefined,
             createdAt: epoch(summary.created_at, stat.birthtimeMs), updatedAt: Math.max(epoch(summary.updated_at, stat.mtimeMs), history?.mtimeMs ?? 0),
             fingerprint: `${stat.size}:${stat.mtimeMs}:${history ? `${history.dev}:${history.ino}:${history.size}:${history.mtimeMs}` : "pending-history"}` });
         } catch { /* A half-written/deleted/inaccessible session cannot authorize a path. */ }
@@ -198,7 +199,7 @@ export class GrokNativeCatalog extends EventEmitter {
   }
   describe(entry: Entry) {
     return { id: entry.id, agentId: "grok", name: entry.title, preview: entry.title, cwd: entry.cwd,
-      model: entry.model, createdAt: Math.floor(entry.createdAt / 1000), updatedAt: Math.floor(entry.updatedAt / 1000),
+      model: entry.model, reasoningEffort: entry.effort, createdAt: Math.floor(entry.createdAt / 1000), updatedAt: Math.floor(entry.updatedAt / 1000),
       status: { type: "notLoaded", activeFlags: [] }, source: "grok",
       execution: { backend: "grok", owner: "external", capabilities: readOnlyCaps, readOnlyReason: READ_ONLY_REASON }, capabilities: readOnlyCaps };
   }
@@ -213,7 +214,7 @@ export class GrokNativeCatalog extends EventEmitter {
     const entry = this.entries.get(id);
     if (!entry) throw new RpcError(ErrorName.NOT_FOUND, "电脑会话已移除、目录不可访问或不在项目白名单内");
     assertAllowedCwd(entry.cwd, this.roots);
-    return { id: entry.id, nativeId: entry.nativeId, cwd: entry.cwd, model: entry.model, title: entry.title, createdAt: entry.createdAt, updatedAt: entry.updatedAt };
+    return { id: entry.id, nativeId: entry.nativeId, cwd: entry.cwd, model: entry.model, effort: entry.effort, title: entry.title, createdAt: entry.createdAt, updatedAt: entry.updatedAt };
   }
   async read(id: string, cursor?: string, options: { maxBytes?: number; maxItems?: number } = {}) {
     const previous = this.reads.get(id) ?? Promise.resolve();
