@@ -5,6 +5,11 @@ import org.junit.Test
 
 class PairingScreenTest {
     @Test
+    fun `device verification code binds ID and encryption public key`() {
+        assertEquals("1BA1 CD2F F06A BA12", deviceVerificationCode("test-device", "public-key"))
+        org.junit.Assert.assertNotEquals(deviceVerificationCode("other-device", "public-key"), deviceVerificationCode("test-device", "public-key"))
+    }
+    @Test
     fun `fresh install uses build default relay`() {
         assertEquals(
             "https://relay.example.com",

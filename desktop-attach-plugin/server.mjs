@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readAssistantTextFromRollout } from "./rollout-reader.mjs";
+import { DesktopNativeApprovals, NativeApprovalError, DESKTOP_APPROVAL_CAPABILITY } from "./native-approvals.mjs";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_RESULT_CHARS = 512 * 1024;
@@ -33,7 +34,8 @@ const IPC_PROTOCOL_VERSION = 1;
 const PLUGIN_VERSION = "0.3.2";
 const BRIDGE_HOST_MODE = process.argv.includes("--bridge-host");
 const SERVER_PATH = fileURLToPath(import.meta.url);
-const BRIDGE_CAPABILITIES = ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/send-model-v1", "thread/wait"];
+const BRIDGE_CAPABILITIES = ["attach/probe", "project/list", "thread/list", "thread/read", "thread/create", "thread/send", "thread/send-model-v1", "thread/wait", "thread/approvals", "approval/respond", DESKTOP_APPROVAL_CAPABILITY];
+const nativeApprovals = new DesktopNativeApprovals();
 const DESKTOP_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 let host;
@@ -485,6 +487,7 @@ async function callDesktopTool(name, args, context) {
 
   const response = await host.request("tools/call", {
     arguments: args,
+    callerSource: "codex",
     callId: context.callId,
     namespace: tool.namespace,
     threadId: context.threadId,
@@ -907,6 +910,7 @@ function handleBridgeConnection(socket, token) {
 
 async function handleBridgeMessage(socket, line, token, isAuthenticated, markAuthenticated) {
   let message;
+  let approvalResponseStarted = false;
   try { message = JSON.parse(line); } catch {
     return writeBridgeError(socket, null, -32700, "Invalid JSON");
   }
@@ -954,6 +958,18 @@ async function handleBridgeMessage(socket, line, token, isAuthenticated, markAut
       return writeBridgeResult(socket, message.id, {
         contentItems: await readDesktopTask(threadId.trim(), turnLimit, cursor, context),
       });
+    }
+    if (message.method === "thread/approvals" || message.method === "approval/respond") {
+      const params = message.params || {};
+      const threadId = optionalTrimmedString(params.threadId, "threadId", 128);
+      if (!threadId) throw new NativeApprovalError("INVALID_REQUEST", "threadId is required");
+      const cwd = canonicalDesktopPath(params.cwd, "cwd").actual;
+      approvalResponseStarted = message.method === "approval/respond";
+      const result = message.method === "thread/approvals"
+        ? await nativeApprovals.read(threadId, cwd)
+        : await nativeApprovals.respond({ threadId, cwd, ownerClientId: params.ownerClientId,
+          requestId: params.requestId, fingerprint: params.fingerprint, decision: params.decision });
+      return writeBridgeResult(socket, message.id, result);
     }
     if (message.method === "thread/create") {
       const cwd = message.params?.cwd;
@@ -1016,6 +1032,13 @@ async function handleBridgeMessage(socket, line, token, isAuthenticated, markAut
     }
     return writeBridgeError(socket, message.id, -32601, `Method not found: ${message.method}`);
   } catch (error) {
+    if (message.method === "thread/approvals" || message.method === "approval/respond") {
+      return writeBridgeError(socket, message.id, -32000,
+        error instanceof NativeApprovalError ? error.message : "Desktop 审批暂不可用，请在 Desktop 处理",
+        { code: error instanceof NativeApprovalError ? error.code : "DESKTOP_UNAVAILABLE",
+          // Includes a failure while returning a successful native result.
+          delivery: error instanceof NativeApprovalError ? error.delivery : approvalResponseStarted ? "unknown" : "not_sent" });
+    }
     return writeBridgeError(socket, message.id, -32000, error instanceof Error ? error.message : String(error));
   }
 }
@@ -1051,8 +1074,8 @@ function writeBridgeResult(socket, id, result) {
   socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
 }
 
-function writeBridgeError(socket, id, code, message) {
-  socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
+function writeBridgeError(socket, id, code, message, data) {
+  socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message, ...(data ? { data } : {}) } })}\n`);
 }
 
 class NativePipeClient {

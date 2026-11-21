@@ -179,6 +179,7 @@ test("Windows persists Host secrets with DPAPI and remembers accepted channels a
     identity.hostId = "host-id";
     identity.hostToken = "host-token-must-not-leak";
     identity.contentKey = b64(sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES));
+    identity.pendingEnrollment = { id: "synthetic-id", secret: "synthetic-enrollment-secret", expiresAt: Date.now() + 300000, pairUri: "synthetic-pair-uri", proposedHostToken: "synthetic-proposed-host-token" };
 
     const phoneSigning = sodium.crypto_sign_keypair();
     const phoneEncryption = sodium.crypto_box_keypair();
@@ -222,7 +223,7 @@ test("Windows persists Host secrets with DPAPI and remembers accepted channels a
     const stored = JSON.parse(firstDisk);
     assert.equal(stored.protection, "dpapi-current-user");
     assert.equal(typeof stored.protectedSecrets, "string");
-    for (const name of ["signingPrivateKey", "encryptionPrivateKey", "hostToken", "contentKey"]) {
+    for (const name of ["signingPrivateKey", "encryptionPrivateKey", "hostToken", "contentKey", "pendingEnrollment"]) {
       assert.equal(Object.hasOwn(stored, name), false);
     }
     for (const secret of [identity.signingPrivateKey, identity.encryptionPrivateKey, identity.hostToken, identity.contentKey]) {
@@ -230,6 +231,9 @@ test("Windows persists Host secrets with DPAPI and remembers accepted channels a
     }
 
     const loaded = loadHostIdentity(identityPath)!;
+    assert.deepEqual(loaded.pendingEnrollment, identity.pendingEnrollment);
+    assert.equal(firstDisk.includes(identity.pendingEnrollment.proposedHostToken), false);
+    assert.equal(firstDisk.includes(identity.pendingEnrollment.secret), false);
     assert.equal(loaded.hostToken, identity.hostToken);
     assert.equal(loaded.signingPrivateKey, identity.signingPrivateKey);
     loaded.eventCounter = 7;

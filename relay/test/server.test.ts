@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
+import sodium from "libsodium-wrappers-sumo";
 import { hashPassword } from "../src/auth.js";
 import { RelayServer } from "../src/server.js";
 import { account, device, host, tempStore } from "./helpers.js";
@@ -105,6 +106,77 @@ test("admin CSP permits only WebAssembly evaluation required by libsodium", asyn
       response.headers.get("content-security-policy"),
       "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
     );
+  } finally {
+    await relay.stop();
+    context.close();
+    rmSync(adminDir, { recursive: true, force: true });
+  }
+});
+
+test("web shell is unavailable until explicitly enabled", async () => {
+  const context = tempStore();
+  const adminDir = mkdtempSync(join(tmpdir(), "agent-pocket-web-disabled-admin-"));
+  writeFileSync(join(adminDir, "index.html"), "<!doctype html><title>Admin</title>");
+  const relay = new RelayServer({ ...relayConfig(), adminDir, webEnabled: false }, context.store);
+  await relay.start();
+  try {
+    const response = await fetch(`http://127.0.0.1:${relay.address()!.port}/app`);
+    assert.equal(response.status, 404);
+  } finally {
+    await relay.stop();
+    context.close();
+    rmSync(adminDir, { recursive: true, force: true });
+  }
+});
+
+test("dated release directories never make the web shell or service worker immutable", async () => {
+  const context = tempStore();
+  const webDir = join(context.directory, "0.3.2-webtrial.20261013.2", "web");
+  mkdirSync(join(webDir, "assets"), { recursive: true });
+  writeFileSync(join(webDir, "index.html"), "<!doctype html><title>Web</title>");
+  writeFileSync(join(webDir, "sw.js"), "// shell only");
+  writeFileSync(join(webDir, "manifest.webmanifest"), '{"name":"Pocket"}');
+  writeFileSync(join(webDir, "assets", "index-A234bcde.js"), "// asset");
+  const relay = new RelayServer({ ...relayConfig(), webEnabled: true, webDir }, context.store);
+  await relay.start();
+  const base = `http://127.0.0.1:${relay.address()!.port}`;
+  try {
+    for (const path of ["/app/", "/app/index.html", "/app/sw.js", "/app/manifest.webmanifest"]) {
+      const response = await fetch(base + path); assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "no-cache");
+      if (path.endsWith("webmanifest")) { assert.match(response.headers.get("content-type")!, /^application\/manifest\+json/); assert.equal((await response.json() as any).name, "Pocket"); }
+    }
+    assert.match((await fetch(base + "/app/assets/index-A234bcde.js")).headers.get("cache-control")!, /immutable/);
+    assert.equal((await fetch(base + "/app/assets/missing.js")).status, 404);
+  } finally { await relay.stop(); context.close(); }
+});
+
+test("web login is origin-bound and stops before device proof", async () => {
+  await sodium.ready;
+  const context = tempStore();
+  const accountKeys = sodium.crypto_sign_keypair();
+  const accountBox = sodium.crypto_box_keypair();
+  const account = context.store.createAccount({
+    username: "web-login-user", displayName: "Web Login", passwordHash: await hashPassword("correct horse battery staple"), role: "user",
+    signingPublicKey: sodium.to_base64(accountKeys.publicKey, sodium.base64_variants.URLSAFE_NO_PADDING),
+    encryptionPublicKey: sodium.to_base64(accountBox.publicKey, sodium.base64_variants.URLSAFE_NO_PADDING), escrowCiphertext: "escrow",
+  });
+  const deviceSign = sodium.crypto_sign_keypair();
+  const deviceBox = sodium.crypto_box_keypair();
+  const adminDir = mkdtempSync(join(tmpdir(), "agent-pocket-web-login-admin-"));
+  writeFileSync(join(adminDir, "index.html"), "<!doctype html><title>Admin</title>");
+  const relay = new RelayServer({ ...relayConfig(), adminDir, webEnabled: true, webDir: join(adminDir, "web") }, context.store);
+  await relay.start();
+  const url = `http://127.0.0.1:${relay.address()!.port}/api/web/login`;
+  const body = { username: account.username, password: "correct horse battery staple", deviceName: "Safari on iPhone", deviceSigningPublicKey: sodium.to_base64(deviceSign.publicKey, sodium.base64_variants.URLSAFE_NO_PADDING), deviceEncryptionPublicKey: sodium.to_base64(deviceBox.publicKey, sodium.base64_variants.URLSAFE_NO_PADDING) };
+  try {
+    const denied = await fetch(url, { method: "POST", headers: { Origin: "https://evil.example", "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(denied.status, 403);
+    const response = await fetch(url, { method: "POST", headers: { Origin: "http://127.0.0.1", "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal(response.status, 200);
+    const value = await response.json() as any;
+    assert.equal(value.state, "device_proof_pending");
+    assert.ok(value.loginToken);
+    assert.equal(value.device.status, "pending");
   } finally {
     await relay.stop();
     context.close();

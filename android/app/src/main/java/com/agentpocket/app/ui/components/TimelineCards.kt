@@ -8,6 +8,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -60,6 +61,8 @@ import com.agentpocket.app.data.model.Role
 import com.agentpocket.app.data.model.StepStatus
 import com.agentpocket.app.data.model.TimelineItem
 import com.agentpocket.app.ui.theme.StatusColors
+import com.agentpocket.app.ui.theme.SkinGeometry
+import com.agentpocket.app.ui.theme.skinRule
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownTypography
 import com.mikepenz.markdown.model.MarkdownTypography
@@ -89,8 +92,9 @@ private fun MessageRow(message: TimelineItem.Message) {
     when (message.role) {
         Role.User -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Surface(
-                shape = RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp),
-                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
+                shape = SkinGeometry.message,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 modifier = Modifier.widthIn(max = 300.dp),
             ) {
                 Column(Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
@@ -124,7 +128,7 @@ private fun MessageRow(message: TimelineItem.Message) {
         }
 
         Role.Assistant -> Column(Modifier.fillMaxWidth()) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().skinRule().padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     "Codex",
                     style = MaterialTheme.typography.labelMedium,
@@ -219,7 +223,7 @@ private fun StreamingCursor() {
 private fun PlanCard(plan: TimelineItem.Plan) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp),
+        shape = SkinGeometry.panel,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -304,7 +308,7 @@ private fun CommandCard(command: TimelineItem.Command) {
     Card(
         onClick = { expanded = !expanded },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp),
+        shape = SkinGeometry.panel,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -377,7 +381,7 @@ private fun QuestionCard(
     val canAnswer = actionsEnabled && question.available && question.selectedOption == null && !question.submitting
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp),
+        shape = SkinGeometry.panel,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -401,6 +405,7 @@ private fun QuestionCard(
             question.options.forEach { option ->
                 val selected = (question.selectedOption ?: question.pendingOption) == option
                 OutlinedButton(
+                    shape = SkinGeometry.action,
                     onClick = { onAnswer(question.requestId, question.questionId, option) },
                     enabled = canAnswer,
                     modifier = Modifier
@@ -439,7 +444,7 @@ private fun ApprovalCard(
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp),
+        shape = SkinGeometry.panel,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -459,11 +464,11 @@ private fun ApprovalCard(
             Spacer(Modifier.height(10.dp))
             if (approval.decision == null && actionsEnabled && approval.available && !approval.submitting) {
                 // Exactly three choices: allow once / deny / cancel. No permanent approval.
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { onResolve(approval.requestId, ApprovalDecision.AllowOnce) }) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(shape = SkinGeometry.action, onClick = { onResolve(approval.requestId, ApprovalDecision.AllowOnce) }) {
                         Text("允许一次")
                     }
-                    OutlinedButton(onClick = { onResolve(approval.requestId, ApprovalDecision.Deny) }) {
+                    OutlinedButton(shape = SkinGeometry.action, onClick = { onResolve(approval.requestId, ApprovalDecision.Deny) }) {
                         Text("拒绝")
                     }
                     TextButton(onClick = { onResolve(approval.requestId, ApprovalDecision.Cancel) }) {

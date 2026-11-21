@@ -25,6 +25,10 @@ Inno Setup 安装器按 Windows 用户安装到 `%LOCALAPPDATA%\Programs\Agent P
 
 安装完成后会自动打开“Agent Pocket 配对助手”；开始菜单也保留重复打开入口。助手只显示二维码文件、五分钟倒计时、刷新和连接结果，不把 enrollment secret 写入日志。Android 可以在未登录状态先扫码，登录或首次激活成功后会自动继续 Host inspect/approve；绑定成功后 Host 任务重启以加载新身份。
 
+新版助手默认显示 iPhone 网页 QR，并支持打开或复制同源 `/app/#pair=` 链接；“Android App 码”可切换到原始深链二维码。两份 QR 使用同一次 enrollment、各自独立的 PNG 文件，不覆盖旧 QR。NDJSON 保留原字段，只增加 `webQrFile` / `webLinkFile` 路径，不记录完整 secret。链接文件留在当前用户 `%LOCALAPPDATA%\AgentPocket`，五分钟后或绑定后失效，不进入安装包；网页收到片段后立即清除地址栏，不向第三方二维码服务传输内容。
+
+绑定完成请求之前，Host 会先用 DPAPI 保存 enrollment 和 proposed token。Relay 完成响应丢失时会重复同一请求；仍然失败可重新打开助手恢复，不能删除本地身份文件或盲目生成第二个 Host。已完成绑定回执保留 24 小时。网页只有在电脑真正连接后才显示成功；同名电脑在批准之前提示改名。
+
 覆盖升级检测到现有 `host-config.json` 后会跳过 Relay/白名单页面，不重写配置、不删除 Host 身份；安装器会重新安装随版本附带的 Desktop Attach 插件，避免 Codex 继续加载旧版插件。首次安装禁止静默模式，避免用示例配置误装。
 
 ## 卸载与重装

@@ -1,5 +1,8 @@
 package com.agentpocket.app.ui.screens
 
+import com.agentpocket.app.ui.theme.SkinGeometry
+import com.agentpocket.app.ui.theme.skinRule
+
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -47,6 +50,7 @@ import com.agentpocket.app.data.MockPocketRepository
 import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.ui.components.QrScannerButton
 import com.agentpocket.app.ui.theme.AgentPocketTheme
+import java.security.MessageDigest
 
 /** Relay v2 account entry. New phones stay here until a trusted phone approves them. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -59,6 +63,7 @@ fun PairingScreen(
 ) {
     val host by repo.host.collectAsState()
     val paired by repo.isPaired.collectAsState()
+    val device by repo.device.collectAsState()
     val authStatus by repo.authStatus.collectAsState()
     val pendingHostRelay by repo.pendingHostRelay.collectAsState()
     var relayUrl by rememberSaveable {
@@ -79,6 +84,7 @@ fun PairingScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier.skinRule(),
                 title = { Text("Agent Pocket Relay") },
                 navigationIcon = {
                     if (onBack != null) {
@@ -189,8 +195,14 @@ fun PairingScreen(
                     },
                 )
             }
+            if (!paired && device.status == "pending" && device.id.isNotBlank() && device.encryptionPublicKey.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text("设备核对码：${deviceVerificationCode(device.id, device.encryptionPublicKey)}", style = MaterialTheme.typography.bodyMedium)
+                Text("请与已信任设备上显示的核对码逐位核对。", style = MaterialTheme.typography.bodySmall)
+            }
             Spacer(Modifier.height(16.dp))
             Button(
+                shape = SkinGeometry.action,
                 onClick = { repo.login(relayUrl, username, password) },
                 enabled = !busy && username.isNotBlank() && password.length in 12..128,
                 modifier = Modifier.fillMaxWidth(),
@@ -204,6 +216,10 @@ fun PairingScreen(
 
 internal fun initialRelayUrl(savedRelayUrl: String, defaultRelayUrl: String): String =
     savedRelayUrl.ifBlank { defaultRelayUrl }
+
+internal fun deviceVerificationCode(id: String, encryptionPublicKey: String): String =
+    MessageDigest.getInstance("SHA-256").digest("agent-pocket-device-v1\u0000$id\u0000$encryptionPublicKey".toByteArray(Charsets.UTF_8))
+        .take(8).joinToString("") { "%02X".format(it.toInt() and 0xff) }.chunked(4).joinToString(" ")
 
 @Composable
 private fun SecurityPoint(text: String) {

@@ -4,8 +4,11 @@ android/local.properties
 android/app/google-services.json
 bridge/node_modules/
 relay/node_modules/
+dsh-bridge-plugin/**/node_modules/
+dsh-bridge-plugin/**/pocket-runtime.json
 relay/dist/
 relay/admin/dist/
+relay/web/dist/
 installer/windows/payload/
 installer/windows/output/
 installer/windows/.cache/

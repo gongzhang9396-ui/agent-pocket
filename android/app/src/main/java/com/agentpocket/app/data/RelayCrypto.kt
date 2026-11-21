@@ -69,7 +69,7 @@ internal data class RegistrationMaterial(
 
 internal object RelayCrypto {
     private val native = SodiumAndroid()
-    private val sodium = LazySodiumAndroid(native, StandardCharsets.UTF_8)
+    internal val sodium = LazySodiumAndroid(native, StandardCharsets.UTF_8)
     private val json = RelayProtocolJson
 
     fun generateDevice(): DeviceKeyMaterial {
@@ -292,7 +292,7 @@ internal class PhoneChannel(
         require(envelope.channelId == channelId && envelope.kind == "channel.open" && envelope.counter == 0L)
         val cipher = RelayCrypto.unb64(envelope.ciphertext)
         val output = ByteArray(cipher.size - Box.SEALBYTES)
-        val sodium = LazySodiumAndroid(SodiumAndroid(), StandardCharsets.UTF_8)
+        val sodium = RelayCrypto.sodium
         check(
             sodium.cryptoBoxSealOpen(
                 output,
@@ -336,7 +336,7 @@ internal class PhoneChannel(
         val message = text.toByteArray()
         val output = ByteArray(message.size + SecretStream.ABYTES)
         val length = LongArray(1)
-        val sodium = LazySodiumAndroid(SodiumAndroid(), StandardCharsets.UTF_8)
+        val sodium = RelayCrypto.sodium
         check(
             sodium.cryptoSecretStreamPush(
                 pushState,
@@ -360,7 +360,7 @@ internal class PhoneChannel(
         val output = ByteArray(cipher.size - SecretStream.ABYTES)
         val length = LongArray(1)
         val tag = ByteArray(1)
-        val sodium = LazySodiumAndroid(SodiumAndroid(), StandardCharsets.UTF_8)
+        val sodium = RelayCrypto.sodium
         check(
             sodium.cryptoSecretStreamPull(
                 pullState ?: error("Host 通道握手尚未完成"),

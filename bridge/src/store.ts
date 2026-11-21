@@ -20,6 +20,37 @@ function equalHash(left: string, right: string) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+export type OperationStatus = "pending" | "succeeded" | "failed" | "unknown";
+
+export type OperationRecord = {
+  operationId: string;
+  method: string;
+  fingerprint: string;
+  clientMessageId?: string;
+  threadId?: string;
+  backend?: string;
+  owner?: string;
+  agent?: string;
+  status: OperationStatus;
+  /** Alias retained for callers that describe the value as a state. */
+  state: OperationStatus;
+  result?: unknown;
+  error?: unknown;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type OperationInput = {
+  operationId: string;
+  method: string;
+  fingerprint: string;
+  clientMessageId?: string;
+  threadId?: string;
+  backend?: string;
+  owner?: string;
+  agent?: string;
+};
+
 export class BridgeStore {
   db: DatabaseSync;
   now: () => number;
@@ -58,8 +89,116 @@ export class BridgeStore {
         owner TEXT NOT NULL CHECK(owner IN ('desktop','bridge')),
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS operations (
+        operation_id TEXT PRIMARY KEY,
+        method TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        client_message_id TEXT,
+        thread_id TEXT,
+        backend TEXT,
+        owner TEXT,
+        agent TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending','succeeded','failed','unknown')),
+        result_json TEXT,
+        error_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_operations_updated ON operations(updated_at);
       CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
     `);
+    const operationColumns = new Set((this.db.prepare("PRAGMA table_info(operations)").all() as any[]).map((column) => String(column.name)));
+    for (const [name, definition] of [["client_message_id", "TEXT"], ["thread_id", "TEXT"], ["backend", "TEXT"], ["owner", "TEXT"], ["agent", "TEXT"]] as const) {
+      if (!operationColumns.has(name)) this.db.exec(`ALTER TABLE operations ADD COLUMN ${name} ${definition}`);
+    }
+    // A pending mutation cannot be known to have completed after a process
+    // restart. Fail closed so a retry can inspect the durable unknown state
+    // instead of sending the mutation a second time.
+    const restartError = JSON.stringify({ name: "OPERATION_UNKNOWN", detail: "Bridge 在操作完成前重启，结果尚不确定" });
+    this.db.prepare("UPDATE operations SET status='unknown',error_json=?,updated_at=? WHERE status='pending'")
+      .run(restartError, this.now());
+  }
+
+  operationRow(row: any): OperationRecord {
+    const status = row.status as OperationStatus;
+    return {
+      operationId: String(row.operation_id), method: String(row.method),
+      fingerprint: String(row.fingerprint), status, state: status,
+      ...(row.client_message_id ? { clientMessageId: String(row.client_message_id) } : {}),
+      ...(row.thread_id ? { threadId: String(row.thread_id) } : {}),
+      ...(row.backend ? { backend: String(row.backend) } : {}),
+      ...(row.owner ? { owner: String(row.owner) } : {}),
+      ...(row.agent ? { agent: String(row.agent) } : {}),
+      result: row.result_json === null || row.result_json === undefined ? undefined : JSON.parse(row.result_json),
+      error: row.error_json === null || row.error_json === undefined ? undefined : JSON.parse(row.error_json),
+      createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
+    };
+  }
+
+  getOperation(operationId: string) {
+    const row = this.db.prepare("SELECT * FROM operations WHERE operation_id=?").get(operationId) as any;
+    return row ? this.operationRow(row) : undefined;
+  }
+
+  /**
+   * Atomically records a new operation. Existing records are returned unchanged;
+   * the dispatch layer compares their fingerprint before deciding whether to
+   * replay, reject, or surface an uncertain result.
+   */
+  recordOperation(input: OperationInput): OperationRecord & { created: boolean };
+  recordOperation(operationId: string, method: string, fingerprint: string): OperationRecord & { created: boolean };
+  recordOperation(inputOrId: OperationInput | string, methodArg?: string, fingerprintArg?: string) {
+    const input = typeof inputOrId === "string"
+      ? { operationId: inputOrId, method: methodArg!, fingerprint: fingerprintArg! }
+      : inputOrId;
+    if (!input || !input.operationId || !input.method || !input.fingerprint) {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "操作记录参数无效");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    let created = false;
+    try {
+      let row = this.db.prepare("SELECT * FROM operations WHERE operation_id=?").get(input.operationId) as any;
+      if (!row) {
+        const at = this.now();
+        this.db.prepare(`INSERT INTO operations(operation_id,method,fingerprint,client_message_id,thread_id,backend,owner,agent,status,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,'pending',?,?)`).run(
+          input.operationId, input.method, input.fingerprint, input.clientMessageId || null, input.threadId || null,
+          input.backend || null, input.owner || null, input.agent || null, at, at,
+        );
+        row = this.db.prepare("SELECT * FROM operations WHERE operation_id=?").get(input.operationId) as any;
+        created = true;
+      } else if (row.method !== input.method || row.fingerprint !== input.fingerprint) {
+        throw new RpcError("CONFLICT", "操作标识已用于不同请求", { operationId: input.operationId, method: input.method });
+      }
+      this.db.exec("COMMIT");
+      return { ...this.operationRow(row), created };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  updateOperation(operationId: string, status: OperationStatus, value?: unknown): OperationRecord;
+  updateOperation(operationId: string, update: { status?: OperationStatus; state?: OperationStatus; result?: unknown; response?: unknown; error?: unknown }): OperationRecord;
+  updateOperation(operationId: string, statusOrUpdate: OperationStatus | { status?: OperationStatus; state?: OperationStatus; result?: unknown; response?: unknown; error?: unknown }, value?: unknown) {
+    const current = this.getOperation(operationId);
+    if (!current) throw new RpcError(ErrorName.NOT_FOUND, "操作记录不存在或已过期");
+    const status = typeof statusOrUpdate === "string"
+      ? statusOrUpdate
+      : statusOrUpdate.status || statusOrUpdate.state;
+    if (status !== "pending" && status !== "succeeded" && status !== "failed" && status !== "unknown") {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "操作状态无效");
+    }
+    const payload = typeof statusOrUpdate === "string" ? value
+      : status === "succeeded" ? (statusOrUpdate.result ?? statusOrUpdate.response)
+        : (statusOrUpdate.error ?? statusOrUpdate.result ?? statusOrUpdate.response);
+    const resultJson = status === "succeeded" && payload !== undefined ? JSON.stringify(payload) : null;
+    const errorJson = (status === "failed" || status === "unknown") && payload !== undefined ? JSON.stringify(payload) : null;
+    // A terminal state wins over late duplicate completions. This also makes
+    // retries after a process restart safe when two writers race to settle it.
+    this.db.prepare(`UPDATE operations SET status=?,result_json=?,error_json=?,updated_at=?
+      WHERE operation_id=? AND status='pending'`).run(status, resultJson, errorJson, this.now(), operationId);
+    return this.getOperation(operationId)!;
   }
 
   getMeta(key: string) {
@@ -200,22 +339,89 @@ export class BridgeStore {
   }
 
   addPending(codexId: string | number, method: string, params: unknown, requestId = randomUUID()) {
-    this.db.prepare("DELETE FROM pending_requests WHERE created_at < ?").run(this.now() - EVENT_MAX_AGE_MS);
+    // Native approval and async question identities are durable: pruning one
+    // could re-enable an already handled interaction after event retention.
+    this.db.prepare(`DELETE FROM pending_requests WHERE created_at < ?
+      AND method != 'desktop/asyncQuestion'
+      AND (COALESCE(json_extract(params_json,'$.source'),'')!='desktop'
+        OR json_type(params_json,'$.nativeApproval') IS NULL)`).run(this.now() - EVENT_MAX_AGE_MS);
     this.db.prepare(`INSERT OR IGNORE INTO pending_requests(request_id,codex_id,method,params_json,created_at)
       VALUES(?,?,?,?,?)`).run(requestId, String(codexId), method, JSON.stringify(params ?? {}), this.now());
     return requestId;
   }
 
-  interactionsForThread(threadId: string) {
-    return (this.db.prepare(`SELECT * FROM pending_requests WHERE json_extract(params_json,'$.threadId')=?
-      AND created_at>=? ORDER BY created_at DESC LIMIT 100`).all(threadId, this.now() - EVENT_MAX_AGE_MS) as any[])
-      .reverse().map((row) => ({ ...row, params: JSON.parse(row.params_json), response: row.response_json ? JSON.parse(row.response_json) : undefined }));
+  interactionsForThread(threadId: string, includeRequestIds: string[] = []) {
+    const recent = this.db.prepare(`SELECT * FROM pending_requests WHERE json_extract(params_json,'$.threadId')=?
+      AND (created_at>=? OR (resolved_at IS NULL AND json_extract(params_json,'$.source')='desktop'
+        AND json_type(params_json,'$.nativeApproval')='object') OR (resolved_at IS NULL AND method='desktop/asyncQuestion'))
+      ORDER BY created_at DESC LIMIT 100`).all(threadId, this.now() - EVENT_MAX_AGE_MS) as any[];
+    const rows = new Map(recent.map((row) => [row.request_id, row]));
+    // Fetch old resolved questions only when they appear on the current page;
+    // keep the normal interaction snapshot bounded rather than replaying all history.
+    const byId = this.db.prepare(`SELECT * FROM pending_requests WHERE request_id=?
+      AND method='desktop/asyncQuestion' AND json_extract(params_json,'$.threadId')=?`);
+    for (const id of new Set(includeRequestIds)) {
+      if (!rows.has(id)) {
+        const row = byId.get(id, threadId) as any;
+        if (row) rows.set(id, row);
+      }
+    }
+    return [...rows.values()].sort((a, b) => a.created_at - b.created_at)
+      .map((row) => ({ ...row, params: JSON.parse(row.params_json), response: row.response_json ? JSON.parse(row.response_json) : undefined }));
   }
 
   pending(requestId: string) {
     const row = this.db.prepare("SELECT * FROM pending_requests WHERE request_id=?").get(requestId) as any;
     if (!row) throw new RpcError(ErrorName.NOT_FOUND, "请求不存在或已过期");
     return { ...row, params: JSON.parse(row.params_json), response: row.response_json ? JSON.parse(row.response_json) : undefined };
+  }
+
+  /** Reserve the native request itself, independently of the caller's operationId.
+   * Persist BEFORE IPC: a crash leaves it unavailable, including after restart. */
+  reserveDesktopApproval(requestId: string, decision: string) {
+    const pending = this.pending(requestId);
+    if (pending.params.source !== "desktop" || !pending.params.nativeApproval) {
+      throw new RpcError(ErrorName.INVALID_REQUEST, "不是 Desktop 审批");
+    }
+    const response = { desktopApprovalState: "submitting", attemptedDecision: decision };
+    const changed = this.db.prepare(`UPDATE pending_requests SET response_json=?
+      WHERE request_id=? AND resolved_at IS NULL AND response_json IS NULL`).run(JSON.stringify(response), requestId);
+    return { reserved: Number(changed.changes) === 1, pending: this.pending(requestId) };
+  }
+
+  activeDesktopApproval(threadId: string, nativeId: string | number) {
+    const row = this.db.prepare(`SELECT request_id FROM pending_requests
+      WHERE json_extract(params_json,'$.source')='desktop'
+      AND json_extract(params_json,'$.threadId')=?
+      AND json_extract(params_json,'$.nativeApproval.requestId')=?
+      AND json_type(params_json,'$.nativeApproval.requestId')=?
+      AND COALESCE(json_extract(params_json,'$.nativeAbsent'),0)!=1
+      ORDER BY created_at DESC LIMIT 1`).get(threadId, nativeId, typeof nativeId === "string" ? "text" : "integer") as any;
+    return row ? this.pending(row.request_id) : undefined;
+  }
+
+  markDesktopApprovalAbsent(requestId: string) {
+    // CAS against submission: a concurrent refresh can never replace a
+    // submitting/unknown result, including when two processes share this DB.
+    this.db.prepare(`UPDATE pending_requests
+      SET params_json=json_set(params_json,'$.nativeAbsent',1),
+          resolved_at=COALESCE(resolved_at,?),
+          response_json=COALESCE(response_json,'{"desktopApprovalState":"resolved_elsewhere"}')
+      WHERE request_id=? AND json_extract(params_json,'$.source')='desktop'
+      AND (response_json IS NULL OR json_extract(response_json,'$.desktopApprovalState') IN ('succeeded','resolved_elsewhere'))`)
+      .run(this.now(), requestId);
+  }
+
+  settleDesktopApproval(requestId: string, state: "unknown" | "not_sent" | "succeeded", decision: string) {
+    const row = this.pending(requestId);
+    if (row.params.source !== "desktop" || row.response?.desktopApprovalState !== "submitting"
+      || row.response?.attemptedDecision !== decision || row.resolved_at) return;
+    const response = state === "not_sent" ? null : JSON.stringify(state === "succeeded"
+      ? { desktopApprovalState: "succeeded", _pocketDecision: decision }
+      : { desktopApprovalState: "unknown", attemptedDecision: decision });
+    this.db.prepare(`UPDATE pending_requests SET response_json=?,resolved_at=?
+      WHERE request_id=? AND resolved_at IS NULL AND response_json=?`)
+      .run(response, state === "succeeded" ? this.now() : null, requestId, row.response_json);
   }
 
   resolvePending(requestId: string, response: unknown) {

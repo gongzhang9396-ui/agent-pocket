@@ -83,10 +83,16 @@ export class AcpClient extends EventEmitter {
 
   async stop() {
     const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    if (!child) return;
+    // A CLI launcher can exit while a descendant still holds its stdio handles.
+    // Once this process has exited, release our pipes instead of waiting forever
+    // for the descendant to close them. This never kills another process.
+    const releasePipes = () => { child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); };
+    if (child.exitCode !== null || child.signalCode !== null) { releasePipes(); return; }
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => child.kill(), 3_000);
-      child.once("close", () => { clearTimeout(timer); resolve(); });
+      child.once("exit", releasePipes);
+      child.once("close", () => { clearTimeout(timer); child.off("exit", releasePipes); resolve(); });
       child.stdin.end();
     });
   }

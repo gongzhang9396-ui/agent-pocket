@@ -175,8 +175,33 @@ function Remove-DesktopAttachPlugin([string]$NormalizedInstallDir) {
     Write-UninstallLog "Removed Codex marketplace '$marketplaceName'."
 }
 
+function Remove-DshDesktopLinks([string]$StateRoot) {
+    $root = Join-Path $StateRoot 'dsh-desktop'
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    $directory = Get-Item -LiteralPath $root -Force
+    $marker = Get-Item -LiteralPath (Join-Path $root '.agent-pocket-dsh-desktop-v1') -Force
+    if (-not $directory.PSIsContainer -or $marker.PSIsContainer -or
+        ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($marker.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        (Get-Content -LiteralPath $marker.FullName -Raw -Encoding UTF8) -cne "agent-pocket-dsh-desktop-v1`n") {
+        throw 'DeepSeek desktop directory ownership could not be verified.'
+    }
+    $files = @(Get-ChildItem -LiteralPath $root -Force)
+    foreach ($file in $files) {
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            ($file.Name -cne $marker.Name -and $file.Name -cnotmatch '^host-[1-9][0-9]*-runtime-[1-9][0-9]*-[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}\.json(\.tmp)?$')) {
+            throw 'DeepSeek desktop directory contains an unrelated entry.'
+        }
+    }
+    # The exact marked child directory is checked above. No recursive deletion.
+    foreach ($file in $files) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+    [IO.Directory]::Delete($root, $false)
+}
+
 function Remove-VolatileState([string]$StateRoot) {
     if (-not (Test-Path -LiteralPath $StateRoot -PathType Container)) { return }
+
+    Remove-DshDesktopLinks $StateRoot
 
     foreach ($name in @('desktop-attach.json', 'host-runtime.json', 'host-maintenance.json')) {
         $path = Join-Path $StateRoot $name

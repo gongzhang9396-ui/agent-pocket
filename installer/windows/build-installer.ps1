@@ -106,21 +106,41 @@ $bridgeFiles = @(
     'src\agent-store.ts',
     'src\grok.ts',
     'src\grok-native-catalog.ts',
+    'src\dsh.ts',
+    'src\dsh-runtime.ts',
     'src\codex.ts',
     'src\codex-pool.ts',
     'src\config.ts',
     'src\desktop-attach.ts',
     'src\desktop-questions.ts',
+    'src\desktop-question-rollout.ts',
     'src\fcm.ts',
     'src\host-updater.ts',
     'src\protocol.ts',
+    'src\public-activity.ts',
     'src\relay-connector.ts',
     'src\relay-crypto.ts',
     'src\server.ts',
     'src\store.ts',
-    'src\task-catalog.ts'
+    'src\task-catalog.ts',
+    'src\thread-artifacts.ts'
+    'src\attachment-transfers.ts'
 )
 Copy-AllowlistedFiles (Join-Path $repoRoot 'bridge') $bridgeStage $bridgeFiles
+$dshStage = Join-Path $payload 'dsh-bridge-plugin'
+New-Item -ItemType Directory -Force -Path $dshStage | Out-Null
+Copy-AllowlistedFiles (Join-Path $repoRoot 'dsh-bridge-plugin') $dshStage @(
+    'index.mjs',
+    'core.mjs',
+    'projection.mjs',
+    'runtime-integrity.mjs',
+    'private-runtime.mjs',
+    'desktop-link.mjs',
+    'profile-settings.mjs',
+    'prepare-runtime.mjs',
+    'runtime\package.json',
+    'runtime\package-lock.json'
+)
 Push-Location $bridgeStage
 try { & (Join-Path $payload 'node\npm.cmd') ci --omit=dev --ignore-scripts } finally { Pop-Location }
 if ($LASTEXITCODE -ne 0) { throw 'Installing Bridge production dependencies failed.' }
@@ -135,6 +155,7 @@ Copy-AllowlistedFiles (Join-Path $repoRoot 'desktop-attach-plugin') $pluginStage
     '.mcp.json',
     'hooks\hooks.json',
     'rollout-reader.mjs',
+    'native-approvals.mjs',
     'server.mjs'
 )
 $scriptsStage = Join-Path $payload 'scripts'
@@ -147,6 +168,7 @@ Copy-AllowlistedFiles (Join-Path $scriptRoot 'scripts') $scriptsStage @(
     'pairing-assistant.ps1',
     'register-host-tasks.ps1',
     'run-host.ps1',
+    'open-dsh-desktop.ps1',
     'resolve-codex.ps1',
     'update-desktop-integration.ps1',
     'task-names.ps1',

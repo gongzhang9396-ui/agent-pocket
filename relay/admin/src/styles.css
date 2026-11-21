@@ -62,8 +62,22 @@ header p { margin: 0; color: #8e9a93; font-size: 13px; }
 .actions { display: flex; justify-content: flex-end; gap: 6px; }
 .actions button { min-height: 32px; padding: 5px 8px; font-size: 12px; }
 .device-list { border-top: 1px dashed #354039; padding: 8px 0 8px 28px; }
-.device-list > div { min-height: 40px; display: grid; grid-template-columns: 1fr 120px 80px; align-items: center; gap: 12px; }
+.device-list > div { min-height: 40px; display: grid; grid-template-columns: 1fr 120px 160px; align-items: center; gap: 12px; }
 .device-list button { min-height: 30px; padding: 4px 8px; border-color: #713c3c; background: transparent; color: #f0b1b1; }
+.device-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.device-list .approve-device { color: #bde9cd; border-color: #4e9d72; background: #193a27; }
+.approval-modal { width: min(100%, 560px); max-height: calc(100dvh - 40px); overflow-y: auto; }
+.approval-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.approval-modal .card, .approval-content { display: grid; gap: 14px; }
+.approval-modal label { display: grid; gap: 6px; color: #bac3be; font-size: 13px; }
+.approval-modal .check { display: flex; align-items: center; }
+.approval-modal .check input { width: auto; min-height: auto; }
+.approval-modal a { color: #a8ebc2; }
+.approval-modal .secret { white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-modal .error { color: #ffbaba; }
+.approval-modal .modal-description { display: grid; gap: 14px; margin-top: 14px; }
+.approval-modal .modal-description > div { display: grid; gap: 10px; border-top: 1px solid #354039; padding-top: 14px; }
+.approval-modal button small { display: block; font-size: 11px; color: #bac3be; }
 .toolbar { display: flex; gap: 10px; margin-bottom: 18px; }
 .create-user { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr auto; gap: 14px; align-items: end; border: 1px solid #35423b; border-radius: 8px; padding: 18px; margin-bottom: 24px; background: #171e1a; }
 .create-user p, .modal p { color: #98a49d; font-size: 12px; margin: 0; line-height: 1.5; }

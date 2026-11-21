@@ -29,6 +29,14 @@ import com.agentpocket.app.ui.screens.InboxScreen
 import com.agentpocket.app.ui.screens.NewTaskScreen
 import com.agentpocket.app.ui.screens.SessionDetailScreen
 import com.agentpocket.app.ui.theme.AgentPocketTheme
+import com.agentpocket.app.ui.theme.SkinStyle
+import com.agentpocket.app.ui.theme.SkinPicker
+import androidx.compose.material3.Surface
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,7 +46,9 @@ import kotlinx.coroutines.launch
 class UiPreviewActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge(statusBarStyle = SystemBarStyle.light(0, 0), navigationBarStyle = SystemBarStyle.light(0, 0))
+        val previewSkin = SkinStyle.fromId(intent.getStringExtra("skin"))
+        val bars = if (previewSkin == SkinStyle.Pixel) SystemBarStyle.dark(0) else SystemBarStyle.light(0, 0)
+        enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
         val streaming = intent.getStringExtra("screen") == "stream"
         val apiPreview = intent.getStringExtra("screen") == "api"
         val grokPreview = intent.getStringExtra("screen") == "grok"
@@ -55,8 +65,11 @@ class UiPreviewActivity : ComponentActivity() {
             BackHandler(enabled = thread != null || newTaskAgentId != null) {
                 if (newTaskAgentId != null) newTaskAgentId = null else thread = null
             }
-            AgentPocketTheme {
-                if (apiPreview || grokPreview || newTaskAgentId != null) {
+            var skin by remember { mutableStateOf(previewSkin) }
+            AgentPocketTheme(skin = skin, onSkinChange = { skin = it }) {
+                if (intent.getStringExtra("screen") == "skins") {
+                    Surface(Modifier.fillMaxSize()) { Column(Modifier.padding(horizontal = 16.dp, vertical = 48.dp)) { SkinPicker() } }
+                } else if (apiPreview || grokPreview || newTaskAgentId != null) {
                     NewTaskScreen(
                         repo = repository,
                         initialAgentId = newTaskAgentId ?: if (grokPreview) "grok" else "codex",

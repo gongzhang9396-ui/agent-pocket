@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts serve",
-    "build": "tsc -p tsconfig.json && tsc -p admin/tsconfig.json --noEmit && vite build --config admin/vite.config.ts",
+    "build": "tsc -p tsconfig.json && tsc -p admin/tsconfig.json --noEmit && tsc -p web/tsconfig.json && vite build --config admin/vite.config.ts && vite build --config web/vite.config.ts",
     "start": "node dist/cli.js serve",
     "bootstrap": "tsx src/cli.ts bootstrap",
     "register-update": "tsx src/register-update.ts",
@@ -19,12 +19,16 @@
     "firebase-admin": "14.3.0",
     "libsodium-wrappers-sumo": "0.8.4",
     "lucide-react": "^0.468.0",
+    "qrcode": "1.5.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
     "ws": "8.21.3"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
+    "@types/qrcode": "1.5.6",
     "@types/react": "^19.1.16",
     "@types/react-dom": "^19.1.9",
     "@types/ws": "^8.18.1",

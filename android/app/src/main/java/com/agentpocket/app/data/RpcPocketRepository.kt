@@ -54,11 +54,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -145,7 +145,10 @@ private data class ChannelState(
     val ready: CompletableDeferred<Unit> = CompletableDeferred(),
 )
 
-class RpcPocketRepository(private val context: Context) : PocketRepository {
+class RpcPocketRepository internal constructor(
+    private val context: Context,
+    private val sessions: RelaySessionManager,
+) : PocketRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val secure = SecurePrefs(context)
     private val json = RelayProtocolJson
@@ -158,6 +161,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val innerIds = AtomicLong(1)
     private val hostInfos = mutableMapOf<String, RelayHostInfo>()
     private val capabilitiesByHost = mutableMapOf<String, Set<String>>()
+    private val wakeAttestedChannels = mutableMapOf<String, String>()
     private val threadLists = mutableMapOf<String, List<ThreadSummary>>()
     private val grokListMutexes = mutableMapOf<String, Mutex>()
     private val grokListJobs = mutableMapOf<String, Job>()
@@ -187,7 +191,6 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private val deltaJobs = mutableMapOf<Pair<String, String>, Job>()
     private val notificationRefs = mutableMapOf<String, String>()
     private val hostEventMutexes = mutableMapOf<String, Mutex>()
-    private val refreshMutex = Mutex()
     private val hostSyncJobs = mutableMapOf<String, Job>()
     private val hostSyncRerun = mutableSetOf<String>()
     private val threadRefreshJobs = mutableMapOf<String, Job>()
@@ -255,10 +258,20 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     override val refreshingThreads: StateFlow<Set<String>> = _refreshingThreads.asStateFlow()
 
     init {
+        scope.launch {
+            sessions.requiresLogin.collect { required ->
+                if (required) {
+                    _authStatus.value = "登录已失效，请到设置重新登录"
+                    _actionError.value = "登录已失效，请到设置重新登录；设备身份已保留"
+                    rpc?.close()
+                    markRelayDisconnected("登录已失效，请到设置重新登录")
+                }
+            }
+        }
         context.getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(
             object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) { if (!pausedForLimit && _isPaired.value) reconnect() }
-                override fun onLost(network: Network) { rpc?.close() }
+                override fun onAvailable(network: Network) { scope.launch { if (!pausedForLimit && _isPaired.value) reconnect() } }
+                override fun onLost(network: Network) { scope.launch { rpc?.close() } }
             },
         )
         when {
@@ -295,6 +308,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             _authStatus.value = "Relay 地址、用户名或密码格式不正确"
             return
         }
+        val loginGeneration = sessions.generation()
         scope.launch {
             _authStatus.value = "正在登录"
             runCatching {
@@ -336,8 +350,11 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                     ).requireObject("激活账号")
                     credentialsFromRegistration(relayUrl, username.lowercase(), material, result)
                 }
+            }.mapCatching { credentials ->
+                sessions.replace(loginGeneration, credentials)
+                credentials
             }.onSuccess { credentials ->
-                secure.save(credentials)
+                disconnectReplacedSession()
                 _device.value = deviceModel(credentials)
                 if (credentials.approved) {
                     _isPaired.value = true
@@ -361,6 +378,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             _authStatus.value = "邀请链接或注册信息格式不正确"
             return
         }
+        val loginGeneration = sessions.generation()
         scope.launch {
             _authStatus.value = "正在创建加密身份"
             runCatching {
@@ -386,11 +404,14 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                     ),
                 ).requireObject("接受邀请")
                 credentialsFromRegistration(endpoint, username.lowercase(), material, result)
+            }.mapCatching { credentials ->
+                sessions.replace(loginGeneration, credentials)
+                credentials
             }.onSuccess { credentials ->
-                secure.save(credentials)
                 _device.value = deviceModel(credentials)
                 _isPaired.value = true
                 _authStatus.value = "注册完成"
+                disconnectReplacedSession()
                 BridgeSyncService.start(context)
                 reconnect()
             }.onFailure { _authStatus.value = it.message ?: "注册失败" }
@@ -427,19 +448,22 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     override fun approveHostFromQr(payload: String, name: String?) = prepareHostFromQr(payload)
 
     override fun changePassword(currentPassword: String, newPassword: String) {
-        val credentials = secure.load()?.takeIf { it.approved }
-        if (credentials == null || currentPassword.length !in 12..128 || newPassword.length !in 12..128) {
+        if (currentPassword.length !in 12..128 || newPassword.length !in 12..128) {
             _actionError.value = "当前密码和新密码都必须为 12-128 个字符"
             return
         }
         scope.launch {
             runCatching {
+                val session = sessions.snapshot()
+                val credentials = sessions.fresh(session)
+                currentCoroutineContext().ensureActive()
                 apiPostAuthorized(
                     credentials.endpoint,
                     "/api/account/password",
                     obj("currentPassword" to currentPassword, "newPassword" to newPassword),
                     credentials.accessToken,
                 )
+                sessions.withCurrent(session) { }
             }.onSuccess {
                 _actionError.value = null
                 _authStatus.value = "密码已修改"
@@ -532,6 +556,11 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             _actionError.value = "启动失败：目标电脑当前离线"
             return
         }
+        val originalChannel = channels[hostId]
+        if (!canRequestDesktopWake(true, hostSupports("desktop-wake-safe-v2", hostId), wakeAttestedChannels[hostId], originalChannel?.crypto?.channelId, _hostRuntimes.value[hostId]) || originalChannel == null) {
+            _actionError.value = "启动失败：请先刷新电脑状态，或更新电脑端 Host"
+            return
+        }
         _hostRuntimes.value = _hostRuntimes.value + (
             hostId to (_hostRuntimes.value[hostId] ?: HostRuntime(hostId)).copy(
                 desktopState = DesktopRuntimeState.Starting,
@@ -540,8 +569,12 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         )
         scope.launch {
             runCatching {
-                val result = innerCall(hostId, "desktop/launch").requireObject("启动 Desktop")
-                updateHostRuntime(hostId, result)
+                if (!sameWakeChannel(originalChannel, channels[hostId]) || hostInfos[hostId]?.online != true ||
+                    wakeAttestedChannels[hostId] != originalChannel.crypto.channelId || !hostSupports("desktop-wake-safe-v2", hostId)) {
+                    throw BridgeRpcException("连接已变化，请刷新电脑状态后再试", CHANNEL_CLOSED_CODE)
+                }
+                val result = innerCall(hostId, "desktop/launch", expectedChannel = originalChannel).requireObject("启动 Desktop")
+                if (channels[hostId] === originalChannel && hostInfos[hostId]?.online == true) updateHostRuntime(hostId, result)
                 delay(2_000)
                 fetchHostRuntime(hostId)
             }.onFailure {
@@ -899,6 +932,10 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     override fun pairFromQr(payload: String) = approveHostFromQr(payload)
 
     override fun resetPairing() {
+        try { sessions.clear() } catch (_: Exception) {
+            _actionError.value = "无法保存退出状态，请检查手机存储空间后重试"
+            return
+        }
         connectionGeneration.incrementAndGet()
         connectionJob?.cancel()
         pendingApprovalJob?.cancel()
@@ -938,6 +975,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         rpc?.close()
         channels.clear()
         capabilitiesByHost.clear()
+        wakeAttestedChannels.clear()
         projectsByHost.clear()
         modelsByHost.clear()
         agentsByHost.clear()
@@ -978,7 +1016,33 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     override fun clearActionError() { _actionError.value = null }
 
+    private fun disconnectReplacedSession() {
+        connectionGeneration.incrementAndGet()
+        connectionJob?.cancel()
+        connectionJob = null
+        pendingApprovalJob?.cancel()
+        pendingApprovalJob = null
+        rpc?.close()
+        clearRelayChannels()
+        _actionError.value = null
+    }
+
+    private fun clearRelayChannels() {
+        val disconnected = BridgeRpcException("Relay 连接中断，正在自动恢复", CONNECTION_LOST_CODE)
+        // Drain first: completing a deferred can immediately resume its Main waiter.
+        val disconnectedChannels = channels.values.toList()
+        channels.clear()
+        capabilitiesByHost.clear()
+        wakeAttestedChannels.clear()
+        _hostRuntimes.value = emptyMap()
+        disconnectedChannels.forEach { it.ready.completeExceptionally(disconnected) }
+        val disconnectedCalls = innerPending.values.toList()
+        innerPending.clear()
+        disconnectedCalls.forEach { it.completeExceptionally(disconnected) }
+    }
+
     private fun reconnect() {
+        if (sessions.requiresLogin.value) return
         if (pausedForLimit || secure.load()?.approved != true) return
         if (connectionJob?.isActive == true) return
         val generation = connectionGeneration.incrementAndGet()
@@ -989,12 +1053,18 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     private suspend fun connectLoop(initialGeneration: Long) {
         var generation = initialGeneration
         var backoff = 1_000L
-        while (currentCoroutineContext().isActive && !pausedForLimit) {
-            var credentials = secure.load()?.takeIf { it.approved } ?: return
+        var rejectedAccessToken: String? = null
+        var recoveredAuthentication = false
+        while (currentCoroutineContext().isActive && !pausedForLimit && !sessions.requiresLogin.value) {
+            val session = runCatching { sessions.snapshot() }.getOrNull() ?: return
+            var credentials = session.credentials
             var client: BridgeRpcClient? = null
             var connectionReady: CompletableDeferred<Unit>? = null
             try {
-                if (credentials.accessExpiresAt < System.currentTimeMillis() + 30_000) credentials = refreshCredentials(credentials)
+                credentials = sessions.fresh(session, rejectedAccessToken)
+                if (rejectedAccessToken != null) recoveredAuthentication = true
+                rejectedAccessToken = null
+                currentCoroutineContext().ensureActive()
                 markRelayConnecting()
                 val clientGeneration = generation
                 val nextReady = CompletableDeferred<Unit>()
@@ -1018,6 +1088,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 nextClient.connect()
                 withTimeout(15_000) { nextClient.awaitOpen() }
                 nextClient.call("relay/hello", obj("protocolVersion" to 2, "deviceId" to credentials.deviceId))
+                recoveredAuthentication = false
                 nextReady.complete(Unit)
                 backoff = 1_000L
                 approvePendingHostEnrollment(credentials)
@@ -1025,23 +1096,29 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 nextClient.awaitClosed()
             } catch (error: Throwable) {
                 if (!currentCoroutineContext().isActive) return
+                if (error is SignInRequiredException || error is SessionChangedException) return
+                if (error is BridgeRpcException && error.nameCode == "AUTH_FAILED") {
+                    if (recoveredAuthentication) {
+                        runCatching { sessions.rejectAccess(session, credentials.accessToken) }
+                        if (sessions.requiresLogin.value) return
+                    }
+                    rejectedAccessToken = credentials.accessToken
+                }
             } finally {
                 val disconnected = BridgeRpcException("Relay 连接中断，正在自动恢复", CONNECTION_LOST_CODE)
                 if (rpc === client) rpc = null
                 if (relayReady === connectionReady) relayReady = null
                 client?.close()
                 connectionReady?.completeExceptionally(disconnected)
-                // Completing a deferred resumes its waiter immediately on Main.immediate.
-                // Drain the maps first so waiter cleanup cannot mutate a map while it is
-                // being iterated (which would crash with ConcurrentModificationException).
-                val disconnectedChannels = channels.values.toList()
-                channels.clear()
-                disconnectedChannels.forEach { it.ready.completeExceptionally(disconnected) }
-                val disconnectedCalls = innerPending.values.toList()
-                innerPending.clear()
-                disconnectedCalls.forEach { it.completeExceptionally(disconnected) }
+                if (generation == connectionGeneration.get()) {
+                    clearRelayChannels()
+                }
             }
             if (!currentCoroutineContext().isActive) return
+            if (sessions.requiresLogin.value) {
+                markRelayDisconnected("登录已失效，请到设置重新登录")
+                return
+            }
             markRelayDisconnected()
             generation = connectionGeneration.incrementAndGet()
             delay(backoff)
@@ -1064,6 +1141,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             hostInfos[info.id] = info
         }
         capabilitiesByHost.keys.retainAll(hostInfos.keys)
+        (wakeAttestedChannels.keys + _hostRuntimes.value.keys).filter { hostInfos[it]?.online != true }.toSet().forEach(::invalidateHostWake)
         updateHosts()
     }
 
@@ -1183,14 +1261,18 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private suspend fun loadHostCapabilities(hostId: String) {
             val credentials = secure.load()?.takeIf { it.approved } ?: throw BridgeRpcException("尚未登录")
+            val state = ensureChannel(hostId)
+            invalidateHostWake(hostId)
             val hello = innerCall(
                 hostId,
                 "bridge/hello",
                 obj("protocolVersion" to 1, "deviceId" to credentials.deviceId),
             ).requireObject("Host 能力")
+            if (channels[hostId] !== state || hostInfos[hostId]?.online != true) return
             capabilitiesByHost[hostId] = hello.array("capabilities")
                 .mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
                 .toSet()
+            if (hostSupports("desktop-wake-safe-v2", hostId)) wakeAttestedChannels[hostId] = state.crypto.channelId
     }
 
     private fun scheduleHostMetadataSync(hostId: String) {
@@ -1249,7 +1331,9 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
     }
 
     private suspend fun fetchHostRuntime(hostId: String) {
-        updateHostRuntime(hostId, innerCall(hostId, "host/runtime").requireObject("Desktop 状态"))
+        val state = ensureChannel(hostId)
+        val result = innerCall(hostId, "host/runtime").requireObject("Desktop 状态")
+        if (channels[hostId] === state && hostInfos[hostId]?.online == true) updateHostRuntime(hostId, result)
     }
 
     private fun updateHostRuntime(hostId: String, value: JsonObject) {
@@ -1267,6 +1351,8 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 attachReady = desktop?.boolean("attachReady") == true,
                 processRunning = desktop?.boolean("processRunning") == true,
                 canWake = desktop?.boolean("canWake") == true,
+                safeLaunch = desktop?.boolean("safeLaunch") == true && channels[hostId]?.crypto?.channelId != null &&
+                    wakeAttestedChannels[hostId] == channels[hostId]?.crypto?.channelId && hostInfos[hostId]?.online == true,
                 bridgeReady = value.obj("bridge")?.let { it.string("state") == "ready" },
                 bridgeVersion = value.obj("bridge")?.string("version"),
             )
@@ -1624,6 +1710,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             } catch (error: Throwable) {
                 // 通道未就绪或握手失败：丢弃后重建，而不是让这台 Host 永久占着一条死通道。
                 channels.remove(hostId, existing)
+                invalidateHostWake(hostId)
                 if (error is CancellationException && error !is TimeoutCancellationException) throw error
             }
         }
@@ -1631,6 +1718,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         val host = hostInfos[hostId]?.takeIf { it.online } ?: throw BridgeRpcException("目标电脑离线", "HOST_OFFLINE")
         val (crypto, envelope) = RelayCrypto.openChannel(credentials, host, UUID.randomUUID().toString())
         val state = ChannelState(crypto)
+        invalidateHostWake(hostId)
         channels[hostId] = state
         try {
             outerCall("channel/open", buildJsonObject { put("envelope", json.encodeToJsonElement(RelayEnvelope.serializer(), envelope)) })
@@ -1638,15 +1726,20 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
             return state
         } catch (_: TimeoutCancellationException) {
             channels.remove(hostId, state)
+            invalidateHostWake(hostId)
             throw BridgeRpcException("Host 通道握手超时，正在自动恢复", CHANNEL_TIMEOUT_CODE)
         } catch (error: Throwable) {
             channels.remove(hostId, state)
+            invalidateHostWake(hostId)
             throw error
         }
     }
 
-    private suspend fun innerCall(hostId: String, method: String, params: JsonObject = JsonObject(emptyMap())): JsonElement {
-        val state = ensureChannel(hostId)
+    private suspend fun innerCall(hostId: String, method: String, params: JsonObject = JsonObject(emptyMap()), expectedChannel: ChannelState? = null): JsonElement {
+        val state = if (expectedChannel == null) ensureChannel(hostId) else {
+            if (!sameWakeChannel(expectedChannel, channels[hostId])) throw BridgeRpcException("Host 通道已变化，请刷新状态后再试", CHANNEL_CLOSED_CODE)
+            expectedChannel
+        }
         val id = innerIds.getAndIncrement()
         val deferred = CompletableDeferred<JsonElement>()
         innerPending[state.crypto.channelId to id] = deferred
@@ -1675,7 +1768,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 val state = channels.values.firstOrNull { it.crypto.channelId == envelope.channelId } ?: return
                 runCatching { state.crypto.accept(envelope) }
                     .onSuccess { state.ready.complete(Unit) }
-                    .onFailure { state.ready.completeExceptionally(it); channels.remove(envelope.hostId) }
+                    .onFailure { state.ready.completeExceptionally(it); if (channels.remove(envelope.hostId, state)) invalidateHostWake(envelope.hostId) }
             }
             "channel/data" -> {
                 val envelope = params.obj("envelope")?.let(::envelopeFromJson) ?: return
@@ -1689,7 +1782,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 } ?: pending.complete(response["result"] ?: JsonNull)
             }
             "channel/close" -> params.string("channelId")?.let { channelId ->
-                channels.entries.removeAll { it.value.crypto.channelId == channelId }
+                channels.filterValues { it.crypto.channelId == channelId }.keys.toList().forEach { hostId -> channels.remove(hostId); invalidateHostWake(hostId) }
                 val error = BridgeRpcException("Host 通道已关闭，正在自动恢复", CHANNEL_CLOSED_CODE)
                 innerPending.keys.filter { it.first == channelId }.forEach { key ->
                     innerPending.remove(key)?.completeExceptionally(error)
@@ -1708,6 +1801,7 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                 val hostId = params.string("hostId") ?: return
                 if (hostInfos[hostId] == null) syncHosts()
                 if (params.boolean("online") != true) {
+                    invalidateHostWake(hostId)
                     channels.remove(hostId)?.let { state ->
                         state.ready.completeExceptionally(BridgeRpcException("目标电脑已离线", CHANNEL_CLOSED_CODE))
                         innerPending.keys.filter { it.first == state.crypto.channelId }.toList().forEach { key ->
@@ -2108,22 +2202,30 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
         if (pendingApprovalJob?.isActive == true) return
         pendingApprovalJob = scope.launch {
             while (currentCoroutineContext().isActive) {
-                var credentials = secure.load()?.takeIf { it.deviceStatus == "pending" } ?: return@launch
+                val session = runCatching { sessions.snapshot(approvedOnly = false) }.getOrNull() ?: return@launch
+                val credentials = session.credentials.takeIf { it.deviceStatus == "pending" } ?: return@launch
                 runCatching {
-                    if (credentials.accessExpiresAt < System.currentTimeMillis() + 30_000) credentials = refreshCredentials(credentials)
-                    apiGet(credentials.endpoint, "/api/device/status", credentials.accessToken).requireObject("设备状态")
-                }.onSuccess { result ->
-                    val device = result.obj("device") ?: return@onSuccess
-                    if (device.string("status") != "approved") return@onSuccess
-                    val packageValue = device.string("keyPackage") ?: return@onSuccess
+                    sessions.read(session) { current ->
+                        try {
+                            apiGet(current.endpoint, "/api/device/status", current.accessToken).requireObject("设备状态")
+                        } catch (error: BridgeRpcException) {
+                            if (error.nameCode == "AUTH_FAILED") throw AccessRejectedException()
+                            throw error
+                        }
+                    }
+                }.mapCatching { result ->
+                    val device = result.obj("device") ?: return@mapCatching null
+                    if (device.string("status") != "approved") return@mapCatching null
+                    val packageValue = device.string("keyPackage") ?: return@mapCatching null
                     val secret = RelayCrypto.openAccountPackage(packageValue, credentials.deviceKeys())
-                    val approved = credentials.copy(
+                    sessions.update(session) { it.copy(
                         deviceStatus = "approved",
                         accountSigningPrivateKey = secret.signingPrivateKey,
                         accountEncryptionPrivateKey = secret.encryptionPrivateKey,
                         contentKey = secret.contentKey,
-                    )
-                    secure.save(approved)
+                    ) }
+                }.onSuccess { approved ->
+                    if (approved == null) return@onSuccess
                     _device.value = deviceModel(approved)
                     _isPaired.value = true
                     _authStatus.value = "设备已批准"
@@ -2131,35 +2233,15 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
                     reconnect()
                     (context.applicationContext as? PocketApplication)?.updater?.checkForUpdates()
                 }.onFailure { error ->
-                    if (isPendingSessionRejected(error)) {
-                        secure.clearCredentials()
-                        _device.value = deviceModel(null)
+                    if (error is SignInRequiredException) {
                         _isPaired.value = false
-                        _authStatus.value = "待批准设备已失效，请重新登录"
-                    } else {
+                        _authStatus.value = "登录已失效，请重新登录；设备身份已保留"
+                    } else if (error !is SessionChangedException && error !is CancellationException) {
                         _authStatus.value = "等待批准：${error.message}"
                     }
                 }
-                if (_isPaired.value) return@launch
+                if (_isPaired.value || sessions.requiresLogin.value || session.generation != sessions.generation()) return@launch
                 delay(5_000)
-            }
-        }
-    }
-
-    private suspend fun refreshCredentials(credentials: RelayCredentials): RelayCredentials {
-        return refreshMutex.withLock {
-            withContext(NonCancellable) {
-                val current = secure.load()?.takeIf { it.approved && sameEndpoint(it.endpoint, credentials.endpoint) } ?: credentials
-                if (current.accessExpiresAt >= System.currentTimeMillis() + 30_000) return@withContext current
-                val result = apiPost(current.endpoint, "/api/auth/refresh", obj("refreshToken" to current.refreshToken)).requireObject("刷新登录")
-                val updated = current.copy(
-                    accessToken = result.string("accessToken") ?: error("刷新结果缺少 accessToken"),
-                    refreshToken = result.string("refreshToken") ?: error("刷新结果缺少 refreshToken"),
-                    accessExpiresAt = result.long("accessExpiresAt") ?: error("刷新结果缺少有效期"),
-                    refreshExpiresAt = result.long("refreshExpiresAt") ?: current.refreshExpiresAt,
-                )
-                secure.save(updated)
-                updated
             }
         }
     }
@@ -2299,10 +2381,19 @@ class RpcPocketRepository(private val context: Context) : PocketRepository {
 
     private fun markRelayConnecting() { _host.value = aggregateHost("正在连接 Relay").copy(connectionState = ConnectionState.Connecting) }
     private fun markRelayDisconnected(message: String = "连接暂时中断，正在自动重连") {
+        capabilitiesByHost.clear()
+        wakeAttestedChannels.clear()
+        _hostRuntimes.value = emptyMap()
         hostInfos.replaceAll { _, value -> value.copy(online = false) }
         queueActiveThreadRefresh()
         updateHosts()
         _host.value = aggregateHost(message)
+    }
+
+    private fun invalidateHostWake(hostId: String) {
+        capabilitiesByHost.remove(hostId)
+        wakeAttestedChannels.remove(hostId)
+        _hostRuntimes.value = _hostRuntimes.value - hostId
     }
 
     private fun queueActiveThreadRefresh() {

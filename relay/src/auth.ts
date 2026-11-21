@@ -1,4 +1,4 @@
-import { randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { RelayError } from "./protocol.js";
 
 export type PasswordCost = { N: number; r: number; p: number; maxmem: number };
@@ -44,6 +44,15 @@ export async function hashPassword(password: string, cost = PRODUCTION_PASSWORD_
   const salt = randomBytes(SCRYPT_SALT_BYTES);
   const derived = await scrypt(password, salt, SCRYPT_KEY_BYTES, cost);
   return `scrypt$${cost.N}$${cost.r}$${cost.p}$${salt.toString("base64url")}$${derived.toString("base64url")}`;
+}
+
+/** An idempotency receipt must not introduce a cheap offline password oracle. */
+export async function passwordOperationFingerprint(password: string, context: readonly unknown[], cost = PRODUCTION_PASSWORD_COST) {
+  validatePassword(password);
+  if (!validCost(cost.N, cost.r, cost.p)) throw new RelayError("INVALID_REQUEST", "scrypt 参数无效");
+  const salt = createHash("sha256").update(JSON.stringify(["web-password-operation-v1", ...context])).digest().subarray(0, SCRYPT_SALT_BYTES);
+  const derived = await scrypt(password, salt, SCRYPT_KEY_BYTES, cost);
+  return `scrypt-op-v1$${cost.N}$${cost.r}$${cost.p}$${derived.toString("base64url")}`;
 }
 
 export async function verifyPassword(password: string, encoded: string) {

@@ -17,8 +17,8 @@ export class TaskCatalog {
   private codex: CodexAppServer;
   private roots: string[];
   private describe: (thread: any) => any;
-  private observe: (thread: any, newestFirstTurns: any[]) => void;
-  constructor(codex: CodexAppServer, roots: string[], describe: (thread: any) => any, observe: (thread: any, turns: any[]) => void = () => {}) {
+  private observe: (thread: any, newestFirstTurns: any[]) => any[] | void;
+  constructor(codex: CodexAppServer, roots: string[], describe: (thread: any) => any, observe: (thread: any, turns: any[]) => any[] | void = () => {}) {
     this.codex = codex;
     this.roots = roots;
     this.describe = describe;
@@ -126,7 +126,7 @@ export class TaskCatalog {
   private historyPage(metadata: any, turns: any[], nativeCursor?: string, nextNativeCursor?: string,
     before?: HistoryPosition, legacy = false) {
     // Observe structured interactions before the byte limit trims a long active turn.
-    this.observe(metadata, turns);
+    turns = this.observe(metadata, turns) || turns;
     const thread = this.describe({ ...metadata, turns: [] });
     const selected: any[] = [];
     // Reserve room for the opaque cursor and response envelope, measured in

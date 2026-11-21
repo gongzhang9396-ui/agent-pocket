@@ -5,6 +5,15 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 
 const IPC_PROTOCOL_VERSION = 1;
 const MAX_IPC_MESSAGE_BYTES = 2 * 1024 * 1024;
+export const DESKTOP_APPROVAL_CAPABILITY = "desktop-approval-v1";
+
+export type DesktopApproval = {
+  id: string | number; method: string; fingerprint: string; available: boolean;
+  allowedDecisions: string[]; params: Record<string, any>; unavailableReason?: string;
+};
+export type DesktopApprovals = {
+  threadId: string; cwd: string; ownerClientId: string; available: boolean; requests: DesktopApproval[];
+};
 
 type DesktopAttachRegistration = {
   protocolVersion: number;
@@ -273,16 +282,24 @@ export class DesktopAttachClient {
     });
   }
 
+  readApprovals(threadId: string, cwd: string): Promise<DesktopApprovals> {
+    return this.request("thread/approvals", { threadId, cwd }, { capability: DESKTOP_APPROVAL_CAPABILITY });
+  }
+
+  respondApproval(params: { threadId: string; cwd: string; ownerClientId: string; requestId: string | number; fingerprint: string; decision: string }) {
+    return this.request("approval/respond", params, { write: true, capability: DESKTOP_APPROVAL_CAPABILITY });
+  }
+
   async request(method: string, params: Record<string, unknown>, options: { write?: boolean; timeoutMs?: number; capability?: string } = {}) {
-    const registration = this.registration();
-    if (!registration.capabilities.includes(method)) {
-      return Promise.reject(new Error(`Desktop Attach 当前不支持：${method}`));
-    }
-    if (options.capability && !registration.capabilities.includes(options.capability)) {
-      return Promise.reject(new Error(`Desktop Attach 当前不支持：${options.capability}`));
-    }
-    if (options.write && registration.readOnly) {
-      return Promise.reject(new Error("Desktop Attach 当前处于只读模式"));
+    let registration: DesktopAttachRegistration;
+    try {
+      registration = this.registration();
+      if (!registration.capabilities.includes(method)) throw new Error(`Desktop Attach 当前不支持：${method}`);
+      if (options.capability && !registration.capabilities.includes(options.capability)) throw new Error(`Desktop Attach 当前不支持：${options.capability}`);
+      if (options.write && registration.readOnly) throw new Error("Desktop Attach 当前处于只读模式");
+    } catch (error) {
+      if (options.write && error instanceof Error) Object.assign(error, { delivery: "not_sent" });
+      throw error;
     }
 
     return new Promise<any>((resolvePromise, rejectPromise) => {
@@ -290,12 +307,17 @@ export class DesktopAttachClient {
       let buffer = "";
       let authenticated = false;
       let settled = false;
+      let dispatched = false;
       const finish = (error?: unknown, value?: unknown) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         socket.destroy();
-        if (error) rejectPromise(error instanceof Error ? error : new Error(String(error)));
+        if (error) {
+          const failure: any = error instanceof Error ? error : new Error(String(error));
+          if (options.write && !failure.delivery) failure.delivery = dispatched ? "unknown" : "not_sent";
+          rejectPromise(failure);
+        }
         else resolvePromise(value);
       };
       const send = (id: number, requestMethod: string, requestParams: Record<string, unknown>) => {
@@ -345,9 +367,12 @@ export class DesktopAttachClient {
               return;
             }
             authenticated = true;
+            dispatched = true;
             send(2, method, params);
           } else if (message.id === 2 && authenticated) {
-            if (message.error) finish(new Error(message.error.message || `Desktop Attach 调用失败：${method}`));
+            if (message.error) finish(Object.assign(new Error(message.error.message || `Desktop Attach 调用失败：${method}`),
+              options.write && message.error.data?.delivery === "not_sent"
+                ? { delivery: "not_sent", approvalCode: message.error.data.code } : {}));
             else finish(undefined, message.result);
             return;
           }

@@ -21,6 +21,8 @@ New-Item -ItemType Directory -Force -Path $attachmentsPath | Out-Null
 try { $codexCommand = Resolve-CodexCommand ([string]$config.codexCommand) }
 catch { $codexCommand = 'codex'; Write-Warning 'Codex CLI 尚未就绪；Host 将继续提供其他 Agent。' }
 if (-not [string]::IsNullOrWhiteSpace([string]$config.grokCommand)) { $env:AGENT_POCKET_GROK = [string]$config.grokCommand }
+if (-not [string]::IsNullOrWhiteSpace([string]$config.dshRuntimeRoot)) { $env:AGENT_POCKET_DSH_RUNTIME = [string]$config.dshRuntimeRoot }
+if (-not [string]::IsNullOrWhiteSpace([string]$config.dshHome)) { $env:DSH_HOME = [string]$config.dshHome }
 $env:AGENT_POCKET_PORT = '0'
 $env:AGENT_POCKET_DB = Join-Path $stateDir 'bridge-v2.db'
 $env:AGENT_POCKET_ATTACHMENTS_DIR = $attachmentsPath
@@ -29,6 +31,7 @@ $env:AGENT_POCKET_PROJECT_ROOTS = $roots -join [IO.Path]::PathSeparator
 $env:AGENT_POCKET_RELAY_URL = [string]$config.relayUrl
 $env:AGENT_POCKET_HOST_NAME = [string]$config.hostName
 $env:AGENT_POCKET_RELAY_IDENTITY = Join-Path $env:LOCALAPPDATA 'AgentPocket\relay-host.json'
+$env:AGENT_POCKET_DESKTOP_INTEGRATION_ENABLED = if ($config.desktopIntegrationEnabled -eq $false) { '0' } else { '1' }
 $node = Join-Path $installDir 'node\node.exe'
 $entry = Join-Path $installDir 'bridge\src\cli.ts'
 $outputLog = Join-Path $stateDir 'host-v2.log'

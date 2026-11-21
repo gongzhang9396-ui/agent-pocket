@@ -1,0 +1,5 @@
+.desktop-wake { flex: none; margin: 0 12px 10px; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 12px; color: var(--ink-soft); font-size: 13px; }
+.desktop-wake-row { display: flex; align-items: center; gap: 8px; min-height: 32px; }
+.desktop-wake-row > span { flex: 1; min-width: 0; }
+.desktop-wake-action { width: 100%; min-height: 40px; margin-top: 6px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); color: var(--ink); }
+.desktop-wake p { margin: 8px 0 0; line-height: 1.45; }

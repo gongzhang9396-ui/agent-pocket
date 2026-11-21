@@ -22,8 +22,8 @@ $env:AGENT_POCKET_RELAY_IDENTITY = $identityPath
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Agent Pocket 配对助手'
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object Drawing.Size(480, 650)
-$form.MinimumSize = New-Object Drawing.Size(496, 689)
+$form.ClientSize = New-Object Drawing.Size(480, 710)
+$form.MinimumSize = New-Object Drawing.Size(496, 749)
 $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 10)
 $form.BackColor = [Drawing.Color]::FromArgb(245, 247, 250)
 
@@ -35,7 +35,7 @@ $title.Location = New-Object Drawing.Point(24, 20)
 $form.Controls.Add($title)
 
 $subtitle = New-Object Windows.Forms.Label
-$subtitle.Text = '打开 Agent Pocket，扫描二维码后输入账号密码。首次登录会自动激活并绑定。'
+$subtitle.Text = 'iPhone 用相机扫码打开网页。先完成账号开通和验证码绑定，再确认这台电脑。Android App 可切换二维码。'
 $subtitle.ForeColor = [Drawing.Color]::FromArgb(82, 91, 103)
 $subtitle.Location = New-Object Drawing.Point(26, 62)
 $subtitle.Size = New-Object Drawing.Size(425, 44)
@@ -71,21 +71,65 @@ $form.Controls.Add($progress)
 
 $refreshButton = New-Object Windows.Forms.Button
 $refreshButton.Text = '刷新二维码'
-$refreshButton.Location = New-Object Drawing.Point(28, 585)
+$refreshButton.Location = New-Object Drawing.Point(28, 648)
 $refreshButton.Size = New-Object Drawing.Size(205, 42)
 $refreshButton.Enabled = $false
 $form.Controls.Add($refreshButton)
 
 $closeButton = New-Object Windows.Forms.Button
 $closeButton.Text = '关闭'
-$closeButton.Location = New-Object Drawing.Point(246, 585)
+$closeButton.Location = New-Object Drawing.Point(246, 648)
 $closeButton.Size = New-Object Drawing.Size(205, 42)
 $form.Controls.Add($closeButton)
+
+$openWebButton = New-Object Windows.Forms.Button
+$openWebButton.Text = '在浏览器打开'
+$openWebButton.Location = New-Object Drawing.Point(28, 583)
+$openWebButton.Size = New-Object Drawing.Size(135, 42)
+$openWebButton.Enabled = $false
+$form.Controls.Add($openWebButton)
+$copyWebButton = New-Object Windows.Forms.Button
+$copyWebButton.Text = '复制网页链接'
+$copyWebButton.Location = New-Object Drawing.Point(172, 583)
+$copyWebButton.Size = New-Object Drawing.Size(135, 42)
+$copyWebButton.Enabled = $false
+$form.Controls.Add($copyWebButton)
+$qrModeButton = New-Object Windows.Forms.Button
+$qrModeButton.Text = 'Android App 码'
+$qrModeButton.Location = New-Object Drawing.Point(316, 583)
+$qrModeButton.Size = New-Object Drawing.Size(135, 42)
+$qrModeButton.Enabled = $false
+$form.Controls.Add($qrModeButton)
 
 $script:enrollProcess = $null
 $script:expiresAt = 0L
 $script:completed = $false
 $script:lastError = ''
+$script:webLink = ''
+$script:webQrFile = ''
+$script:appQrFile = ''
+$script:showWebQr = $true
+
+function Clear-WebPairingControls {
+    $script:webLink = ''
+    $openWebButton.Enabled = $false
+    $copyWebButton.Enabled = $false
+    $qrModeButton.Enabled = $false
+}
+
+function Read-WebPairingLink([string]$Path) {
+    $prefix = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'AgentPocket')).TrimEnd('\') + '\'
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($full) -notmatch '^pairing-[0-9a-f-]+-web\.txt$') { throw '网页链接文件路径无效。' }
+    $value = [IO.File]::ReadAllText($full).Trim()
+    $uri = [Uri]$value
+    $relay = [Uri]$relayUrl
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or
+        $uri.GetLeftPart([UriPartial]::Authority) -ne $relay.GetLeftPart([UriPartial]::Authority) -or
+        $uri.AbsolutePath -ne '/app/' -or $uri.Fragment -notmatch '^#pair=[0-9a-f-]{36}\.[A-Za-z0-9_-]{24,128}$') { throw '网页配对链接与当前 Relay 不一致。' }
+    return $value
+}
 
 function Set-QrImage([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
@@ -119,8 +163,18 @@ $handleOutput = [Action[string]] {
     switch ([string]$event.event) {
         'enrollment_started' {
             $script:expiresAt = [long]$event.expiresAt
-            Set-QrImage ([string]$event.qrFile)
-            $statusLabel.Text = '请用手机扫描二维码'
+            $script:appQrFile = [string]$event.qrFile
+            $script:webQrFile = [string]$event.webQrFile
+            $script:showWebQr = $true
+            if ($event.webLinkFile) {
+                try { $script:webLink = Read-WebPairingLink ([string]$event.webLinkFile) } catch { $script:webLink = '' }
+            }
+            if ($script:webQrFile) { Set-QrImage $script:webQrFile } else { Set-QrImage $script:appQrFile; $script:showWebQr = $false }
+            $qrModeButton.Text = if ($script:showWebQr) { 'Android App 码' } else { 'iPhone 网页码' }
+            $qrModeButton.Enabled = [bool]($script:appQrFile -and $script:webQrFile)
+            $openWebButton.Enabled = [bool]$script:webLink
+            $copyWebButton.Enabled = [bool]$script:webLink
+            $statusLabel.Text = '请用 iPhone 相机扫描网页二维码'
             $detailLabel.Text = "Relay：$relayUrl`r`n二维码将在 5 分钟后过期"
             $refreshButton.Enabled = $true
         }
@@ -135,6 +189,7 @@ $handleOutput = [Action[string]] {
             $statusLabel.ForeColor = [Drawing.Color]::FromArgb(22, 125, 78)
             $detailLabel.Text = 'Agent Pocket Host 已启动。现在可以在手机上查看任务。'
             $refreshButton.Enabled = $false
+            Clear-WebPairingControls
             Restart-AgentPocketHost
         }
     }
@@ -156,6 +211,7 @@ function Stop-EnrollmentProcess {
 
 function Start-Enrollment {
     Stop-EnrollmentProcess
+    Clear-WebPairingControls
     $script:completed = $false
     $script:lastError = ''
     $script:expiresAt = 0
@@ -201,12 +257,14 @@ $timer.add_Tick({
         $seconds = [int]($remaining % 60)
         $detailLabel.Text = "Relay：$relayUrl`r`n二维码剩余 $minutes 分 $($seconds.ToString('00')) 秒"
         if ($remaining -eq 0) {
+            Clear-WebPairingControls
             $statusLabel.Text = '二维码已过期，请刷新'
             $statusLabel.ForeColor = [Drawing.Color]::FromArgb(185, 72, 45)
             $refreshButton.Enabled = $true
         }
     }
     if ($script:enrollProcess -and $script:enrollProcess.HasExited -and -not $script:completed) {
+        Clear-WebPairingControls
         $statusLabel.Text = if ($script:lastError) { $script:lastError } else { '配对未完成，请刷新二维码重试' }
         $statusLabel.ForeColor = [Drawing.Color]::FromArgb(185, 72, 45)
         $refreshButton.Enabled = $true
@@ -214,6 +272,14 @@ $timer.add_Tick({
 })
 
 $refreshButton.add_Click({ Start-Enrollment })
+$openWebButton.add_Click({ if ($script:webLink) { [Diagnostics.Process]::Start($script:webLink) | Out-Null } })
+$copyWebButton.add_Click({ if ($script:webLink) { [Windows.Forms.Clipboard]::SetText($script:webLink) } })
+$qrModeButton.add_Click({
+    $script:showWebQr = -not $script:showWebQr
+    Set-QrImage $(if ($script:showWebQr) { $script:webQrFile } else { $script:appQrFile })
+    $qrModeButton.Text = if ($script:showWebQr) { 'Android App 码' } else { 'iPhone 网页码' }
+    $statusLabel.Text = if ($script:showWebQr) { '请用 iPhone 相机扫描网页二维码' } else { '请用 Android Agent Pocket 扫码' }
+})
 $closeButton.add_Click({ $form.Close() })
 $form.add_FormClosed({
     $timer.Stop()

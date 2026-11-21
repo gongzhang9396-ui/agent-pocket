@@ -22,6 +22,7 @@ data class HostRuntime(
     val attachReady: Boolean = false,
     val processRunning: Boolean = false,
     val canWake: Boolean = false,
+    val safeLaunch: Boolean = false,
     /** null means an older Host has not advertised executor health. */
     val bridgeReady: Boolean? = null,
     val bridgeVersion: String? = null,

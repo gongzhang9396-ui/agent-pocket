@@ -35,7 +35,7 @@ Agent Pocket 是一个 Android 远程 Codex 控制台。Codex Desktop、源码�
 - 任务正文、提示词、代码和命令使用端到端加密，Relay 只保存路由元数据和密文。
 - Android 和 Windows Host 都支持签名更新；Host 有活动任务时不会强制替换。
 
-Desktop 原生任务的硬中断、原生审批响应和结构化问题回答目前没有稳定插件接口。Agent Pocket 不会启动第二个 writer、删除锁或模拟坐标点击来强抢任务。
+Desktop 原生任务没有稳定的公开控制接口。当前开发版新增实验性网页审批：在 Desktop 原生通道确认支持时，可对命令执行和文件修改选择“允许本次 / 拒绝 / 取消”；其他审批、硬中断仍回 Desktop 处理。此能力尚未发布到 v0.3.2，验证边界见 [Desktop 审批说明](docs/DESKTOP-APPROVALS.md)。Agent Pocket 不会启动第二个 writer、删除锁或模拟坐标点击来强抢任务。
 
 Android v0.3 的界面方向和附件交互见 [视觉原型](docs/prototypes/agent-pocket-v03-overview.png)。Codex 已接入；当前开发代码新增 [Grok CLI 接入](docs/GROK-CLI.md)，支持电脑会话同步与手机续聊、新建任务、流式进度、审批与中断，尚未发布到稳定版。Kimi Code 仍待接入。
 
@@ -51,7 +51,7 @@ Codex Desktop 与 Host 启动的 `codex app-server --stdio` 是两个独立的 t
 
 | 任务 owner | 唯一 writer | 手机写入路径 | 能力边界 |
 |---|---|---|---|
-| `desktop` | Codex Desktop | Host → Desktop Attach → Desktop 自己的 task tools / queue | 可续写和等待；硬中断、审批与结构化问题仍回 Desktop 处理 |
+| `desktop` | Codex Desktop | Host → Desktop Attach → Desktop 自己的 task tools / queue；开发版审批走本地 follower 通道 | 可续写和等待；开发版按能力处理命令/文件审批，其他阻塞交互仍回 Desktop |
 | `bridge` | 独立 `codex app-server` | Host → JSON-RPC stdio | 支持续写、steer、中断、审批、问题与 Plan；任务虽可在 Desktop 查看，但不要从 Desktop 续写 |
 
 写保护分两层，不能混为一谈：

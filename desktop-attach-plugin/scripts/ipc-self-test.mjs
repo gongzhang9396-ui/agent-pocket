@@ -35,6 +35,9 @@ const desktop = net.createServer((socket) => {
       if (buffer.length < length + 4) return;
       const message = JSON.parse(buffer.subarray(4, length + 4).toString("utf8"));
       buffer = buffer.subarray(length + 4);
+      if (message.method === "tools/call") {
+        assert.equal(message.params?.callerSource, "codex");
+      }
       let result;
       if (message.method === "tools/list") {
         result = {

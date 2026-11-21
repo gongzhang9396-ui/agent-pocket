@@ -8,7 +8,7 @@
 | Codex Desktop | 回答 `request_user_input_async` 异步提问，包括多组选项和自由文本。命令、文件、权限等阻塞审批仍需在 Desktop 处理。 |
 | Grok CLI | 单次权限卡片和回应通道；审批独立于历史分页恢复，历史暂不可读时也能处理。 |
 
-Desktop 的异步问题保存在 `agentMessage` 的 `delivery: "async"`、`questions` 字段中。桥接器使用原始消息 ID 和问题序号生成稳定的请求标识，回复采用 Desktop 自身使用的 `send_user_message_question_reply` 结构。普通聊天内容不会被当作审批结果，也不会用异步回答绕过执行审批。
+Desktop 的异步问题可以由 `agentMessage` 的 `delivery: "async"`、`questions` 字段提供。新版历史缺少这些字段时，桥接器会有界读取本地 rollout，验证会话身份，并且仅在线程中的轮次、消息 ID 与 `request_user_input_async` 调用及其 `accepted: true` 结果匹配时恢复结构化问题。无法核实时不从普通消息猜测问题或选项。桥接器使用原始消息 ID 和问题序号生成稳定的请求标识，回复采用 Desktop 自身使用的 `send_user_message_question_reply` 结构。普通聊天内容不会被当作审批结果，也不会用异步回答绕过执行审批。
 
 读取历史时先索引问题，再按字节切页，因此长任务前面的待回答问题不会被末尾的大段工具输出遮掉。桥接器从原生用户回复恢复回答状态，返回 `pocketQuestion` / `pocketApproval` 卡片及 `interactionItems`。现有请求表提供有界缓存，读取不认领 writer、不恢复执行会话。
 

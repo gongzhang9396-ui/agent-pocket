@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN" data-skin="plain" data-mode="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f2f5f7" />
+  <script src="./relay/web/public/assets/theme-init.js"></script>
+  <title>Agent Pocket · 艺术主题预览</title>
+  <link rel="stylesheet" href="../relay/web/src/styles.css" />
+  <link rel="stylesheet" href="./relay/web/src/skins.css" />
+  <style>
+    svg:not(.visually-hidden) { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <svg class="visually-hidden" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></symbol>
+    <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6.1 8a7 7 0 0 1 11.5-2L20 8M4 16l2.4 2a7 7 0 0 0 11.5-2"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m21 11.5-8.5 8.5a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.9-2.8l8.4-8.4"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 9-4 3 4 3m8-6 4 3-4 3m-2-9-4 12"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4m0-14.2-1.4 1.4M6.3 17.7l-1.4 1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.9 13a9 9 0 0 1-9.9-9.9A9 9 0 1 0 20.9 13Z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+  </defs></svg>
+  <div class="app workspace-shell" id="app">
+    <aside class="sidebar" aria-label="任务导航">
+      <div class="brand-row"><div class="brand"><div class="brand-mark"><svg><use href="#i-terminal"/></svg></div><strong>Agent Pocket</strong></div><span class="web-label">WEB</span></div>
+      <div class="theme-scene" aria-hidden="true"></div>
+      <div class="host-area"><button class="host-switch" aria-expanded="false"><svg><use href="#i-monitor"/></svg><span class="host-name">家里的服务器<small>在线 · 已连接</small></span><span class="status-dot online"></span><svg width="14"><use href="#i-chevron"/></svg></button></div>
+      <button class="new-task-button" id="new-task"><svg><use href="#i-plus"/></svg><span>新建任务</span><span class="subtle-shortcut">＋</span></button>
+      <label class="search"><svg><use href="#i-search"/></svg><input id="search" aria-label="搜索任务" placeholder="搜索任务…" /></label>
+      <div class="list-heading"><span>任务</span><span id="task-count">4</span></div>
+      <nav class="task-list" aria-label="任务列表">
+        <section class="project-group">
+          <button class="project-heading" aria-expanded="true"><svg width="12"><use href="#i-chevron"/></svg><svg width="13"><use href="#i-folder"/></svg><span>agent-pocket</span></button>
+          <button class="task-row selected" aria-current="page"><div class="task-row-top"><span class="task-indicator active"><span class="activity-dot"></span></span><span class="task-title">优化家庭服务器监控</span></div><div class="task-row-meta"><span>Bridge · Codex</span><span>刚刚</span></div></button>
+          <button class="task-row"><div class="task-row-top"><span class="task-indicator review"><span class="review-dot"></span></span><span class="task-title">检查 Relay 登录安全</span></div><div class="task-row-meta"><span>需要审批 · Codex</span><span>12 分钟</span></div></button>
+          <button class="task-row"><div class="task-row-top"><span class="task-indicator idle"><svg width="14"><use href="#i-message"/></svg></span><span class="task-title">整理项目更新日志</span></div><div class="task-row-meta"><span>Desktop · Codex</span><span>昨天</span></div></button>
+        </section>
+        <section class="project-group">
+          <button class="project-heading" aria-expanded="true"><svg width="12"><use href="#i-chevron"/></svg><svg width="13"><use href="#i-folder"/></svg><span>home-dashboard</span></button>
+          <button class="task-row"><div class="task-row-top"><span class="task-indicator idle"><svg width="14"><use href="#i-message"/></svg></span><span class="task-title">修复夜间备份提醒</span></div><div class="task-row-meta"><span>Bridge · Codex</span><span>周一</span></div></button>
+        </section>
+        <div class="search-empty" id="search-empty" hidden><svg><use href="#i-search"/></svg><p>没有找到相关任务</p><small>试试其他关键词</small></div>
+      </nav>
+      <div class="sidebar-footer"><div class="account-row"><div class="avatar account-avatar">G</div><span>gongzhang<small>你的电脑，你的任务</small></span><button class="icon-button" id="open-settings" aria-label="账号与设置" title="账号与设置"><svg><use href="#i-settings"/></svg></button></div></div>
+    </aside>
+    <main class="main-panel">
+      <header class="conversation-header"><button class="icon-button mobile-back" id="mobile-back" aria-label="返回任务列表"><svg><use href="#i-back"/></svg></button><div class="conversation-heading"><div class="breadcrumb"><svg width="12"><use href="#i-folder"/></svg><span>agent-pocket</span><span class="breadcrumb-divider">/</span><span>Bridge</span></div><h1 id="conversation-title">优化家庭服务器监控</h1></div><span class="task-status active" title="运行中"><span></span>运行中</span><button class="icon-button" aria-label="刷新任务" title="刷新任务"><svg><use href="#i-refresh"/></svg></button><button class="icon-button" aria-label="任务信息" title="任务信息"><svg><use href="#i-more"/></svg></button></header>
+      <div class="message-scroll">
+        <div class="message-column">
+          <div class="date-divider"><span></span>今天 14:32<span></span></div>
+          <section class="message user" aria-label="你的消息"><div class="message-body"><div class="markdown"><p>帮我检查一下家庭服务器最近的运行情况，看看有没有需要处理的异常。</p></div></div></section>
+          <section class="message assistant" aria-label="助手回复"><div class="message-byline"><div class="assistant-mark"><svg width="12"><use href="#i-terminal"/></svg></div><span>Codex</span></div><div class="message-body"><div class="markdown"><p>我已经检查了系统负载、磁盘空间和最近 24 小时的服务日志。整体运行正常，有两项值得留意：</p><ul><li><strong>备份磁盘已使用 82%</strong>，建议清理 30 天前的临时快照。</li><li>Relay 在凌晨重启过一次，服务已自动恢复，没有丢失任务。</li></ul><p>可以先运行下面的命令确认可释放的空间：</p><div class="code-block"><div class="code-toolbar"><span>Shell</span><button><svg width="13"><use href="#i-copy"/></svg>复制</button></div><pre><code>df -h /volume1/backups
+find /volume1/backups/tmp -mtime +30 -type f</code></pre></div><p>需要我继续整理一份安全的清理计划吗？</p></div></div><div class="message-actions"><button class="icon-button" aria-label="复制回复"><svg width="14"><use href="#i-copy"/></svg></button></div></section>
+          <div class="running-line"><span class="activity-dot"></span>正在处理任务…<span>进度会自动同步</span></div><div class="scroll-bottom"></div>
+        </div>
+      </div>
+      <div class="composer-dock"><div class="composer-column"><div class="composer-box"><textarea id="composer" aria-label="输入消息" rows="2" placeholder="继续这项任务…"></textarea><div class="composer-toolbar"><div class="composer-tools"><button class="icon-button" aria-label="添加图片或文件"><svg><use href="#i-paperclip"/></svg></button><button class="plan-toggle" aria-pressed="false"><svg width="15"><use href="#i-code"/></svg>Plan</button><span class="composer-context"><span class="status-dot online"></span>Bridge</span></div><div class="composer-send"><span class="enter-hint">Shift ↵ 换行</span><button class="icon-button send-button" id="send" aria-label="发送消息"><svg><use href="#i-arrow"/></svg></button></div></div></div><div class="composer-footnote"><svg width="12"><use href="#i-shield"/></svg><span>任务在你的电脑上执行，关闭网页后仍会继续。</span></div></div></div>
+    </main>
+  </div>
+  <div class="modal-overlay" id="settings-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal-heading"><h2 id="settings-title">账号与设备</h2><button class="icon-button" id="close-settings" aria-label="关闭"><svg><use href="#i-close"/></svg></button></div>
+      <div class="settings-account"><div class="avatar">G</div><div><strong>gongzhang</strong><span>当前浏览器</span></div></div>
+      <div class="settings-options">
+        <div class="appearance-picker">
+          <fieldset class="skin-picker"><legend>界面风格</legend><p>选择适合你的工作台，设置仅保存在这台设备。</p><div class="skin-options">
+            <label class="skin-choice selected"><input type="radio" name="preview-skin" value="plain" checked /><span class="skin-swatch skin-swatch-plain" aria-hidden="true"><span class="swatch-rail"><i></i><i></i><i></i></span><span class="swatch-content"><b>Aa</b><i></i><i></i><em></em></span><span class="swatch-check"><svg width="11"><use href="#i-check"/></svg></span></span><span class="skin-choice-label">澄明<small>清爽、克制，适合长时间使用</small></span></label>
+            <label class="skin-choice"><input type="radio" name="preview-skin" value="pixel" /><span class="skin-swatch skin-swatch-pixel" aria-hidden="true"><span class="swatch-rail"><i></i><i></i><i></i></span><span class="swatch-content"><b>&gt;_</b><i></i><i></i><em></em></span></span><span class="skin-choice-label">像素<small>复古掌机，保留清晰的操作感</small></span></label>
+            <label class="skin-choice"><input type="radio" name="preview-skin" value="oil" /><span class="skin-swatch skin-swatch-oil" aria-hidden="true"><span class="swatch-rail"><i></i><i></i><i></i></span><span class="swatch-content"><b>Aa</b><i></i><i></i><em></em></span></span><span class="skin-choice-label">油画<small>纸色与森林绿，像一本工作手记</small></span></label>
+          </div></fieldset>
+          <fieldset class="mode-picker"><legend>明暗模式</legend><div class="mode-options">
+            <label class="mode-choice selected"><input type="radio" name="preview-mode" value="light" checked /><svg><use href="#i-sun"/></svg><span>浅色</span></label>
+            <label class="mode-choice"><input type="radio" name="preview-mode" value="dark" /><svg><use href="#i-moon"/></svg><span>深色</span></label>
+            <label class="mode-choice"><input type="radio" name="preview-mode" value="system" /><svg><use href="#i-monitor"/></svg><span>跟随系统</span></label>
+          </div></fieldset>
+        </div>
+        <button><svg><use href="#i-monitor"/></svg><span>设备与隐私<small>当前浏览器已通过加密验证</small></span><svg><use href="#i-chevron"/></svg></button>
+        <details class="card password-card"><summary>修改网页密码</summary><div class="password-fields"><input type="password" placeholder="当前密码" /><input type="password" placeholder="新密码（至少 12 位）" /><button>保存密码</button></div></details>
+        <button><svg><use href="#i-close"/></svg><span>退出登录<small>下次使用时重新认证</small></span><svg><use href="#i-chevron"/></svg></button>
+      </div>
+    </div>
+  </div>
+  <div class="toast" id="toast" role="status" hidden><svg><use href="#i-check"/></svg><span></span></div>
+  <script>
+    (() => {
+      const root = document.documentElement;
+      const app = document.querySelector("#app");
+      const modal = document.querySelector("#settings-modal");
+      const opener = document.querySelector("#open-settings");
+      const closer = document.querySelector("#close-settings");
+      const system = matchMedia("(prefers-color-scheme: dark)");
+      const colors = { plain: ["#f2f5f7", "#111820"], pixel: ["#e7edf0", "#101a23"], oil: ["#ede8dc", "#20241f"] };
+      const validSkins = Object.keys(colors);
+      const validModes = ["light", "dark", "system"];
+      const read = (key, fallback, valid) => { try { const value = localStorage.getItem(key); return valid.includes(value) ? value : fallback; } catch { return fallback; } };
+      const save = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+      let skin = read("agent-pocket-appearance-v1", "plain", validSkins);
+      let mode = read("agent-pocket-color-mode-v1", "light", validModes);
+      let toastTimer;
+
+      function renderTheme() {
+        const resolved = mode === "system" ? (system.matches ? "dark" : "light") : mode;
+        root.dataset.skin = skin;
+        root.dataset.appearance = mode;
+        root.dataset.mode = resolved;
+        root.style.colorScheme = resolved;
+        document.querySelector('meta[name="theme-color"]').content = colors[skin][resolved === "dark" ? 1 : 0];
+        document.querySelectorAll('input[name="preview-skin"]').forEach((input) => {
+          input.checked = input.value === skin;
+          const label = input.closest(".skin-choice");
+          label.classList.toggle("selected", input.checked);
+          label.querySelector(".swatch-check")?.remove();
+          if (input.checked) {
+            const check = document.createElement("span");
+            check.className = "swatch-check";
+            check.innerHTML = '<svg width="11"><use href="#i-check"/></svg>';
+            label.querySelector(".skin-swatch").append(check);
+          }
+        });
+        document.querySelectorAll('input[name="preview-mode"]').forEach((input) => {
+          input.checked = input.value === mode;
+          input.closest(".mode-choice").classList.toggle("selected", input.checked);
+        });
+      }
+      function toast(message) {
+        const element = document.querySelector("#toast");
+        element.querySelector("span").textContent = message;
+        element.hidden = false;
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => { element.hidden = true; }, 2400);
+      }
+      function closeSettings() { modal.hidden = true; app.inert = false; opener.focus(); }
+      document.querySelectorAll('input[name="preview-skin"]').forEach((input) => input.addEventListener("change", () => {
+        skin = input.value; save("agent-pocket-appearance-v1", skin); renderTheme();
+      }));
+      document.querySelectorAll('input[name="preview-mode"]').forEach((input) => input.addEventListener("change", () => {
+        mode = input.value; save("agent-pocket-color-mode-v1", mode); renderTheme();
+      }));
+      const onSystemChange = () => { if (mode === "system") renderTheme(); };
+      if (typeof system.addEventListener === "function") system.addEventListener("change", onSystemChange);
+      else system.addListener(onSystemChange);
+      opener.addEventListener("click", () => { modal.hidden = false; app.inert = true; closer.focus(); });
+      closer.addEventListener("click", closeSettings);
+      modal.addEventListener("mousedown", (event) => { if (event.target === modal) closeSettings(); });
+      modal.addEventListener("keydown", (event) => {
+        if (event.key !== "Tab") return;
+        const nodes = Array.from(modal.querySelectorAll('button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),summary')).filter((node) => node.getClientRects().length);
+        if (!nodes.length) return;
+        const first = nodes[0], last = nodes[nodes.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      });
+      document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !modal.hidden) closeSettings(); });
+      document.querySelectorAll(".task-row").forEach((button) => button.addEventListener("click", () => {
+        document.querySelectorAll(".task-row").forEach((item) => { item.classList.remove("selected"); item.removeAttribute("aria-current"); });
+        button.classList.add("selected"); button.setAttribute("aria-current", "page");
+        document.querySelector("#conversation-title").textContent = button.querySelector(".task-title").textContent;
+        app.classList.add("chat-open");
+      }));
+      document.querySelector("#mobile-back").addEventListener("click", () => app.classList.remove("chat-open"));
+      document.querySelector("#search").addEventListener("input", (event) => {
+        const query = event.target.value.trim().toLowerCase(); let count = 0;
+        document.querySelectorAll(".task-row").forEach((button) => {
+          const visible = button.textContent.toLowerCase().includes(query); button.hidden = !visible; if (visible) count += 1;
+        });
+        document.querySelectorAll(".project-group").forEach((group) => { group.hidden = !Array.from(group.querySelectorAll(".task-row")).some((button) => !button.hidden); });
+        document.querySelector("#task-count").textContent = String(count);
+        document.querySelector("#search-empty").hidden = count !== 0;
+      });
+      document.querySelector(".plan-toggle").addEventListener("click", (event) => {
+        const button = event.currentTarget; const enabled = button.getAttribute("aria-pressed") !== "true";
+        button.setAttribute("aria-pressed", String(enabled)); button.classList.toggle("enabled", enabled);
+      });
+      document.querySelector("#send").addEventListener("click", () => {
+        const input = document.querySelector("#composer"); const text = input.value.trim(); if (!text) { input.focus(); return; }
+        const section = document.createElement("section"); section.className = "message user";
+        const body = document.createElement("div"); body.className = "message-body";
+        const markdown = document.createElement("div"); markdown.className = "markdown";
+        const paragraph = document.createElement("p"); paragraph.textContent = text;
+        markdown.append(paragraph); body.append(markdown); section.append(body);
+        document.querySelector(".message-column").insertBefore(section, document.querySelector(".running-line"));
+        input.value = ""; input.focus(); toast("消息已加入预览对话");
+      });
+      document.querySelector("#new-task").addEventListener("click", () => toast("视觉预览不连接电脑或提交任务"));
+      renderTheme();
+    })();
+  </script>
+</body>
+</html>

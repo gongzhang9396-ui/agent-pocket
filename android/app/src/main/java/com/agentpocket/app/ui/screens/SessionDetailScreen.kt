@@ -94,6 +94,8 @@ import com.agentpocket.app.ui.components.rememberFilePicker
 import com.agentpocket.app.ui.components.rememberImagePicker
 import com.agentpocket.app.ui.theme.AgentPocketTheme
 import com.agentpocket.app.ui.theme.StatusColors
+import com.agentpocket.app.ui.theme.SkinGeometry
+import com.agentpocket.app.ui.theme.skinRule
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
@@ -224,6 +226,7 @@ fun SessionDetailScreen(
         topBar = {
             Column {
                 TopAppBar(
+                    modifier = Modifier.skinRule(),
                     title = {
                         Column {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -291,7 +294,7 @@ fun SessionDetailScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp),
-                        shape = RoundedCornerShape(8.dp),
+                        shape = SkinGeometry.badge,
                         color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.10f),
                     ) {
                         Row(
@@ -386,7 +389,7 @@ fun SessionDetailScreen(
                 item(key = "__agent_pocket_thread_empty__", contentType = "empty") {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
+                        shape = SkinGeometry.panel,
                         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
                     ) {
                         Column(Modifier.padding(16.dp)) {
@@ -552,7 +555,7 @@ private fun Composer(
     val pickFiles = rememberFilePicker { picked ->
         fileAttachments = (fileAttachments + picked).distinct().take((3 - imageAttachments.size).coerceAtLeast(0))
     }
-    Surface(color = MaterialTheme.colorScheme.surface) {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(Modifier.imePadding().navigationBarsPadding()) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             ThreadModelControl(repo, threadId, running, busy || sending, readOnly, desktopOwned, modelId, reasoningId) { model, effort ->
@@ -614,15 +617,34 @@ private fun Composer(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
             }
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                enabled = !readOnly && !busy && !sending,
+                placeholder = {
+                    Text(
+                        if (running && !canSteer) "先写下下一条消息…" else if (running) "补充想法，调整当前任务…" else "继续对话…",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                },
+                shape = SkinGeometry.input,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surface,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                ),
+                maxLines = 4,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            )
             Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.Bottom,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (!readOnly && attachmentsSupported) {
                     Box {
-                        IconButton(
+                        FilledIconButton(
+                            shape = SkinGeometry.action,
                             onClick = { attachmentMenuOpen = true },
-                            colors = IconButtonDefaults.iconButtonColors(
+                            colors = IconButtonDefaults.filledIconButtonColors(
                                 containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
                                 contentColor = MaterialTheme.colorScheme.primary,
                             ),
@@ -653,24 +675,10 @@ private fun Composer(
                     }
                     Spacer(Modifier.width(4.dp))
                 }
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    enabled = !readOnly && !busy && !sending,
-                    placeholder = {
-                        Text(
-                            if (running && !canSteer) "先写下下一条消息…" else if (running) "补充想法，调整当前任务…" else "继续对话…",
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    },
-                    shape = RoundedCornerShape(20.dp),
-                    colors = OutlinedTextFieldDefaults.colors(),
-                    maxLines = 4,
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.weight(1f))
                 if (running && canInterrupt && !busy) {
                     FilledIconButton(
+                        shape = SkinGeometry.action,
                         onClick = onInterrupt,
                         colors = IconButtonDefaults.filledIconButtonColors(
                             containerColor = StatusColors.error,
@@ -682,6 +690,7 @@ private fun Composer(
                     Spacer(Modifier.width(6.dp))
                 }
                 FilledIconButton(
+                    shape = SkinGeometry.action,
                     onClick = {
                         if (text.isNotBlank() || imageAttachments.isNotEmpty() || fileAttachments.isNotEmpty()) {
                             sending = true

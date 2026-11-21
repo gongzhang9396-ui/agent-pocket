@@ -1,12 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hashPassword, verifyPassword } from "../src/auth.js";
+import { hashPassword, passwordOperationFingerprint, verifyPassword } from "../src/auth.js";
 import { sanitizedFcmData } from "../src/fcm.js";
 import { validateEnvelope } from "../src/protocol.js";
 import { LoginThrottle } from "../src/rate-limit.js";
 import { tempStore } from "./helpers.js";
 
 const TEST_COST = { N: 1 << 10, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
+
+test("password operation receipts bind the request with a slow KDF", async () => {
+  const context = ["account", "operation", 1, "ciphertext", "session"];
+  const fingerprint = await passwordOperationFingerprint("this-is-a-long-password", context, TEST_COST);
+  assert.match(fingerprint, /^scrypt-op-v1\$/);
+  assert.equal(await passwordOperationFingerprint("this-is-a-long-password", context, TEST_COST), fingerprint);
+  assert.notEqual(await passwordOperationFingerprint("another-long-password", context, TEST_COST), fingerprint);
+  assert.notEqual(await passwordOperationFingerprint("this-is-a-long-password", [...context, "other"], TEST_COST), fingerprint);
+});
 
 test("scrypt hashes verify and malformed cost fields fail closed", async () => {
   const encoded = await hashPassword("this-is-a-long-password", TEST_COST);

@@ -110,6 +110,18 @@ test("stream batching preserves the first chunk and flushes all text before comp
   store.close();
 });
 
+test('public activity reaches the encrypted event feed and final plans follow buffered deltas', () => {
+  const { server, store } = continuityFixture();
+  for (const delta of ['first', '-draft']) server.onCodexNotification({ method: 'item/plan/delta', params: { threadId: 'thread-1', turnId: 'turn', itemId: 'plan', delta } });
+  server.onCodexNotification({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn', item: { id: 'plan', type: 'plan', text: 'final plan' } } });
+  const events = store.eventsAfter(0).filter(event => event.threadId === 'thread-1');
+  assert.equal(events.at(-1)?.type, 'activity.updated');
+  assert.equal((events.at(-1)?.payload as any).item.text, 'final plan');
+  server.onCodexNotification({ method: 'item/reasoning/summaryTextDelta', params: { threadId: 'thread-1', turnId: 'turn', itemId: 'r', summaryIndex: 0, delta: '公开摘要' } });
+  assert.equal((store.eventsForThread('thread-1', 'activity.updated').at(-1)?.payload as any).item.summary[0], '公开摘要');
+  server.publicActivities.close(); store.close();
+});
+
 test("steady streaming flushes within its interval without waiting for turn completion", async () => {
   const { server, store } = continuityFixture();
   for (const delta of ["a", "b", "c"]) server.onCodexNotification({ method: "item/agentMessage/delta", params: { threadId: "thread-1", itemId: "message", delta } });

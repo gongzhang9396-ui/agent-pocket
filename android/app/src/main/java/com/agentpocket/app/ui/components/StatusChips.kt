@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import com.agentpocket.app.data.model.ConnectionState
 import com.agentpocket.app.data.model.ThreadStatus
 import com.agentpocket.app.ui.theme.StatusColors
+import com.agentpocket.app.ui.theme.SkinGeometry
 
 /** Small pill showing Bridge connection state, used in the inbox top bar and settings. */
 @Composable
@@ -37,7 +38,7 @@ fun ConnectionPill(state: ConnectionState, relayName: String, modifier: Modifier
     }
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(50),
+        shape = SkinGeometry.badge,
         color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
         Row(
@@ -48,7 +49,7 @@ fun ConnectionPill(state: ConnectionState, relayName: String, modifier: Modifier
             Box(
                 Modifier
                     .size(7.dp)
-                    .clip(CircleShape)
+                    .clip(SkinGeometry.badge)
                     .background(color),
             )
             Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -58,6 +59,7 @@ fun ConnectionPill(state: ConnectionState, relayName: String, modifier: Modifier
 
 data class StatusStyle(val label: String, val color: Color, val icon: String)
 
+@Composable
 fun ThreadStatus.style(): StatusStyle = when (this) {
     ThreadStatus.Active -> StatusStyle("运行中", StatusColors.running, "●")
     ThreadStatus.NeedsAttention -> StatusStyle("待处理", StatusColors.attention, "▲")
@@ -73,7 +75,7 @@ fun ThreadStatusChip(status: ThreadStatus, modifier: Modifier = Modifier) {
     val style = status.style()
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(6.dp),
+        shape = SkinGeometry.badge,
         color = style.color.copy(alpha = 0.14f),
     ) {
         Row(
@@ -108,16 +110,16 @@ fun MonoBlock(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFFF4F1E8))
+            .clip(MaterialTheme.shapes.small)
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
             .horizontalScroll(rememberScrollState())
             .padding(10.dp),
     ) {
         Text(
             text = text,
             fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-            lineHeight = 17.sp,
+            fontSize = 13.sp,
+            lineHeight = 19.sp,
             color = color,
             softWrap = false,
         )

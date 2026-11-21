@@ -1,5 +1,8 @@
 package com.agentpocket.app.ui.screens
 
+import com.agentpocket.app.ui.theme.SkinGeometry
+import com.agentpocket.app.ui.theme.skinRule
+
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
@@ -169,6 +172,7 @@ fun NewTaskScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier.skinRule(),
                 title = { Text("新建任务") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -196,6 +200,7 @@ fun NewTaskScreen(
                         )
                     }
                     Button(
+                        shape = SkinGeometry.action,
                         onClick = submit,
                         enabled = canCreate,
                         modifier = Modifier.fillMaxWidth(),
@@ -227,6 +232,7 @@ fun NewTaskScreen(
             Spacer(Modifier.height(6.dp))
             Box(modifier = Modifier.fillMaxWidth()) {
                 OutlinedButton(
+                    shape = SkinGeometry.action,
                     onClick = { hostMenuExpanded = true },
                     enabled = hosts.isNotEmpty(),
                     modifier = Modifier.fillMaxWidth(),
@@ -374,12 +380,12 @@ fun NewTaskScreen(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                OutlinedButton(onClick = pickImages, enabled = attachmentsSupported, modifier = Modifier.weight(1f)) {
+                OutlinedButton(shape = SkinGeometry.action, onClick = pickImages, enabled = attachmentsSupported, modifier = Modifier.weight(1f)) {
                     Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.size(6.dp))
                     Text("添加图片")
                 }
-                OutlinedButton(onClick = pickFiles, enabled = attachmentsSupported, modifier = Modifier.weight(1f)) {
+                OutlinedButton(shape = SkinGeometry.action, onClick = pickFiles, enabled = attachmentsSupported, modifier = Modifier.weight(1f)) {
                     Icon(Icons.Filled.AttachFile, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.size(6.dp))
                     Text("添加文件")
@@ -434,6 +440,7 @@ fun NewTaskScreen(
                 else -> {
                     Box(modifier = Modifier.fillMaxWidth()) {
                         OutlinedButton(
+                            shape = SkinGeometry.action,
                             onClick = { projectMenuExpanded = true },
                             modifier = Modifier.fillMaxWidth(),
                         ) {

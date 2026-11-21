@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { WEB_SCHEMA, invalidateWebCredentials } from "./web-schema.js";
 import {
   ACCESS_TOKEN_TTL_MS,
   ENROLLMENT_TTL_MS,
@@ -18,6 +19,19 @@ import {
 } from "./protocol.js";
 
 const MAX_PENDING_HOST_ENROLLMENTS = 5_000;
+
+// Operation receipts can survive a retry, but bearer credentials must never be
+// copied into the durable SQLite operation ledger.
+function operationReceipt(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(operationReceipt);
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (key === "accessToken" || key === "refreshToken" || key === "tokens") continue;
+    result[key] = operationReceipt(item);
+  }
+  return result;
+}
 
 type AccountInput = {
   username: string;
@@ -43,6 +57,7 @@ type AccountProvisionInput = {
   displayName: string;
   passwordHash: string;
   createdBy: string;
+  webOnly?: boolean;
 };
 
 export type UpdatePlatform = "android" | "host";
@@ -61,7 +76,7 @@ export type UpdateReleaseInput = {
   createdBy: string;
 };
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 function compareReleaseVersions(left: string, right: string) {
   const a = left.split(".").map(Number);
@@ -89,7 +104,10 @@ export class RelayStore {
       this.db.close();
       throw new Error(`Relay 数据库版本不兼容: ${storedVersion ?? "unknown"}`);
     }
-    if (schemaVersion === SCHEMA_VERSION) return;
+    if (schemaVersion === SCHEMA_VERSION) {
+      this.transaction(() => this.ensureWebLoginColumns());
+      return;
+    }
 
     this.transaction(() => {
       this.db.exec(`
@@ -272,8 +290,25 @@ export class RelayStore {
       );
       CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created_at DESC);
       `);
+      this.db.exec(WEB_SCHEMA);
       this.setMeta("schemaVersion", String(SCHEMA_VERSION));
     });
+    // WEB_SCHEMA is part of the v0/v1/v2 -> v3 transaction above. The
+    // additive column check is also kept idempotent for databases created by
+    // an earlier v3 build; wrap it so that a partial upgrade cannot expose a
+    // half-shaped login table.
+    this.transaction(() => this.ensureWebLoginColumns());
+  }
+
+  private ensureWebLoginColumns() {
+    const columns = new Set((this.db.prepare("PRAGMA table_info(web_logins)").all() as any[]).map((column) => String(column.name)));
+    for (const [name, definition] of [
+      ["device_name", "TEXT"],
+      ["device_signing_public_key", "TEXT"],
+      ["device_encryption_public_key", "TEXT"],
+    ] as const) {
+      if (!columns.has(name)) this.db.exec(`ALTER TABLE web_logins ADD COLUMN ${name} ${definition}`);
+    }
   }
 
   close() { this.db.close(); }
@@ -371,6 +406,7 @@ export class RelayStore {
       ) VALUES(?,?,?,?,?,?,?)`).run(
         provisionId, input.username, input.displayName, input.passwordHash, "user", input.createdBy, now(),
       );
+      if (input.webOnly) this.setMeta(`webActivationMode:${provisionId}`, "web-only");
       this.audit(input.createdBy, "web", input.createdBy, "account.provision.create", "account_provision", provisionId, {
         username: input.username,
       });
@@ -379,12 +415,16 @@ export class RelayStore {
   }
 
   cancelAccountProvision(provisionId: string, actorId: string) {
+    return this.transaction(() => {
     const provision = this.accountProvisionById(provisionId);
     if (!provision) throw new RelayError("NOT_FOUND", "待激活用户不存在");
     const changed = this.db.prepare("DELETE FROM account_provisions WHERE id=?").run(provisionId);
     if (!changed.changes) throw new RelayError("NOT_FOUND", "待激活用户不存在");
+    this.db.prepare("DELETE FROM web_logins WHERE account_id=?").run(provisionId);
+    this.db.prepare("DELETE FROM meta WHERE key=?").run(`webActivationMode:${provisionId}`);
     this.audit(actorId, "web", actorId, "account.provision.cancel", "account_provision", provisionId, {
       username: provision.username,
+    });
     });
   }
 
@@ -397,6 +437,9 @@ export class RelayStore {
       const provision = this.accountProvisionById(provisionId);
       if (!provision || provision.username !== account.username) {
         throw new RelayError("AUTH_FAILED", "用户名或密码错误");
+      }
+      if (this.meta(`webActivationMode:${provisionId}`) === "web-only") {
+        throw new RelayError("FORBIDDEN", "此账号需要在网页完成首次激活和验证码绑定");
       }
       if (this.accountByUsername(account.username)) throw new RelayError("CONFLICT", "用户已经激活");
       const created = this.createAccount({
@@ -417,11 +460,15 @@ export class RelayStore {
     return this.db.prepare(`SELECT * FROM (
       SELECT id,username,display_name,role,status,created_at,disabled_at,
         (SELECT count(*) FROM devices d WHERE d.account_id=accounts.id AND d.status='approved') AS device_count,
-        (SELECT count(*) FROM hosts h WHERE h.account_id=accounts.id AND h.revoked_at IS NULL) AS host_count
+        (SELECT count(*) FROM hosts h WHERE h.account_id=accounts.id AND h.revoked_at IS NULL) AS host_count,
+        COALESCE((SELECT totp_required FROM web_security ws WHERE ws.account_id=accounts.id), 0) AS totp_required,
+        CASE WHEN EXISTS (SELECT 1 FROM web_security ws WHERE ws.account_id=accounts.id AND ws.totp_secret IS NOT NULL) THEN 1 ELSE 0 END AS totp_configured,
+        (SELECT version FROM web_key_packages wk WHERE wk.account_id=accounts.id) AS web_key_package_version,
+        COALESCE((SELECT stale FROM web_key_packages wk WHERE wk.account_id=accounts.id), 0) AS web_key_package_stale
         FROM accounts
       UNION ALL
       SELECT id,username,display_name,role,'pending_activation' AS status,created_at,NULL AS disabled_at,
-        0 AS device_count,0 AS host_count FROM account_provisions
+        0 AS device_count,0 AS host_count,0 AS totp_required,0 AS totp_configured,NULL AS web_key_package_version,0 AS web_key_package_stale FROM account_provisions
       ) ORDER BY created_at ASC`).all() as any[];
   }
 
@@ -444,6 +491,7 @@ export class RelayStore {
   }
 
   changeAccountPassword(accountId: string, passwordHash: string, actorId: string, keepSessionId?: string) {
+    return this.transaction(() => {
     const changed = this.db.prepare("UPDATE accounts SET password_hash=? WHERE id=? AND status='active'")
       .run(passwordHash, accountId);
     if (!changed.changes) throw new RelayError("NOT_FOUND", "用户不存在或已停用");
@@ -455,21 +503,27 @@ export class RelayStore {
         .run(now(), accountId);
     }
     this.audit(accountId, "device", actorId, "account.password.change", "account", accountId);
+    invalidateWebCredentials(this.db, accountId);
+    });
   }
 
   resetUserPassword(targetId: string, passwordHash: string, actorId: string) {
+    return this.transaction(() => {
     const account = this.accountById(targetId);
     if (account) {
       this.db.prepare("UPDATE accounts SET password_hash=? WHERE id=?").run(passwordHash, targetId);
       this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL").run(now(), targetId);
       this.audit(targetId, "web", actorId, "account.password.reset", "account", targetId);
+      invalidateWebCredentials(this.db, targetId);
       return "active" as const;
     }
     const provision = this.accountProvisionById(targetId);
     if (!provision) throw new RelayError("NOT_FOUND", "用户不存在");
     this.db.prepare("UPDATE account_provisions SET password_hash=? WHERE id=?").run(passwordHash, targetId);
+    this.db.prepare("DELETE FROM web_logins WHERE account_id=?").run(targetId);
     this.audit(actorId, "web", actorId, "account.provision.password.reset", "account_provision", targetId);
     return "pending_activation" as const;
+    });
   }
 
   createInvite(accountId: string, role: AccountRole, ttlMs = INVITE_TTL_MS) {
@@ -486,6 +540,7 @@ export class RelayStore {
       if (!invite || invite.used_at || invite.expires_at < now() || invite.secret_hash !== tokenHash(secret)) {
         throw new RelayError("AUTH_FAILED", "邀请无效或已过期");
       }
+      if (this.accountProvisionByUsername(account.username)) throw new RelayError("CONFLICT", "用户名已由管理员预留，请使用分配的账号激活");
       const created = this.createAccount({ ...account, role: invite.role });
       const firstDevice = this.createDevice({ ...device, accountId: created.id, approved: true });
       this.db.prepare("UPDATE invitations SET used_by=?,used_at=? WHERE id=?").run(created.id, now(), inviteId);
@@ -506,9 +561,44 @@ export class RelayStore {
     return this.deviceById(input.accountId, deviceId)!;
   }
 
-  findDeviceForLogin(accountId: string, deviceId: string | undefined, signingPublicKey: string, encryptionPublicKey: string, name: string) {
+  findDeviceForLogin(accountId: string, deviceId: string | undefined, signingPublicKey: string, encryptionPublicKey: string, name: string, recoverKeys = false) {
     if (!deviceId) {
+      if (recoverKeys) {
+        // Opt-in recovery is checked by a device-private-key proof at the HTTP
+        // boundary. Never adopt a browser or silently recreate revoked keys.
+        const matching = this.db.prepare("SELECT * FROM devices WHERE account_id=? AND (signing_public_key=? OR encryption_public_key=?)")
+          .all(accountId, signingPublicKey, encryptionPublicKey) as any[];
+        if (matching.length) {
+          const existing = matching.length === 1 ? matching[0] : undefined;
+          if (!existing || existing.status === "revoked" || existing.signing_public_key !== signingPublicKey || existing.encryption_public_key !== encryptionPublicKey ||
+              this.db.prepare("SELECT 1 FROM web_devices WHERE device_id=?").get(existing.id)) throw new RelayError("AUTH_FAILED", "设备密钥不匹配、已撤销或属于浏览器");
+          this.db.prepare("UPDATE devices SET name=? WHERE id=? AND account_id=?").run(name, existing.id, accountId);
+          return this.deviceById(accountId, existing.id)!;
+        }
+      }
       return this.createDevice({ accountId, name, signingPublicKey, encryptionPublicKey, approved: false });
+    }
+    const existing = this.deviceById(accountId, deviceId);
+    if (!existing || existing.status === "revoked") throw new RelayError("AUTH_FAILED", "设备不存在或已撤销");
+    if (existing.signing_public_key !== signingPublicKey || existing.encryption_public_key !== encryptionPublicKey) {
+      throw new RelayError("AUTH_FAILED", "设备密钥不匹配");
+    }
+    this.db.prepare("UPDATE devices SET name=? WHERE id=? AND account_id=?").run(name, deviceId, accountId);
+    return this.deviceById(accountId, deviceId)!;
+  }
+
+  findWebDeviceForLogin(accountId: string, deviceId: string | undefined, signingPublicKey: string, encryptionPublicKey: string, name: string) {
+    if (!deviceId) {
+      const created = this.createDevice({ accountId, name, signingPublicKey, encryptionPublicKey, approved: false });
+      // Once password/TOTP have passed, the browser device may be recorded as
+      // a pending web device. It remains blocked from sessions and channels
+      // until proof/approval, while old Android APIs can still reject it by
+      // the web_devices mapping.
+      this.registerWebDevice(created.id, accountId);
+      return created;
+    }
+    if (!this.db.prepare("SELECT 1 FROM web_devices WHERE device_id=? AND account_id=?").get(deviceId, accountId)) {
+      throw new RelayError("FORBIDDEN", "网页必须使用独立的浏览器设备，不能复用 Android 设备");
     }
     const existing = this.deviceById(accountId, deviceId);
     if (!existing || existing.status === "revoked") throw new RelayError("AUTH_FAILED", "设备不存在或已撤销");
@@ -533,6 +623,41 @@ export class RelayStore {
       .run(keyPackage, now(), deviceId, accountId);
     if (!changed.changes) throw new RelayError("NOT_FOUND", "待批准设备不存在");
     this.audit(accountId, "device", actorId, "device.approve", "device", deviceId);
+  }
+
+  approveWebDevice(accountId: string, deviceId: string, keyPackage: string, actorId: string) {
+    const changed = this.db.prepare(`UPDATE devices SET status='approved',key_package=?,approved_at=?
+      WHERE id=? AND account_id=? AND status!='revoked'`).run(keyPackage, now(), deviceId, accountId);
+    if (!changed.changes) throw new RelayError("NOT_FOUND", "网页设备不存在或已撤销");
+    this.registerWebDevice(deviceId, accountId);
+    this.audit(accountId, "device", actorId, "web.device.approve", "device", deviceId);
+  }
+
+  completeWebMigration(accountId: string, deviceId: string, packageJson: string, expectedVersion: number, actorId: string,
+    operationId?: string, fingerprint?: string,
+    buildResponse?: (result: { version: number; credentialVersion: number }, tokens: ReturnType<RelayStore["createWebSession"]>) => unknown) {
+    return this.transaction(() => {
+      if (operationId && fingerprint) {
+        const previous = this.webOperation(accountId, operationId, fingerprint);
+        if (previous) return { version: Number(this.webKeyPackage(accountId)?.version || 0), credentialVersion: Number(this.ensureWebSecurity(accountId).credential_version), response: previous, replay: true };
+      }
+      const security = this.ensureWebSecurity(accountId);
+      const current = this.webKeyPackage(accountId);
+      const currentVersion = current ? Number(current.version) : 0;
+      if (currentVersion !== expectedVersion) throw new RelayError("VERSION_CONFLICT", "网页密钥包版本已经变化", { version: currentVersion });
+      if (current && !current.stale) throw new RelayError("CONFLICT", "网页迁移已经完成");
+      const version = currentVersion + 1;
+      this.db.prepare(`INSERT INTO web_key_packages(account_id,version,credential_version,package_json,stale)
+        VALUES(?,?,?,?,0) ON CONFLICT(account_id) DO UPDATE SET version=excluded.version,
+        credential_version=excluded.credential_version,package_json=excluded.package_json,stale=0`)
+        .run(accountId, version, security.credential_version, packageJson);
+      this.approveWebDevice(accountId, deviceId, packageJson, actorId);
+      const result = { version, credentialVersion: Number(security.credential_version) };
+      const tokens = this.createWebSession(accountId, deviceId);
+      const response = buildResponse?.(result, tokens);
+      if (operationId && fingerprint && response !== undefined) this.saveWebOperation(accountId, operationId, fingerprint, operationReceipt(response));
+      return { ...result, response, replay: false };
+    });
   }
 
   recoveryBundle(accountId: string, deviceId: string) {
@@ -594,12 +719,290 @@ export class RelayStore {
     return { sessionId, accessToken, refreshToken, accessExpiresAt: createdAt + ACCESS_TOKEN_TTL_MS, refreshExpiresAt: refreshToken ? createdAt + REFRESH_TOKEN_TTL_MS : undefined };
   }
 
+  ensureWebSecurity(accountId: string) {
+    this.db.prepare("INSERT INTO web_security(account_id) VALUES(?) ON CONFLICT(account_id) DO NOTHING").run(accountId);
+    return this.db.prepare("SELECT * FROM web_security WHERE account_id=?").get(accountId) as any;
+  }
+
+  webKeyPackage(accountId: string) {
+    return this.db.prepare("SELECT * FROM web_key_packages WHERE account_id=?").get(accountId) as any | undefined;
+  }
+
+  webOperation(accountId: string, operationId: string, fingerprint: string) {
+    const row = this.db.prepare("SELECT * FROM web_operations WHERE account_id=? AND operation_id=?")
+      .get(accountId, operationId) as any | undefined;
+    if (!row) return undefined;
+    if (row.fingerprint !== fingerprint) throw new RelayError("CONFLICT", "operationId 已被不同请求占用");
+    return JSON.parse(String(row.result_json));
+  }
+
+  webOperationById(accountId: string, operationId: string) {
+    const row = this.db.prepare("SELECT result_json FROM web_operations WHERE account_id=? AND operation_id=?")
+      .get(accountId, operationId) as { result_json?: string } | undefined;
+    return row?.result_json ? JSON.parse(row.result_json) : undefined;
+  }
+
+  saveWebOperation(accountId: string, operationId: string, fingerprint: string, result: unknown) {
+    this.db.prepare(`INSERT INTO web_operations(account_id,operation_id,fingerprint,result_json,created_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(account_id,operation_id) DO NOTHING`)
+      .run(accountId, operationId, fingerprint, JSON.stringify(result), now());
+    const row = this.db.prepare("SELECT fingerprint,result_json FROM web_operations WHERE account_id=? AND operation_id=?")
+      .get(accountId, operationId) as any;
+    if (row.fingerprint !== fingerprint) throw new RelayError("CONFLICT", "operationId 已被不同请求占用");
+    return JSON.parse(String(row.result_json));
+  }
+
+  webLoginByToken(tokenValue: string) {
+    const row = this.db.prepare(`SELECT l.*,a.status AS account_status,s.credential_version AS current_credential_version,
+      s.totp_version AS current_totp_version,d.status AS device_status
+      FROM web_logins l JOIN accounts a ON a.id=l.account_id
+      JOIN web_security s ON s.account_id=l.account_id
+      LEFT JOIN devices d ON d.id=l.device_id
+      WHERE l.token_hash=? AND l.expires_at>=?`).get(tokenHash(tokenValue), now()) as any | undefined;
+    if (!row || row.account_status !== "active" || row.device_status === "revoked"
+      || Number(row.credential_version) !== Number(row.current_credential_version)
+      || Number(row.totp_version) !== Number(row.current_totp_version)) return undefined;
+    return row;
+  }
+
+  createWebLogin(input: {
+    accountId: string; deviceId?: string; deviceName?: string; deviceSigningPublicKey?: string; deviceEncryptionPublicKey?: string;
+    credentialVersion: number; totpVersion: number;
+    verified: boolean; signingChallenge: string; boxNonce: string; trusted: boolean;
+    enrollmentSecret?: string;
+  }) {
+    const loginToken = token();
+    this.db.prepare(`INSERT INTO web_logins(
+      token_hash,account_id,expires_at,credential_version,totp_version,verified,device_id,device_name,
+      device_signing_public_key,device_encryption_public_key,signing_challenge,box_nonce,trusted,enrollment_secret
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      tokenHash(loginToken), input.accountId, now() + 5 * 60_000, input.credentialVersion,
+      input.totpVersion, input.verified ? 1 : 0, input.deviceId || null, input.deviceName || null,
+      input.deviceSigningPublicKey || null, input.deviceEncryptionPublicKey || null, input.signingChallenge,
+      input.boxNonce, input.trusted ? 1 : 0, input.enrollmentSecret || null,
+    );
+    return loginToken;
+  }
+
+  materializeWebLoginDevice(tokenValue: string) {
+    return this.transaction(() => {
+      const login = this.webLoginByToken(tokenValue);
+      if (!login) throw new RelayError("AUTH_FAILED", "登录事务已过期");
+      if (login.device_id) {
+        if (!this.db.prepare("SELECT 1 FROM web_devices WHERE device_id=? AND account_id=?").get(login.device_id, login.account_id)) {
+          throw new RelayError("FORBIDDEN", "网页必须使用独立的浏览器设备，不能复用 Android 设备");
+        }
+        const existing = this.deviceById(login.account_id, login.device_id);
+        if (!existing || existing.status === "revoked") throw new RelayError("AUTH_FAILED", "网页设备已撤销");
+        return existing;
+      }
+      if (!login.device_name || !login.device_signing_public_key || !login.device_encryption_public_key) {
+        throw new RelayError("AUTH_FAILED", "网页设备信息不完整");
+      }
+      const device = this.findWebDeviceForLogin(login.account_id, undefined,
+        login.device_signing_public_key, login.device_encryption_public_key, login.device_name);
+      this.db.prepare("UPDATE web_logins SET device_id=? WHERE token_hash=? AND device_id IS NULL")
+        .run(device.id, tokenHash(tokenValue));
+      return device;
+    });
+  }
+
+  updateWebLogin(tokenValue: string, values: { verified?: boolean; proof?: boolean }) {
+    const fields: string[] = [];
+    const args: unknown[] = [];
+    if (values.verified !== undefined) { fields.push("verified=?"); args.push(values.verified ? 1 : 0); }
+    if (values.proof !== undefined) { fields.push("proof=?"); args.push(values.proof ? 1 : 0); }
+    if (!fields.length) return;
+    args.push(tokenHash(tokenValue));
+    this.db.prepare(`UPDATE web_logins SET ${fields.join(",")} WHERE token_hash=?`).run(...args as any[]);
+  }
+
+  deleteWebLogin(tokenValue: string) {
+    this.db.prepare("DELETE FROM web_logins WHERE token_hash=?").run(tokenHash(tokenValue));
+  }
+
+  saveWebKeyPackageWithOperation(accountId: string, packageJson: string, expectedVersion: number, credentialVersion: number,
+    operationId?: string, fingerprint?: string, buildResponse?: (saved: any) => unknown) {
+    return this.transaction(() => {
+      if (operationId && fingerprint) {
+        const previous = this.webOperation(accountId, operationId, fingerprint);
+        if (previous) return { saved: this.webKeyPackage(accountId), response: previous, replay: true };
+      }
+      const current = this.webKeyPackage(accountId);
+      const currentVersion = current ? Number(current.version) : 0;
+      if (currentVersion !== expectedVersion) throw new RelayError("VERSION_CONFLICT", "网页密钥包版本已经变化", { version: currentVersion });
+      const version = currentVersion + 1;
+      this.db.prepare(`INSERT INTO web_key_packages(account_id,version,credential_version,package_json,stale)
+        VALUES(?,?,?,?,0) ON CONFLICT(account_id) DO UPDATE SET version=excluded.version,
+        credential_version=excluded.credential_version,package_json=excluded.package_json,stale=0`)
+        .run(accountId, version, credentialVersion, packageJson);
+      this.ensureWebSecurity(accountId);
+      const saved = this.webKeyPackage(accountId)!;
+      const response = buildResponse?.(saved);
+      if (operationId && fingerprint && response !== undefined) this.saveWebOperation(accountId, operationId, fingerprint, operationReceipt(response));
+      return { saved, response, replay: false };
+    });
+  }
+
+  saveWebKeyPackage(accountId: string, packageJson: string, expectedVersion: number, credentialVersion: number) {
+    return this.saveWebKeyPackageWithOperation(accountId, packageJson, expectedVersion, credentialVersion).saved;
+  }
+
+  changeWebPassword(accountId: string, passwordHash: string, packageJson: string, expectedVersion: number, actorId: string, keepSessionId: string,
+    operationId?: string, fingerprint?: string, buildResponse?: (result: { credentialVersion: number; version: number }) => unknown) {
+    return this.transaction(() => {
+      if (operationId && fingerprint) {
+        const previous = this.webOperation(accountId, operationId, fingerprint);
+        if (previous) return { credentialVersion: Number(this.ensureWebSecurity(accountId).credential_version), version: Number(this.webKeyPackage(accountId)?.version || 0), response: previous, replay: true };
+      }
+      const security = this.ensureWebSecurity(accountId);
+      const current = this.webKeyPackage(accountId);
+      const currentVersion = current ? Number(current.version) : 0;
+      if (currentVersion !== expectedVersion) throw new RelayError("VERSION_CONFLICT", "网页密钥包版本已经变化", { version: currentVersion });
+      const nextCredentialVersion = Number(security.credential_version) + 1;
+      this.db.prepare("UPDATE accounts SET password_hash=? WHERE id=? AND status='active'").run(passwordHash, accountId);
+      const nextPackageVersion = currentVersion + 1;
+      this.db.prepare(`INSERT INTO web_key_packages(account_id,version,credential_version,package_json,stale)
+        VALUES(?,?,?,?,0) ON CONFLICT(account_id) DO UPDATE SET version=excluded.version,
+        credential_version=excluded.credential_version,package_json=excluded.package_json,stale=0`)
+        .run(accountId, nextPackageVersion, nextCredentialVersion, packageJson);
+      this.db.prepare("UPDATE web_security SET credential_version=? WHERE account_id=?").run(nextCredentialVersion, accountId);
+      this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND id<>? AND revoked_at IS NULL").run(now(), accountId, keepSessionId);
+      this.db.prepare("UPDATE web_sessions SET credential_version=? WHERE session_id=?").run(nextCredentialVersion, keepSessionId);
+      this.db.prepare("DELETE FROM web_tickets WHERE account_id=?").run(accountId);
+      this.audit(accountId, "device", actorId, "web.password.change", "account", accountId, { packageVersion: nextPackageVersion });
+      const result = { credentialVersion: nextCredentialVersion, version: nextPackageVersion };
+      const response = buildResponse?.(result);
+      if (operationId && fingerprint && response !== undefined) this.saveWebOperation(accountId, operationId, fingerprint, operationReceipt(response));
+      return { ...result, response, replay: false };
+    });
+  }
+
+  registerWebDevice(deviceId: string, accountId: string) {
+    this.db.prepare("INSERT INTO web_devices(device_id,account_id) VALUES(?,?) ON CONFLICT(device_id) DO UPDATE SET account_id=excluded.account_id")
+      .run(deviceId, accountId);
+  }
+
+  createWebSession(accountId: string, deviceId: string) {
+    const security = this.ensureWebSecurity(accountId);
+    const session = this.createSession(accountId, "device", deviceId, true);
+    this.db.prepare("INSERT INTO web_sessions(session_id,account_id,credential_version,totp_version) VALUES(?,?,?,?)")
+      .run(session.sessionId, accountId, security.credential_version, security.totp_version);
+    return session;
+  }
+
+  webSessionById(sessionId: string) {
+    const row = this.db.prepare(`SELECT s.*,a.role,a.status AS account_status,d.status AS device_status,
+      w.credential_version,w.totp_version,sec.credential_version AS current_credential_version,
+      sec.totp_version AS current_totp_version
+      FROM sessions s JOIN accounts a ON a.id=s.account_id JOIN web_sessions w ON w.session_id=s.id
+      JOIN web_security sec ON sec.account_id=s.account_id LEFT JOIN devices d ON d.id=s.principal_id
+      WHERE s.id=? AND s.principal_kind='device' AND s.revoked_at IS NULL AND s.access_expires_at>=?`).get(sessionId, now()) as any | undefined;
+    if (!row || row.account_status !== "active" || row.device_status !== "approved"
+      || row.credential_version !== row.current_credential_version || row.totp_version !== row.current_totp_version) return undefined;
+    return row;
+  }
+
+  consumeWebTicket(ticketValue: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM web_tickets WHERE token_hash=? AND expires_at>=? AND used_at IS NULL")
+        .get(tokenHash(ticketValue), now()) as any | undefined;
+      if (!row) throw new RelayError("AUTH_FAILED", "WebSocket 票据无效或已使用");
+      const changed = this.db.prepare("UPDATE web_tickets SET used_at=? WHERE token_hash=? AND used_at IS NULL")
+        .run(now(), tokenHash(ticketValue));
+      if (!changed.changes) throw new RelayError("AUTH_FAILED", "WebSocket 票据无效或已使用");
+      const session = this.webSessionById(row.session_id);
+      if (!session || session.account_id !== row.account_id || session.principal_id !== row.device_id) {
+        throw new RelayError("AUTH_FAILED", "网页会话已失效");
+      }
+      return { ...row, session };
+    });
+  }
+
+  createWebTicket(sessionId: string, accountId: string, deviceId: string) {
+    const value = token(24);
+    this.db.prepare("INSERT INTO web_tickets(token_hash,session_id,account_id,device_id,expires_at) VALUES(?,?,?,?,?)")
+      .run(tokenHash(value), sessionId, accountId, deviceId, now() + 60_000);
+    return { ticket: value, expiresAt: now() + 60_000 };
+  }
+
+  refreshWebSession(refreshToken: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare(`SELECT s.*,w.credential_version,w.totp_version,sec.credential_version AS current_credential_version,
+        sec.totp_version AS current_totp_version,a.status AS account_status,d.status AS device_status
+        FROM sessions s JOIN web_sessions w ON w.session_id=s.id JOIN web_security sec ON sec.account_id=s.account_id
+        JOIN accounts a ON a.id=s.account_id JOIN devices d ON d.id=s.principal_id
+        WHERE s.refresh_hash=? AND s.principal_kind='device' AND s.revoked_at IS NULL AND s.refresh_expires_at>=?`)
+        .get(tokenHash(refreshToken), now()) as any | undefined;
+      if (!row || row.account_status !== "active" || row.device_status !== "approved"
+        || row.credential_version !== row.current_credential_version || row.totp_version !== row.current_totp_version) {
+        throw new RelayError("AUTH_FAILED", "网页刷新令牌无效");
+      }
+      this.db.prepare("UPDATE sessions SET revoked_at=? WHERE id=?").run(now(), row.id);
+      return this.createWebSession(row.account_id, row.principal_id);
+    });
+  }
+
+  setTotpRequired(accountId: string, required: boolean) {
+    return this.transaction(() => {
+      const current = this.ensureWebSecurity(accountId);
+      const nextVersion = Number(current.totp_version) + 1;
+      this.db.prepare(`UPDATE web_security SET totp_required=?,totp_version=?,totp_secret=NULL,
+        recovery_hashes='[]',totp_last_step=-1 WHERE account_id=?`).run(required ? 1 : 0, nextVersion, accountId);
+      this.db.prepare("UPDATE sessions SET revoked_at=? WHERE account_id=? AND principal_kind='device' AND principal_id IN (SELECT device_id FROM web_devices) AND revoked_at IS NULL")
+        .run(now(), accountId);
+      this.db.prepare("DELETE FROM web_logins WHERE account_id=?").run(accountId);
+      this.db.prepare("DELETE FROM web_tickets WHERE account_id=?").run(accountId);
+      return this.ensureWebSecurity(accountId);
+    });
+  }
+
+  setTotpSecret(accountId: string, secret: string, recoveryHashes: string[], loginToken: string) {
+    return this.transaction(() => {
+      const security = this.ensureWebSecurity(accountId);
+      const pending = this.webLoginByToken(loginToken);
+      if (!pending || pending.account_id !== accountId || pending.enrollment_secret !== secret || pending.verified
+        || !security.totp_required || security.totp_secret) throw new RelayError("VERSION_CONFLICT", "TOTP 绑定事务已经完成或已失效");
+      const version = Number(security.totp_version) + 1;
+      const updated = this.db.prepare(`UPDATE web_security SET totp_secret=?,recovery_hashes=?,totp_version=?,totp_last_step=-1
+        WHERE account_id=? AND totp_required=1 AND totp_secret IS NULL AND totp_version=? AND credential_version=?`)
+        .run(secret, JSON.stringify(recoveryHashes), version, accountId, pending.totp_version, pending.credential_version);
+      if (!updated.changes) throw new RelayError("VERSION_CONFLICT", "验证码绑定状态已经变化，请重新登录");
+        const changed = this.db.prepare("UPDATE web_logins SET totp_version=?,enrollment_secret=NULL,verified=1 WHERE token_hash=? AND account_id=? AND enrollment_secret IS NOT NULL")
+          .run(version, tokenHash(loginToken), accountId);
+        if (!changed.changes) throw new RelayError("CONFLICT", "TOTP 绑定事务已经完成或已失效");
+      this.db.prepare("DELETE FROM web_logins WHERE account_id=? AND token_hash<>?").run(accountId, tokenHash(loginToken));
+      return version;
+    });
+  }
+
+  recordTotpStep(accountId: string, step: number) {
+    this.db.prepare("UPDATE web_security SET totp_last_step=? WHERE account_id=? AND totp_last_step<?").run(step, accountId, step);
+  }
+
+  consumeRecoveryHash(accountId: string, hash: string) {
+    return this.transaction(() => {
+      const security = this.ensureWebSecurity(accountId);
+      const hashes = JSON.parse(String(security.recovery_hashes || "[]")) as string[];
+      const index = hashes.indexOf(hash);
+      if (index < 0) return false;
+      hashes.splice(index, 1);
+      this.db.prepare("UPDATE web_security SET recovery_hashes=? WHERE account_id=?").run(JSON.stringify(hashes), accountId);
+      return true;
+    });
+  }
+
   authenticateAccess(accessToken: string, allowPendingDevice = false) {
     const row = this.db.prepare(`SELECT s.*,a.role,a.status AS account_status,d.status AS device_status
       FROM sessions s JOIN accounts a ON a.id=s.account_id
       LEFT JOIN devices d ON s.principal_kind='device' AND d.id=s.principal_id
       WHERE s.access_hash=? AND s.revoked_at IS NULL AND s.access_expires_at>=?`).get(tokenHash(accessToken), now()) as any;
     if (!row || row.account_status !== "active") return undefined;
+    if (row.principal_kind === "device" && this.db.prepare('SELECT 1 FROM web_devices WHERE device_id=?').get(row.principal_id)) {
+      const verified = this.db.prepare(`SELECT 1 FROM web_sessions w JOIN web_security a ON a.account_id=w.account_id
+        WHERE w.session_id=? AND w.credential_version=a.credential_version AND w.totp_version=a.totp_version`).get(row.id);
+      if (!verified) return undefined;
+    }
     if (row.principal_kind === "device" && row.device_status !== "approved" && !(allowPendingDevice && row.device_status === "pending")) return undefined;
     return row;
   }
@@ -612,6 +1015,9 @@ export class RelayStore {
       if (!row || row.account_status !== "active"
         || (row.principal_kind === "device" && row.device_status !== "approved" && !(allowPendingDevice && row.device_status === "pending"))) {
         throw new RelayError("AUTH_FAILED", "刷新令牌无效");
+      }
+      if (this.db.prepare('SELECT 1 FROM web_devices WHERE device_id=?').get(row.principal_id)) {
+        throw new RelayError('AUTH_FAILED', '网页设备必须使用网页刷新接口');
       }
       this.db.prepare("UPDATE sessions SET revoked_at=? WHERE id=?").run(now(), row.id);
       return this.createSession(row.account_id, row.principal_kind, row.principal_id, true);
@@ -685,8 +1091,8 @@ export class RelayStore {
   startHostEnrollment(name: string, signingPublicKey: string, encryptionPublicKey: string, ttlMs = ENROLLMENT_TTL_MS) {
     return this.transaction(() => {
       const at = now();
-      this.db.prepare("DELETE FROM host_enrollments WHERE expires_at<? OR completed_at IS NOT NULL").run(at);
-      const pending = this.db.prepare("SELECT COUNT(*) AS count FROM host_enrollments").get() as { count: number };
+      this.db.prepare("DELETE FROM host_enrollments WHERE (completed_at IS NULL AND expires_at<?) OR completed_at<?").run(at, at - 24 * 60 * 60_000);
+      const pending = this.db.prepare("SELECT COUNT(*) AS count FROM host_enrollments WHERE completed_at IS NULL").get() as { count: number };
       if (pending.count >= MAX_PENDING_HOST_ENROLLMENTS) throw new RelayError("RATE_LIMITED", "主机绑定请求数量已达上限");
       const enrollment = { id: id(), secret: token(24), expiresAt: at + ttlMs };
       this.db.prepare(`INSERT INTO host_enrollments(
@@ -701,7 +1107,7 @@ export class RelayStore {
     const row = this.db.prepare(`SELECT id,requested_name,signing_public_key,encryption_public_key,expires_at,
       approved_account_id,approved_name,completed_at
       FROM host_enrollments WHERE id=? AND secret_hash=?`).get(enrollmentId, tokenHash(secret)) as any;
-    if (!row || row.expires_at < now()) throw new RelayError("AUTH_FAILED", "主机绑定二维码无效或已过期");
+    if (!row || (!row.completed_at && row.expires_at < now())) throw new RelayError("AUTH_FAILED", "主机绑定二维码无效或已过期");
     return row;
   }
 
@@ -714,6 +1120,11 @@ export class RelayStore {
       if (!row || row.completed_at || row.expires_at < now() || row.secret_hash !== tokenHash(secret)) {
         throw new RelayError("AUTH_FAILED", "主机绑定二维码无效或已过期");
       }
+      if (row.approved_account_id) throw new RelayError("CONFLICT", "主机绑定已经被批准，请查询连接状态");
+      if (this.db.prepare("SELECT 1 FROM hosts WHERE account_id=? AND name=?").get(accountId, name)
+        || this.db.prepare("SELECT 1 FROM host_enrollments WHERE approved_account_id=? AND approved_name=? AND completed_at IS NULL AND expires_at>=? AND id<>?").get(accountId, name, now(), enrollmentId)) {
+        throw new RelayError("CONFLICT", "此账号已有同名电脑，请修改显示名称再确认");
+      }
       const changed = this.db.prepare(`UPDATE host_enrollments SET approved_by=?,approved_account_id=?,approved_name=?,key_package=?
         WHERE id=? AND approved_account_id IS NULL`).run(deviceId, accountId, name, keyPackage, enrollmentId);
       if (!changed.changes) throw new RelayError("CONFLICT", "主机绑定已经被其他账户批准");
@@ -721,14 +1132,25 @@ export class RelayStore {
     });
   }
 
-  completeHostEnrollment(enrollmentId: string, secret: string) {
+  completeHostEnrollment(enrollmentId: string, secret: string, proposedHostToken?: string) {
     return this.transaction(() => {
+      if (proposedHostToken !== undefined && !/^[A-Za-z0-9_-]{32,128}$/.test(proposedHostToken)) throw new RelayError("INVALID_REQUEST", "Host token 格式无效");
       const row = this.db.prepare("SELECT * FROM host_enrollments WHERE id=?").get(enrollmentId) as any;
-      if (!row || row.completed_at || row.expires_at < now() || row.secret_hash !== tokenHash(secret) || !row.approved_account_id) {
+      if (!row || (!row.completed_at && row.expires_at < now()) || row.secret_hash !== tokenHash(secret) || !row.approved_account_id) {
         throw new RelayError("AUTH_FAILED", "主机绑定尚未批准或已经失效");
       }
+      const account = this.accountById(row.approved_account_id);
+      if (!account || account.status !== "active") throw new RelayError("AUTH_FAILED", "绑定账号不可用");
+      if (row.completed_at) {
+        if (!proposedHostToken) throw new RelayError("AUTH_FAILED", "旧客户端主机绑定事务已完成");
+        const host = this.db.prepare(`SELECT * FROM hosts WHERE account_id=? AND name=? AND signing_public_key=? AND encryption_public_key=? AND token_hash=? AND revoked_at IS NULL`)
+          .get(account.id, row.approved_name || row.requested_name, row.signing_public_key, row.encryption_public_key, tokenHash(proposedHostToken)) as any;
+        if (!host) throw new RelayError("CONFLICT", "主机绑定重试材料不一致或已被撤销");
+        return { host, hostToken: proposedHostToken, keyPackage: row.key_package, account: { id: account.id, signingPublicKey: account.signing_public_key, encryptionPublicKey: account.encryption_public_key } };
+      }
       const hostId = id();
-      const hostToken = token();
+      const hostToken = proposedHostToken || token();
+      if (this.db.prepare("SELECT 1 FROM hosts WHERE account_id=? AND name=?").get(account.id, row.approved_name || row.requested_name)) throw new RelayError("CONFLICT", "同名电脑已存在，请重新配对并修改显示名称");
       this.db.prepare(`INSERT INTO hosts(
         id,account_id,name,signing_public_key,encryption_public_key,token_hash,created_at,last_seen_at
       ) VALUES(?,?,?,?,?,?,?,?)`).run(
@@ -736,7 +1158,6 @@ export class RelayStore {
         row.signing_public_key, row.encryption_public_key, tokenHash(hostToken), now(), now(),
       );
       this.db.prepare("UPDATE host_enrollments SET completed_at=? WHERE id=?").run(now(), enrollmentId);
-      const account = this.accountById(row.approved_account_id)!;
       this.audit(account.id, "host", hostId, "host.enroll.complete", "host", hostId);
       return {
         host: this.hostById(account.id, hostId), hostToken,
@@ -826,12 +1247,24 @@ export class RelayStore {
     return this.eventRow(envelope.accountId, envelope.hostId, envelope.eventId);
   }
 
-  eventsAfter(accountId: string, hostId: string, lastSeq: number) {
+  eventsAfter(accountId: string, hostId: string, lastSeq: number, limit?: number) {
     this.requireHost(accountId, hostId);
     const bounds = this.db.prepare("SELECT min(host_seq) AS min_seq,max(host_seq) AS max_seq FROM encrypted_events WHERE account_id=? AND host_id=?")
       .get(accountId, hostId) as any;
     if (bounds?.min_seq && lastSeq > 0 && lastSeq < Number(bounds.min_seq) - 1) {
       throw new RelayError("EVENT_GAP", "事件游标已经过期", { minSeq: bounds.min_seq, maxSeq: bounds.max_seq });
+    }
+    if (limit !== undefined) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) throw new RelayError("INVALID_REQUEST", "回放分页大小无效");
+      const page: ReturnType<RelayStore["mapStoredEvent"]>[] = []; let bytes = 0;
+      const rows = this.db.prepare(`SELECT host_seq AS seq,host_id,device_id,channel_id,counter,kind,event_id,event_type,ciphertext,created_at
+        FROM encrypted_events WHERE account_id=? AND host_id=? AND host_seq>? ORDER BY host_seq ASC LIMIT ?`).iterate(accountId, hostId, lastSeq, limit);
+      for (const row of rows) {
+        const mapped = this.mapStoredEvent(row, accountId), size = Buffer.byteLength(JSON.stringify(mapped));
+        if (page.length && bytes + size > 1024 * 1024) break;
+        page.push(mapped); bytes += size;
+      }
+      return page;
     }
     return (this.db.prepare(`SELECT host_seq AS seq,host_id,device_id,channel_id,counter,kind,event_id,event_type,ciphertext,created_at
       FROM encrypted_events WHERE account_id=? AND host_id=? AND host_seq>? ORDER BY host_seq ASC`)

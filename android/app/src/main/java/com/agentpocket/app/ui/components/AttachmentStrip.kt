@@ -83,7 +83,7 @@ private fun AttachmentThumb(uri: Uri, onRemove: () -> Unit) {
         Box(
             Modifier
                 .size(56.dp)
-                .clip(RoundedCornerShape(8.dp))
+                .clip(MaterialTheme.shapes.small)
                 .background(MaterialTheme.colorScheme.surfaceVariant),
         ) {
             bitmap?.let {
@@ -111,7 +111,7 @@ private fun PendingFileCard(uri: Uri, onRemove: () -> Unit) {
     }
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(10.dp),
+        shape = MaterialTheme.shapes.small,
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
     ) {
         Row(

@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import com.agentpocket.app.data.model.DesktopRuntimeState
 import com.agentpocket.app.data.model.HostRuntime
 import com.agentpocket.app.ui.theme.StatusColors
+import com.agentpocket.app.ui.theme.SkinGeometry
 
 /** Live Host/Desktop status. Every action is backed by a Host RPC. */
 @Composable
@@ -36,13 +37,14 @@ fun HostRuntimeCard(
     runtime: HostRuntime?,
     onRefresh: () -> Unit,
     onLaunch: () -> Unit,
+    safeWake: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val state = if (hostOnline) runtime?.desktopState ?: DesktopRuntimeState.Unavailable else DesktopRuntimeState.Unavailable
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp),
+        shape = SkinGeometry.panel,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -76,13 +78,13 @@ fun HostRuntimeCard(
                 DesktopRuntimeState.Starting -> RuntimeText("Codex Desktop 正在启动，Attach 加载后会自动变为可用。", StatusColors.attention)
                 DesktopRuntimeState.Closed -> {
                     RuntimeText("Codex Desktop 未运行。", MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (runtime?.canWake == true) {
-                        OutlinedButton(onClick = onLaunch, modifier = Modifier.fillMaxWidth()) {
+                    if (canStartDesktop(hostOnline, safeWake, runtime)) {
+                        OutlinedButton(onClick = onLaunch, shape = SkinGeometry.action, modifier = Modifier.fillMaxWidth()) {
                             Icon(Icons.Filled.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(8.dp))
                             Text("启动 Codex Desktop")
                         }
-                    }
+                    } else if (runtime?.canWake == true) RuntimeText("请更新电脑端 Agent Pocket Host 后使用远程启动。", MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 DesktopRuntimeState.Unavailable -> RuntimeText(
                     if (hostOnline) "正在读取 Codex Desktop 状态…" else "Host 离线，无法远程启动 Desktop。",
@@ -92,6 +94,9 @@ fun HostRuntimeCard(
         }
     }
 }
+
+internal fun canStartDesktop(hostOnline: Boolean, safeWake: Boolean, runtime: HostRuntime?): Boolean =
+    hostOnline && safeWake && runtime?.desktopState == DesktopRuntimeState.Closed && runtime.canWake && runtime.safeLaunch
 
 @Composable
 private fun RuntimeText(text: String, color: androidx.compose.ui.graphics.Color) {

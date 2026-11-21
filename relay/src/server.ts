@@ -4,7 +4,8 @@ import { basename, extname, join, normalize, resolve, sep } from "node:path";
 import { createHash, createPublicKey, timingSafeEqual, verify } from "node:crypto";
 import { isIP } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
-import { hashPassword, validatePassword, verifyPassword } from "./auth.js";
+import sodium from "libsodium-wrappers-sumo";
+import { hashPassword, passwordOperationFingerprint, validatePassword, verifyPassword } from "./auth.js";
 import type { RelayConfig } from "./config.js";
 import { FcmNotifier } from "./fcm.js";
 import {
@@ -15,6 +16,7 @@ import {
   normalizeUsername,
   requiredString,
   token,
+  tokenHash,
   validateEnvelope,
   validatePublicKey,
   type AccountRole,
@@ -22,12 +24,15 @@ import {
 } from "./protocol.js";
 import { LoginThrottle } from "./rate-limit.js";
 import { RelayStore, type UpdatePlatform } from "./store.js";
+import { createRecoveryCodes, otpauthUri, randomTotpSecret, recoveryCodeHash, verifyTotp } from "./totp.js";
+import { WebActivationService } from "./web-activation.js";
 
 type RpcId = string | number;
 type RpcRequest = { jsonrpc: "2.0"; id: RpcId; method: string; params?: unknown };
 type DeviceSocket = {
   socket: WebSocket;
-  accessToken: string;
+  accessToken?: string;
+  webSessionId?: string;
   accountId: string;
   deviceId: string;
   hello: boolean;
@@ -67,6 +72,7 @@ const UPDATE_MAX_BYTES: Record<UpdatePlatform, number> = {
 };
 const UPDATE_VERSION = /^\d+\.\d+\.\d+$/;
 const UPDATE_SHA256 = /^[0-9a-f]{64}$/;
+const WEB_LOGIN_MAX = 64 * 1024;
 
 function asObject(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -119,6 +125,33 @@ function equalText(left: string | undefined, right: string | undefined) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function base64Bytes(value: unknown, name: string) {
+  const text = requiredString(value, name, 128);
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) throw new RelayError("INVALID_REQUEST", `${name} 格式无效`);
+  try { return sodium.from_base64(text, sodium.base64_variants.URLSAFE_NO_PADDING); }
+  catch { throw new RelayError("INVALID_REQUEST", `${name} 格式无效`); }
+}
+
+function webPackage(value: unknown) {
+  const text = requiredString(value, "packageJson", MAX_KEY_PACKAGE_CHARS);
+  let parsed: any;
+  try { parsed = JSON.parse(text); } catch { throw new RelayError("INVALID_REQUEST", "网页密钥包 JSON 无效"); }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1
+    || typeof parsed.ciphertext !== "string" || typeof parsed.salt !== "string"
+    || typeof parsed.nonce !== "string" || typeof parsed.accountPublicKeyFingerprint !== "string"
+    || typeof parsed.kdf !== "object" || !Number.isSafeInteger(parsed.kdf.opsLimit)
+    || !Number.isSafeInteger(parsed.kdf.memLimit) || !Number.isSafeInteger(parsed.kdf.algorithm)
+    || parsed.algorithm !== "argon2id+xchacha20poly1305"
+    || !/^[A-Za-z0-9_-]+$/.test(parsed.ciphertext) || !/^[A-Za-z0-9_-]+$/.test(parsed.salt)
+    || !/^[A-Za-z0-9_-]+$/.test(parsed.nonce) || !/^[A-Za-z0-9_-]+$/.test(parsed.accountPublicKeyFingerprint)) {
+    throw new RelayError("INVALID_REQUEST", "网页密钥包字段无效");
+  }
+  if (parsed.kdf.opsLimit < 1 || parsed.kdf.opsLimit > 10 || parsed.kdf.memLimit < 8 * 1024 * 1024 || parsed.kdf.memLimit > 256 * 1024 * 1024) {
+    throw new RelayError("INVALID_REQUEST", "网页密钥包 KDF 参数超出允许范围");
+  }
+  return text;
+}
+
 async function sha256File(path: string) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
@@ -140,7 +173,8 @@ async function readJson(req: IncomingMessage) {
 }
 
 function statusFor(error: RelayError) {
-  if (error.nameCode === "AUTH_FAILED") return 401;
+  if (error.nameCode === "AUTH_FAILED" || error.nameCode === "TOTP_REQUIRED") return 401;
+  if (error.nameCode === "TOTP_ENROLLMENT_REQUIRED" || error.nameCode === "KEY_MIGRATION_REQUIRED") return 409;
   if (error.nameCode === "FORBIDDEN") return 403;
   if (error.nameCode === "NOT_FOUND") return 404;
   if (error.nameCode === "CONFLICT") return 409;
@@ -148,6 +182,26 @@ function statusFor(error: RelayError) {
   if (error.nameCode === "RATE_LIMITED") return 429;
   if (error.nameCode === "PAYLOAD_TOO_LARGE") return 413;
   return 400;
+}
+
+function webOrigin(req: IncomingMessage, publicUrl: string) {
+  const origin = Array.isArray(req.headers.origin) ? req.headers.origin[0] : req.headers.origin;
+  // Browsers commonly omit Origin on same-origin GETs. Read endpoints are bearer
+  // authenticated and do not mutate state, so an absent Origin is acceptable only
+  // for GET/HEAD; every state-changing web request remains origin-bound.
+  if (!origin) {
+    if (req.method === "GET" || req.method === "HEAD") return undefined;
+    throw new RelayError("FORBIDDEN", "请求来源不受信任");
+  }
+  if (origin !== new URL(publicUrl).origin) throw new RelayError("FORBIDDEN", "请求来源不受信任");
+  return origin;
+}
+
+function requireJsonContentType(req: IncomingMessage) {
+  const value = Array.isArray(req.headers["content-type"]) ? req.headers["content-type"][0] : req.headers["content-type"];
+  if (req.method === "POST" && value?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+    throw new RelayError("INVALID_REQUEST", "网页 API 只接受 application/json");
+  }
 }
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string | string[]> = {}) {
@@ -193,7 +247,11 @@ function notification(socket: WebSocket, method: string, params: unknown) {
 
 export class RelayServer {
   private readonly http = createServer((req, res) => void this.onHttp(req, res));
-  private readonly deviceWss = new WebSocketServer({ noServer: true, maxPayload: WS_LIMIT });
+  private readonly deviceWss = new WebSocketServer({
+    noServer: true,
+    maxPayload: WS_LIMIT,
+    handleProtocols: (protocols) => protocols.has("agentpocket.device.v1") ? "agentpocket.device.v1" : false,
+  });
   private readonly hostWss = new WebSocketServer({ noServer: true, maxPayload: WS_LIMIT });
   private readonly devices = new Map<string, Set<DeviceSocket>>();
   private readonly hosts = new Map<string, HostSocket>();
@@ -202,6 +260,10 @@ export class RelayServer {
   private readonly accountThrottle: LoginThrottle;
   private readonly sourceThrottle: LoginThrottle;
   private readonly enrollmentThrottle: LoginThrottle;
+  private readonly webTotpThrottle: LoginThrottle;
+  private readonly webTotpAttempts = new Map<string, { startedAt: number; count: number }>();
+  private readonly webPasswordChanges = new Set<string>();
+  private readonly webActivation: WebActivationService;
   private readonly wsAttempts = new Map<string, { startedAt: number; count: number }>();
   private updateDownloadCount = 0;
   private readonly updateDownloadsByPrincipal = new Map<string, number>();
@@ -222,6 +284,8 @@ export class RelayServer {
     this.accountThrottle = new LoginThrottle({ maxEntries: 10_000, freeFailures: 10, persistent: store });
     this.sourceThrottle = new LoginThrottle({ maxEntries: 5_000, freeFailures: 30, persistent: store });
     this.enrollmentThrottle = new LoginThrottle({ maxEntries: 5_000, freeFailures: 10, persistent: store });
+    this.webTotpThrottle = new LoginThrottle({ maxEntries: 10_000, freeFailures: 5, persistent: store });
+    this.webActivation = new WebActivationService(store, new URL(config.publicUrl).origin, webPackage);
     this.http.on("upgrade", (req, socket, head) => this.onUpgrade(req, socket, head));
     this.deviceWss.on("connection", (socket: WebSocket, request: IncomingMessage, principal: DeviceSocket) => this.onDeviceConnected(socket, request, principal));
     this.hostWss.on("connection", (socket: WebSocket, request: IncomingMessage, principal: HostSocket) => this.onHostConnected(socket, request, principal));
@@ -305,10 +369,30 @@ export class RelayServer {
       this.consumeWebSocketAttempt(req);
       const pathname = new URL(req.url || "/", this.config.publicUrl).pathname;
       const authToken = bearer(req);
-      if (!authToken) throw new RelayError("AUTH_FAILED", "缺少访问令牌");
       if (pathname === "/ws/device") {
-        const principal = this.store.authenticateAccess(authToken);
-        if (!principal || principal.principal_kind !== "device") throw new RelayError("AUTH_FAILED", "设备令牌无效");
+        let principal: any;
+        let webSessionId: string | undefined;
+        if (authToken) {
+          principal = this.store.authenticateAccess(authToken);
+          if (!principal || principal.principal_kind !== "device") throw new RelayError("AUTH_FAILED", "设备令牌无效");
+          // Browser devices must establish their WebSocket through a short-lived
+          // ticket. Keeping bearer-authenticated sockets for legacy Android
+          // devices only makes the web session binding explicit and ensures
+          // account/session revocation can close every browser connection.
+          if (this.store.db.prepare("SELECT 1 FROM web_devices WHERE device_id=?").get(principal.principal_id)) {
+            throw new RelayError("FORBIDDEN", "网页设备必须使用一次性 WebSocket 票据");
+          }
+        } else {
+          const origin = Array.isArray(req.headers.origin) ? req.headers.origin[0] : req.headers.origin;
+          if (origin !== new URL(this.config.publicUrl).origin) throw new RelayError("FORBIDDEN", "网页 WebSocket 来源不受信任");
+          const protocols = String(req.headers["sec-websocket-protocol"] || "").split(",").map((value) => value.trim()).filter(Boolean);
+          if (!protocols.includes("agentpocket.device.v1")) throw new RelayError("AUTH_FAILED", "缺少网页 WebSocket 票据");
+          const ticket = protocols.find((value) => value !== "agentpocket.device.v1");
+          if (!ticket) throw new RelayError("AUTH_FAILED", "网页 WebSocket 票据无效");
+          const consumed = this.store.consumeWebTicket(ticket);
+          principal = consumed.session;
+          webSessionId = consumed.session.id;
+        }
         const deviceConnectionCount = [...this.devices.values()].reduce((total, sessions) => total + sessions.size, 0);
         if (deviceConnectionCount >= MAX_DEVICE_WS_CONNECTIONS
           || (this.devices.get(principal.principal_id)?.size || 0) >= MAX_DEVICE_WS_CONNECTIONS_PER_DEVICE) {
@@ -317,6 +401,7 @@ export class RelayServer {
         const session: DeviceSocket = {
           socket: undefined as unknown as WebSocket,
           accessToken: authToken,
+          webSessionId,
           accountId: principal.account_id,
           deviceId: principal.principal_id,
           hello: false,
@@ -328,6 +413,7 @@ export class RelayServer {
         return;
       }
       if (pathname === "/ws/host") {
+        if (!authToken) throw new RelayError("AUTH_FAILED", "缺少访问令牌");
         const principal = this.store.authenticateHost(authToken);
         if (!principal) throw new RelayError("AUTH_FAILED", "主机令牌无效");
         if (!this.hosts.has(principal.id) && this.hosts.size >= MAX_HOST_WS_CONNECTIONS) {
@@ -415,7 +501,9 @@ export class RelayServer {
     let request: RpcRequest | undefined;
     try {
       request = rpcRequest(data);
-      const principal = this.store.authenticateAccess(session.accessToken);
+      const principal = session.webSessionId
+        ? this.store.webSessionById(session.webSessionId)
+        : session.accessToken ? this.store.authenticateAccess(session.accessToken) : undefined;
       if (!principal || principal.account_id !== session.accountId || principal.principal_id !== session.deviceId) {
         session.socket.close(4003, "Device access expired or revoked");
         return;
@@ -454,7 +542,7 @@ export class RelayServer {
         throw new RelayError("VERSION_UNSUPPORTED", "Relay 协议版本不兼容");
       }
       session.hello = true;
-      return { protocolVersion: RELAY_PROTOCOL_VERSION, accountId: session.accountId, deviceId: session.deviceId };
+      return { protocolVersion: RELAY_PROTOCOL_VERSION, accountId: session.accountId, deviceId: session.deviceId, capabilities: ["event-replay-paged-v1"] };
     }
     if (method === "host/list") {
       return this.store.listHosts(session.accountId).map((host) => ({
@@ -497,7 +585,7 @@ export class RelayServer {
     if (method === "device/revoke") {
       const deviceId = requiredString(params.deviceId, "deviceId", 64);
       this.store.revokeDevice(session.accountId, deviceId, session.deviceId);
-      if (deviceId === session.deviceId) queueMicrotask(() => session.socket.close(4003, "Device revoked"));
+      this.closeDeviceSockets(deviceId, "Device revoked");
       return { revoked: true };
     }
     if (method === "host/revoke") {
@@ -523,6 +611,7 @@ export class RelayServer {
         session.accountId,
         requiredString(params.hostId, "hostId", 64),
         integer(params.lastSeq ?? 0, "lastSeq"),
+        params.limit === undefined ? undefined : integer(params.limit, "limit", 1),
       );
     }
     if (method === "event/get") {
@@ -713,6 +802,36 @@ export class RelayServer {
     }
   }
 
+  private closeAccountSockets(accountId: string, reason: string, keepWebSessionId?: string, webOnly = false) {
+    for (const sessions of this.devices.values()) {
+      for (const session of sessions) {
+        if (session.accountId !== accountId) continue;
+        if (webOnly && !session.webSessionId) continue;
+        if (keepWebSessionId && session.webSessionId === keepWebSessionId) continue;
+        session.socket.close(4003, reason);
+      }
+    }
+  }
+
+  private closeDeviceSockets(deviceId: string, reason: string) {
+    const sessions = this.devices.get(deviceId);
+    if (sessions) for (const session of sessions) session.socket.close(4003, reason);
+  }
+
+  private assertWebTotpAttempt(loginToken: string) {
+    const now = Date.now();
+    const current = this.webTotpAttempts.get(loginToken);
+    if (!current || now - current.startedAt >= 5 * 60_000) { this.webTotpAttempts.set(loginToken, { startedAt: now, count: 0 }); return; }
+    if (current.count >= 8) throw new RelayError("RATE_LIMITED", "验证码尝试次数过多，请重新登录", { retryAfterMs: Math.max(1, 5 * 60_000 - (now - current.startedAt)) });
+  }
+
+  private failedWebTotp(loginToken: string) {
+    const current = this.webTotpAttempts.get(loginToken) || { startedAt: Date.now(), count: 0 };
+    current.count += 1; this.webTotpAttempts.set(loginToken, current);
+  }
+
+  private succeededWebTotp(loginToken: string) { this.webTotpAttempts.delete(loginToken); }
+
   private broadcastHostStatus(accountId: string, hostId: string, online: boolean) {
     this.broadcastAccount(accountId, "host/status", { hostId, online, at: new Date().toISOString() });
   }
@@ -726,6 +845,18 @@ export class RelayServer {
       }
       if (url.pathname.startsWith("/api/")) {
         await this.onApi(req, res, url);
+        return;
+      }
+      if (url.pathname === "/invite") {
+        // Keep the legacy Android invitation surface available while /app is optional.
+        this.serveAdmin(res, url.pathname);
+        return;
+      }
+      if (!this.config.webEnabled && (url.pathname === "/app" || url.pathname.startsWith("/app/"))) {
+        throw new RelayError("NOT_FOUND", "网页端尚未启用");
+      }
+      if (this.config.webEnabled && (url.pathname === "/app" || url.pathname.startsWith("/app/"))) {
+        this.serveWeb(res, url.pathname);
         return;
       }
       this.serveAdmin(res, url.pathname);
@@ -746,6 +877,11 @@ export class RelayServer {
 
   private async onApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     const method = req.method || "GET";
+    if (url.pathname.startsWith("/api/web/")) {
+      if (!this.config.webEnabled) throw new RelayError("NOT_FOUND", "网页端尚未启用");
+      webOrigin(req, this.config.publicUrl);
+      requireJsonContentType(req);
+    }
     if (method === "GET" && url.pathname === "/api/bootstrap/status") {
       json(res, 200, { required: this.store.accountCount() === 0 });
       return;
@@ -754,6 +890,7 @@ export class RelayServer {
       json(res, 200, {
         protocolVersion: RELAY_PROTOCOL_VERSION,
         recoveryPublicKey: this.store.meta("recoveryPublicKey") || null,
+        deviceLoginRecovery: 1,
       });
       return;
     }
@@ -787,6 +924,395 @@ export class RelayServer {
       const tokens = this.store.createSession(claimed.account.id, "device", claimed.device.id);
       json(res, 201, this.loginResult(claimed.account, claimed.device, tokens));
       return;
+    }
+    if (method === "POST" && (url.pathname === "/api/web/activate/start" || url.pathname === "/api/web/activate/complete")) {
+      const body = asObject(await readJson(req));
+      const result = url.pathname.endsWith("/start") ? await this.webActivation.start(body, clientAddress(req)) : await this.webActivation.complete(body, clientAddress(req));
+      json(res, 200, result); return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/login") {
+      await sodium.ready;
+      const body = asObject(await readJson(req));
+      const username = normalizeUsername(body.username);
+      const sourceKey = `web-source:${clientAddress(req)}`;
+      const accountKey = `web-username:${username}`;
+      const key = `web-account-source:${username}:${clientAddress(req)}`;
+      this.sourceThrottle.assertAllowed(sourceKey);
+      this.accountThrottle.assertAllowed(accountKey);
+      this.throttle.assertAllowed(key);
+      const password = String(body.password || "");
+      const account = this.store.accountByUsername(username);
+      if (!account) {
+        const provision = this.store.accountProvisionByUsername(username);
+        if (provision && this.store.meta(`webActivationMode:${provision.id}`) === "web-only" && await verifyPassword(password, provision.password_hash)) {
+          this.throttle.succeeded(key); this.accountThrottle.succeeded(accountKey); this.sourceThrottle.succeeded(sourceKey);
+          throw new RelayError("ACCOUNT_ACTIVATION_REQUIRED", "首次使用，请在网页激活这个账号");
+        }
+      }
+      if (!account || account.status !== "active" || !await verifyPassword(password, account.password_hash)) {
+        const sourceDelay = this.sourceThrottle.failed(sourceKey);
+        const retryAfterMs = Math.max(sourceDelay, this.accountThrottle.failed(accountKey), this.throttle.failed(key));
+        throw new RelayError(retryAfterMs ? "RATE_LIMITED" : "AUTH_FAILED", "用户名或密码错误", retryAfterMs ? { retryAfterMs } : undefined);
+      }
+      this.throttle.succeeded(key); this.accountThrottle.succeeded(accountKey); this.sourceThrottle.succeeded(sourceKey);
+      const requestedDeviceId = optionalString(body.deviceId, "deviceId", 64);
+      const deviceSigningPublicKey = validatePublicKey(body.deviceSigningPublicKey, "deviceSigningPublicKey");
+      const deviceEncryptionPublicKey = validatePublicKey(body.deviceEncryptionPublicKey, "deviceEncryptionPublicKey");
+      const deviceName = requiredString(body.deviceName, "deviceName", 80);
+      const security = this.store.ensureWebSecurity(account.id);
+      const packageRow = this.store.webKeyPackage(account.id);
+      const totpSecret = security.totp_secret as string | null;
+      const requiredTotp = Boolean(security.totp_required);
+      const suppliedTotp = body.totpCode;
+      let verified = !requiredTotp;
+      if (requiredTotp && totpSecret) {
+        const totpRateKey = `web-totp:${account.id}:${clientAddress(req)}`;
+        this.webTotpThrottle.assertAllowed(totpRateKey);
+        const step = verifyTotp(totpSecret, suppliedTotp, Number(security.totp_last_step));
+        if (step === undefined) {
+          this.webTotpThrottle.failed(totpRateKey);
+          const challenge = this.store.createWebLogin({
+            accountId: account.id, deviceId: requestedDeviceId, deviceName, deviceSigningPublicKey, deviceEncryptionPublicKey,
+            credentialVersion: Number(security.credential_version),
+            totpVersion: Number(security.totp_version), verified: false, signingChallenge: token(32),
+            boxNonce: sodium.to_base64(sodium.randombytes_buf(32), sodium.base64_variants.URLSAFE_NO_PADDING), trusted: body.trustBrowser !== false,
+          });
+          throw new RelayError("TOTP_REQUIRED", "请输入 FreeOTP+ 中的 6 位验证码", { loginToken: challenge });
+        }
+        this.webTotpThrottle.succeeded(totpRateKey);
+        this.store.recordTotpStep(account.id, step);
+        verified = true;
+      }
+      const enrollmentSecret = requiredTotp && !totpSecret ? randomTotpSecret() : undefined;
+      // Do not create or touch a browser device until password and TOTP have
+      // both succeeded. A pending login stores only the public device data;
+      // materializeWebLoginDevice attaches it after the second factor.
+      const device = enrollmentSecret ? undefined : this.store.findWebDeviceForLogin(
+        account.id, requestedDeviceId, deviceSigningPublicKey, deviceEncryptionPublicKey, deviceName,
+      );
+      const signingChallenge = token(32);
+      const boxNonce = sodium.to_base64(sodium.randombytes_buf(32), sodium.base64_variants.URLSAFE_NO_PADDING);
+      const loginToken = this.store.createWebLogin({
+        accountId: account.id, deviceId: device?.id, deviceName, deviceSigningPublicKey, deviceEncryptionPublicKey,
+        credentialVersion: Number(security.credential_version),
+        totpVersion: Number(security.totp_version), verified, signingChallenge, boxNonce,
+        trusted: body.trustBrowser !== false, enrollmentSecret,
+      });
+      if (enrollmentSecret) {
+        throw new RelayError("TOTP_ENROLLMENT_REQUIRED", "此账号需要先绑定验证器", {
+          loginToken, secret: enrollmentSecret, otpauthUri: otpauthUri("Agent Pocket", account.username, enrollmentSecret),
+        });
+      }
+      if (!device) throw new RelayError("AUTH_FAILED", "网页设备验证事务无效");
+      const encryptedChallenge = sodium.crypto_box_seal(sodium.from_base64(boxNonce, sodium.base64_variants.URLSAFE_NO_PADDING), base64Bytes(device.encryption_public_key, "deviceEncryptionPublicKey"));
+      json(res, 200, {
+        state: "device_proof_pending", loginToken, account: this.publicAccount(account),
+        device: { id: device.id, name: device.name, status: device.status },
+        challenge: { signingMessage: signingChallenge, boxChallenge: sodium.to_base64(encryptedChallenge, sodium.base64_variants.URLSAFE_NO_PADDING) },
+        // A stale package still occupies its version slot. The migration
+        // endpoint uses this value for its compare-and-swap check.
+        keyPackageVersion: packageRow ? Number(packageRow.version) : 0,
+      });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/auth/web-package") {
+      const principal = this.devicePrincipal(req);
+      if (this.store.db.prepare("SELECT 1 FROM web_devices WHERE device_id=?").get(principal.principal_id)) {
+        throw new RelayError("FORBIDDEN", "网页设备不能代替可信 Android 迁移账户密钥");
+      }
+      const body = asObject(await readJson(req));
+      const packageJson = webPackage(body.packageJson);
+      const security = this.store.ensureWebSecurity(principal.account_id);
+      const current = this.store.webKeyPackage(principal.account_id);
+      const expectedVersion = integer(body.expectedVersion ?? (current ? Number(current.version) : 0), "expectedVersion");
+      const operationId = optionalString(body.operationId, "operationId", 128);
+      const fingerprint = createHash("sha256").update(JSON.stringify({ packageJson, expectedVersion, accountId: principal.account_id })).digest("hex");
+      const previous = operationId && this.store.webOperation(principal.account_id, operationId, fingerprint);
+      if (previous) { json(res, 200, previous); return; }
+      const result = this.store.saveWebKeyPackageWithOperation(
+        principal.account_id,
+        packageJson,
+        expectedVersion,
+        Number(security.credential_version),
+        operationId,
+        fingerprint,
+        (saved) => ({ migrated: true, keyPackageVersion: Number(saved.version) }),
+      );
+      const response = result.response || { migrated: true, keyPackageVersion: Number(result.saved?.version || 0) };
+      if (!result.replay) this.store.audit(principal.account_id, "device", principal.principal_id, "web.package.android-migrate", "account", principal.account_id, { version: Number(result.saved?.version || 0) });
+      json(res, 200, response);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/totp/enroll/start") {
+      const body = asObject(await readJson(req));
+      const login = this.store.webLoginByToken(requiredString(body.loginToken, "loginToken", 256));
+      if (!login) throw new RelayError("AUTH_FAILED", "登录事务已过期");
+      const account = this.store.accountById(login.account_id);
+      const security = this.store.ensureWebSecurity(login.account_id);
+      if (!account || !security.totp_required) throw new RelayError("FORBIDDEN", "当前账号不需要绑定 TOTP");
+      if (!login.enrollment_secret) throw new RelayError("CONFLICT", "TOTP 绑定事务不存在");
+      json(res, 200, { secret: login.enrollment_secret, otpauthUri: otpauthUri("Agent Pocket", account.username, login.enrollment_secret) });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/totp/enroll/finish") {
+      const body = asObject(await readJson(req));
+      const loginToken = requiredString(body.loginToken, "loginToken", 256);
+      this.assertWebTotpAttempt(loginToken);
+      const login = this.store.webLoginByToken(loginToken);
+      if (!login || !login.enrollment_secret) throw new RelayError("AUTH_FAILED", "TOTP 绑定事务已过期");
+      const totpRateKey = `web-totp:${login.account_id}:${clientAddress(req)}`;
+      this.webTotpThrottle.assertAllowed(totpRateKey);
+      const step = verifyTotp(login.enrollment_secret, body.code);
+      if (step === undefined) { this.webTotpThrottle.failed(totpRateKey); this.failedWebTotp(loginToken); throw new RelayError("AUTH_FAILED", "TOTP 验证码无效"); }
+      this.webTotpThrottle.succeeded(totpRateKey);
+      this.succeededWebTotp(loginToken);
+      const codes = createRecoveryCodes(10);
+      this.store.setTotpSecret(login.account_id, login.enrollment_secret, codes.hashes, loginToken);
+      this.store.recordTotpStep(login.account_id, step);
+      this.store.updateWebLogin(loginToken, { verified: true });
+      this.store.materializeWebLoginDevice(loginToken);
+      json(res, 200, { state: "device_proof_pending", recoveryCodes: codes.codes, loginToken });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/totp/recovery") {
+      const body = asObject(await readJson(req));
+      const loginToken = requiredString(body.loginToken, "loginToken", 256);
+      this.assertWebTotpAttempt(loginToken);
+      const login = this.store.webLoginByToken(loginToken);
+      if (!login) throw new RelayError("AUTH_FAILED", "登录事务已过期");
+      const totpRateKey = `web-totp:${login.account_id}:${clientAddress(req)}`;
+      this.webTotpThrottle.assertAllowed(totpRateKey);
+      if (!this.store.consumeRecoveryHash(login.account_id, recoveryCodeHash(requiredString(body.code, "code", 32)))) { this.webTotpThrottle.failed(totpRateKey); this.failedWebTotp(loginToken); throw new RelayError("AUTH_FAILED", "恢复码无效或已经使用"); }
+      this.webTotpThrottle.succeeded(totpRateKey);
+      this.succeededWebTotp(loginToken);
+      this.store.updateWebLogin(loginToken, { verified: true });
+      this.store.materializeWebLoginDevice(loginToken);
+      json(res, 200, { state: "device_proof_pending", loginToken });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/totp/verify") {
+      const body = asObject(await readJson(req));
+      const loginToken = requiredString(body.loginToken, "loginToken", 256);
+      this.assertWebTotpAttempt(loginToken);
+      const login = this.store.webLoginByToken(loginToken);
+      if (!login) throw new RelayError("AUTH_FAILED", "登录事务已过期");
+      const security = this.store.ensureWebSecurity(login.account_id);
+      const totpRateKey = `web-totp:${login.account_id}:${clientAddress(req)}`;
+      this.webTotpThrottle.assertAllowed(totpRateKey);
+      const step = verifyTotp(String(security.totp_secret || ""), body.code, Number(security.totp_last_step));
+      if (step === undefined) { this.webTotpThrottle.failed(totpRateKey); this.failedWebTotp(loginToken); throw new RelayError("AUTH_FAILED", "TOTP 验证码无效"); }
+      this.webTotpThrottle.succeeded(totpRateKey);
+      this.succeededWebTotp(loginToken);
+      this.store.recordTotpStep(login.account_id, step);
+      this.store.updateWebLogin(loginToken, { verified: true });
+      this.store.materializeWebLoginDevice(loginToken);
+      json(res, 200, { state: "device_proof_pending", loginToken });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/device/complete") {
+      const body = asObject(await readJson(req));
+      const loginToken = requiredString(body.loginToken, "loginToken", 256);
+      const login = this.store.webLoginByToken(loginToken);
+      if (!login || !login.verified || login.proof) throw new RelayError("AUTH_FAILED", "设备证明事务已完成或已失效");
+      this.store.materializeWebLoginDevice(loginToken);
+      const materializedLogin = this.store.webLoginByToken(loginToken);
+      if (!materializedLogin) throw new RelayError("AUTH_FAILED", "登录事务已过期");
+      const account = this.store.accountById(login.account_id);
+      const device = account && this.store.deviceById(account.id, materializedLogin.device_id);
+      if (!account || !device) throw new RelayError("AUTH_FAILED", "网页设备不存在");
+      await this.verifyWebProof(login, device, body);
+      // Approval, session creation, and consumption of the proof transaction
+      // must commit together. Otherwise a crash after session creation could
+      // let a retry of the same loginToken create another web session.
+      const result = this.store.transaction(() => {
+        const current = this.store.webLoginByToken(loginToken);
+        if (!current?.verified || current.proof || current.account_id !== account.id || current.device_id !== device.id
+          || current.signing_challenge !== login.signing_challenge || current.box_nonce !== login.box_nonce) throw new RelayError("AUTH_FAILED", "设备证明事务已完成或已失效");
+        const consumed = this.store.db.prepare("UPDATE web_logins SET proof=1 WHERE token_hash=? AND verified=1 AND proof=0")
+          .run(tokenHash(loginToken));
+        if (consumed.changes !== 1) throw new RelayError("CONFLICT", "设备证明已经被使用");
+        const packageRow = this.store.webKeyPackage(account.id);
+        if (!packageRow || packageRow.stale) return { state: "key_migration_required", loginToken, account: this.publicAccount(account), device: { id: device.id, name: device.name, status: device.status }, keyPackageVersion: packageRow ? Number(packageRow.version) : 0 };
+        this.store.approveWebDevice(account.id, device.id, packageRow.package_json, device.id);
+        const tokens = this.store.createWebSession(account.id, device.id);
+        this.store.deleteWebLogin(loginToken);
+        return { state: "ready", account: this.publicAccount(account), device: { id: device.id, name: device.name, status: "approved" }, tokens, keyPackage: packageRow.package_json, keyPackageVersion: Number(packageRow.version) };
+      });
+      json(res, 200, result);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/device/challenge") {
+      const body = asObject(await readJson(req));
+      const loginToken = requiredString(body.loginToken, "loginToken", 256);
+      const login = this.store.webLoginByToken(loginToken);
+      if (!login || !login.verified) throw new RelayError("AUTH_FAILED", "网页二次验证尚未完成");
+      this.store.materializeWebLoginDevice(loginToken);
+      const materializedLogin = this.store.webLoginByToken(loginToken);
+      if (!materializedLogin) throw new RelayError("AUTH_FAILED", "登录事务已过期");
+      const device = this.store.deviceById(materializedLogin.account_id, materializedLogin.device_id);
+      if (!device || device.status === "revoked") throw new RelayError("AUTH_FAILED", "网页设备已撤销");
+      await sodium.ready;
+      const encrypted = sodium.crypto_box_seal(sodium.from_base64(materializedLogin.box_nonce, sodium.base64_variants.URLSAFE_NO_PADDING), base64Bytes(device.encryption_public_key, "deviceEncryptionPublicKey"));
+      json(res, 200, { signingMessage: materializedLogin.signing_challenge, boxChallenge: sodium.to_base64(encrypted, sodium.base64_variants.URLSAFE_NO_PADDING) });
+      return;
+    }
+    if (method === "GET" && url.pathname === "/api/web/key-migration/status") {
+      const principal = this.webPrincipal(req);
+      const security = this.store.ensureWebSecurity(principal.account_id);
+      const row = this.store.webKeyPackage(principal.account_id);
+      json(res, 200, { state: !row || row.stale ? "key_migration_required" : "ready", keyPackageVersion: row ? Number(row.version) : 0, credentialVersion: Number(security.credential_version) });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/key-migration/start") {
+      const principal = this.webPrincipal(req);
+      const security = this.store.ensureWebSecurity(principal.account_id);
+      const row = this.store.webKeyPackage(principal.account_id);
+      json(res, 200, { state: !row || row.stale ? "key_migration_required" : "ready", expectedVersion: row ? Number(row.version) : 0, credentialVersion: Number(security.credential_version) });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/key-migration/package") {
+      const body = asObject(await readJson(req));
+      const login = this.store.webLoginByToken(requiredString(body.loginToken, "loginToken", 256));
+      if (!login?.verified || !login.proof || !login.device_id
+        || !this.store.db.prepare("SELECT 1 FROM web_devices WHERE device_id=? AND account_id=?").get(login.device_id, login.account_id)) {
+        throw new RelayError("AUTH_FAILED", "网页二次验证和设备证明尚未完成");
+      }
+      const current = this.store.webKeyPackage(login.account_id);
+      if (current && !current.stale) throw new RelayError("CONFLICT", "网页迁移已完成，请重新登录");
+      const device = this.store.deviceById(login.account_id, login.device_id);
+      if (!device || device.status === "revoked") throw new RelayError("AUTH_FAILED", "网页设备不存在或已撤销");
+      if (device.status !== "approved" || !device.key_package) { json(res, 200, { state: "pending" }); return; }
+      // Legacy Android approves only the sealed device package. It does not
+      // grant a web session or mark the password-wrapped package migrated.
+      if (device.key_package.trim().startsWith("{")) throw new RelayError("CONFLICT", "旧网页密钥已失效，请使用临时浏览器模式重新登录并由手机批准");
+      json(res, 200, { state: "approved", sealedKeyPackage: device.key_package });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/key-migration/complete") {
+      const body = asObject(await readJson(req));
+      const loginToken = requiredString(body.loginToken, "loginToken", 256);
+      const login = this.store.webLoginByToken(loginToken);
+      if (!login || !login.verified || !login.proof) throw new RelayError("AUTH_FAILED", "设备证明尚未完成");
+      const packageJson = webPackage(body.packageJson);
+      const account = this.store.accountById(login.account_id);
+      if (!account) throw new RelayError("NOT_FOUND", "用户不存在");
+      const expectedVersion = Number(body.expectedVersion ?? 0);
+      const operationId = optionalString(body.operationId, "operationId", 128);
+      const fingerprint = createHash("sha256").update(JSON.stringify({ packageJson, expectedVersion, deviceId: login.device_id })).digest("hex");
+      const previous = operationId && this.store.webOperation(account.id, operationId, fingerprint);
+      if (previous) {
+        // Tokens are intentionally removed from the durable receipt. A retry
+        // with the same operationId can still recover a usable session without
+        // repeating the migration or generating a second key package.
+        if (previous.state === "ready" && login.device_id) {
+          const device = this.store.deviceById(account.id, login.device_id);
+          if (device?.status === "approved") {
+            const tokens = this.store.createWebSession(account.id, device.id);
+            this.store.deleteWebLogin(loginToken);
+            json(res, 200, { ...previous, tokens });
+            return;
+          }
+        }
+        json(res, 200, previous);
+        return;
+      }
+      const device = this.store.deviceById(account.id, login.device_id);
+      const currentPackage = this.store.webKeyPackage(account.id);
+      if (!device || device.status === "revoked"
+        || !this.store.db.prepare("SELECT 1 FROM web_devices WHERE device_id=? AND account_id=?").get(device.id, account.id)
+        || (currentPackage && !currentPackage.stale)) throw new RelayError("AUTH_FAILED", "网页迁移事务已经完成，请重新登录");
+      const result = this.store.completeWebMigration(account.id, login.device_id, packageJson, expectedVersion, login.device_id,
+        operationId, fingerprint, (completed, tokens) => ({ state: "ready", account: this.publicAccount(account), device: { id: login.device_id, status: "approved" }, tokens, keyPackage: packageJson, keyPackageVersion: completed.version }));
+      const response = result.response || { state: "ready", account: this.publicAccount(account), device: { id: login.device_id, status: "approved" }, keyPackage: packageJson, keyPackageVersion: result.version };
+      if (!operationId) this.store.deleteWebLogin(loginToken);
+      json(res, 200, response);
+      return;
+    }
+    if (method === "GET" && url.pathname === "/api/web/session") {
+      const principal = this.webPrincipal(req);
+      const account = this.store.accountById(principal.account_id)!;
+      const security = this.store.ensureWebSecurity(principal.account_id);
+      const packageRow = this.store.webKeyPackage(principal.account_id);
+      json(res, 200, { state: "ready", account: this.publicAccount(account), device: { id: principal.principal_id, status: principal.device_status }, totp: { required: Boolean(security.totp_required), configured: Boolean(security.totp_secret) }, keyPackageVersion: packageRow && !packageRow.stale ? Number(packageRow.version) : 0 });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/refresh") {
+      const body = asObject(await readJson(req));
+      const tokens = this.store.refreshWebSession(requiredString(body.refreshToken, "refreshToken", 256));
+      json(res, 200, tokens);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/logout") {
+      const principal = this.webPrincipal(req);
+      this.store.revokeSession(principal.id);
+      this.closeAccountSockets(principal.account_id, "Web session logged out", principal.id, true);
+      const body = asObject(await readJson(req));
+      if (body.refreshToken) {
+        const refreshToken = requiredString(body.refreshToken, "refreshToken", 256);
+        const row = this.store.db.prepare("SELECT s.id,s.account_id,s.principal_id FROM sessions s JOIN web_sessions w ON w.session_id=s.id WHERE s.refresh_hash=? AND s.principal_kind='device'").get(tokenHash(refreshToken)) as any;
+        if (!row || row.account_id !== principal.account_id || row.principal_id !== principal.principal_id) throw new RelayError("AUTH_FAILED", "网页刷新令牌无效");
+        this.store.revokeRefreshToken(refreshToken);
+        this.closeDeviceSockets(row.principal_id, "Web session logged out");
+      }
+      json(res, 200, { loggedOut: true });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/device/forget") {
+      const principal = this.webPrincipal(req);
+      this.store.revokeDevice(principal.account_id, principal.principal_id, principal.principal_id);
+      this.closeDeviceSockets(principal.principal_id, "Device forgotten");
+      json(res, 200, { forgotten: true });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/ws-ticket") {
+      const principal = this.webPrincipal(req);
+      const ticket = this.store.createWebTicket(principal.id, principal.account_id, principal.principal_id);
+      json(res, 200, ticket);
+      return;
+    }
+    const webOperationMatch = /^\/api\/web\/operations\/([^/]+)$/.exec(url.pathname);
+    if (method === "GET" && webOperationMatch) {
+      const principal = this.webPrincipal(req);
+      const operationId = decodeURIComponent(webOperationMatch[1]);
+      const result = this.store.webOperationById(principal.account_id, operationId);
+      if (result === undefined) throw new RelayError("NOT_FOUND", "操作记录不存在或已过期");
+      json(res, 200, { operationId, result });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/web/password") {
+      const principal = this.webPrincipal(req);
+      const body = asObject(await readJson(req));
+      const packageJson = webPackage(body.packageJson);
+      const expectedVersion = Number(body.expectedVersion ?? 0);
+      const operationId = optionalString(body.operationId, "operationId", 128);
+      const newPassword = validatePassword(body.newPassword);
+      if (this.webPasswordChanges.has(principal.account_id) || this.webPasswordChanges.size >= 2) throw new RelayError("RATE_LIMITED", "密码更新正在处理中，请稍后查询或重试");
+      this.webPasswordChanges.add(principal.account_id);
+      try {
+      const fingerprint = await passwordOperationFingerprint(newPassword, [principal.account_id, operationId ?? null, expectedVersion, packageJson, principal.id]);
+      this.webPrincipal(req);
+      const previous = operationId && this.store.webOperation(principal.account_id, operationId, fingerprint);
+      if (previous) { json(res, 200, previous); return; }
+      const account = this.store.accountById(principal.account_id)!;
+      if (!await verifyPassword(String(body.currentPassword || ""), account.password_hash)) throw new RelayError("AUTH_FAILED", "当前密码错误");
+      const security = this.store.ensureWebSecurity(principal.account_id);
+      if (security.totp_required) {
+        const step = verifyTotp(String(security.totp_secret || ""), body.totpCode, Number(security.totp_last_step));
+        if (step === undefined) throw new RelayError("TOTP_REQUIRED", "请输入 TOTP 验证码");
+        this.store.recordTotpStep(principal.account_id, step);
+      }
+      const passwordHash = await hashPassword(newPassword);
+      // KDF work yields to resets/revocations. Revalidate immediately before
+      // the synchronous transaction so an obsolete session cannot change keys.
+      this.webPrincipal(req);
+      if (this.store.accountById(principal.account_id)?.password_hash !== account.password_hash) throw new RelayError("VERSION_CONFLICT", "账户凭据已变化，请重新登录");
+      const result = this.store.changeWebPassword(principal.account_id, passwordHash, packageJson, expectedVersion, principal.principal_id, principal.id,
+        operationId, fingerprint, value => ({ changed: true, ...value }));
+      const response = result.response || { changed: true, credentialVersion: result.credentialVersion, version: result.version };
+      this.closeAccountSockets(principal.account_id, "Web credentials changed", principal.id);
+      json(res, 200, response);
+      return;
+      } finally { this.webPasswordChanges.delete(principal.account_id); }
     }
     if (method === "POST" && url.pathname === "/api/auth/activate") {
       const body = asObject(await readJson(req));
@@ -840,12 +1366,26 @@ export class RelayServer {
       this.throttle.succeeded(key);
       this.accountThrottle.succeeded(accountKey);
       this.sourceThrottle.succeeded(sourceKey);
+      if (body.recoverDeviceKeys === true) {
+        const issuedAt = body.deviceProofIssuedAt;
+        const signing = validatePublicKey(body.deviceSigningPublicKey, "deviceSigningPublicKey");
+        const encryption = validatePublicKey(body.deviceEncryptionPublicKey, "deviceEncryptionPublicKey");
+        const signature = requiredString(body.deviceRecoveryProof, "deviceRecoveryProof", 128);
+        await sodium.ready;
+        const bytes = Buffer.from(signature, "base64url");
+        if (!Number.isSafeInteger(issuedAt) || Math.abs(Date.now() - Number(issuedAt)) > 5 * 60_000 ||
+            bytes.toString("base64url") !== signature || bytes.length !== sodium.crypto_sign_BYTES ||
+            !sodium.crypto_sign_verify_detached(bytes, Buffer.from(JSON.stringify(["agent-pocket-device-login-recovery-v1", username, signing, encryption, issuedAt])), Buffer.from(signing, "base64url"))) {
+          throw new RelayError("AUTH_FAILED", "设备私钥证明无效");
+        }
+      }
       const device = this.store.findDeviceForLogin(
         account.id,
         optionalString(body.deviceId, "deviceId", 64),
         validatePublicKey(body.deviceSigningPublicKey, "deviceSigningPublicKey"),
         validatePublicKey(body.deviceEncryptionPublicKey, "deviceEncryptionPublicKey"),
         requiredString(body.deviceName, "deviceName", 80),
+        body.recoverDeviceKeys === true,
       );
       const tokens = this.store.createSession(account.id, "device", device.id);
       this.store.audit(account.id, "device", device.id, "auth.login", "device", device.id, { status: device.status });
@@ -873,9 +1413,16 @@ export class RelayServer {
     if (method === "POST" && url.pathname === "/api/auth/logout") {
       const access = bearer(req);
       const principal = access && this.store.authenticateAccess(access, true);
+      if (principal && this.store.db.prepare("SELECT 1 FROM web_devices WHERE device_id=?").get(principal.principal_id)) {
+        throw new RelayError("FORBIDDEN", "网页设备必须使用网页退出接口");
+      }
       if (principal) this.store.revokeSession(principal.id);
       const body = asObject(await readJson(req));
-      if (body.refreshToken) this.store.revokeRefreshToken(requiredString(body.refreshToken, "refreshToken", 256));
+      if (body.refreshToken) {
+        const refreshToken = requiredString(body.refreshToken, "refreshToken", 256);
+        if (this.store.db.prepare("SELECT 1 FROM web_sessions w JOIN sessions s ON s.id=w.session_id WHERE s.refresh_hash=?").get(tokenHash(refreshToken))) throw new RelayError("FORBIDDEN", "网页刷新令牌必须使用网页退出接口");
+        this.store.revokeRefreshToken(refreshToken);
+      }
       json(res, 200, { loggedOut: true });
       return;
     }
@@ -914,6 +1461,7 @@ export class RelayServer {
       const completed = this.store.completeHostEnrollment(
         requiredString(body.enrollmentId, "enrollmentId", 64),
         requiredString(body.secret, "secret", 128),
+        optionalString(body.proposedHostToken, "proposedHostToken", 128),
       );
       json(res, 201, completed);
       return;
@@ -1007,6 +1555,7 @@ export class RelayServer {
         displayName: requiredString(body.displayName, "displayName", 80),
         passwordHash,
         createdBy: principal.account_id,
+        webOnly: body.webOnly === true,
       });
       json(res, 201, {
         user: {
@@ -1078,6 +1627,33 @@ export class RelayServer {
       json(res, 200, { recovered: true });
       return;
     }
+    const webPackageMatch = /^\/api\/admin\/users\/([^/]+)\/web-package$/.exec(url.pathname);
+    if (method === "POST" && webPackageMatch) {
+      const target = this.store.accountById(webPackageMatch[1]);
+      if (!target || target.role !== "user") throw new RelayError("NOT_FOUND", "普通用户不存在");
+      const body = asObject(await readJson(req));
+      const packageJson = webPackage(body.packageJson);
+      const security = this.store.ensureWebSecurity(target.id);
+      const current = this.store.webKeyPackage(target.id);
+      const expectedVersion = integer(body.expectedVersion ?? (current ? Number(current.version) : 0), "expectedVersion");
+      const operationId = optionalString(body.operationId, "operationId", 128);
+      const fingerprint = createHash("sha256").update(JSON.stringify({ packageJson, expectedVersion, accountId: target.id })).digest("hex");
+      const previous = operationId && this.store.webOperation(target.id, operationId, fingerprint);
+      if (previous) { json(res, 200, previous); return; }
+      const result = this.store.saveWebKeyPackageWithOperation(
+        target.id,
+        packageJson,
+        expectedVersion,
+        Number(security.credential_version),
+        operationId,
+        fingerprint,
+        (saved) => ({ migrated: true, keyPackageVersion: Number(saved.version) }),
+      );
+      const response = result.response || { migrated: true, keyPackageVersion: Number(result.saved?.version || 0) };
+      if (!result.replay) this.store.audit(target.id, "web", principal.account_id, "web.package.admin-migrate", "account", target.id, { version: Number(result.saved?.version || 0) });
+      json(res, 200, response);
+      return;
+    }
     if (method === "GET" && url.pathname === "/api/admin/audit") {
       json(res, 200, { audit: this.store.auditRows(Math.min(500, integer(url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : 200, "limit", 1))) });
       return;
@@ -1103,17 +1679,27 @@ export class RelayServer {
       const passwordHash = await hashPassword(validatePassword(body.newPassword));
       const status = this.store.resetUserPassword(passwordResetMatch[1], passwordHash, principal.account_id);
       if (status === "active") {
-        for (const device of this.store.listDevices(passwordResetMatch[1])) {
-          const sessions = this.devices.get(device.id);
-          if (sessions) for (const session of sessions) session.socket.close(4003, "Password reset");
-        }
+        this.closeAccountSockets(passwordResetMatch[1], "Password reset");
       }
       json(res, 200, { changed: true, status });
+      return;
+    }
+    const totpMatch = /^\/api\/admin\/users\/([^/]+)\/totp$/.exec(url.pathname);
+    if (method === "POST" && totpMatch) {
+      const target = this.store.accountById(totpMatch[1]);
+      if (!target || target.role !== "user") throw new RelayError("NOT_FOUND", "普通用户不存在");
+      const body = asObject(await readJson(req));
+      const enabled = body.enabled === true;
+      const security = this.store.setTotpRequired(target.id, enabled);
+      this.closeAccountSockets(target.id, "TOTP policy changed", undefined, true);
+      this.store.audit(target.id, "web", principal.account_id, enabled ? "totp.require" : "totp.disable", "account", target.id);
+      json(res, 200, { enabled: Boolean(security.totp_required), configured: Boolean(security.totp_secret) });
       return;
     }
     const accountMatch = /^\/api\/admin\/users\/([^/]+)\/(disable|enable)$/.exec(url.pathname);
     if (method === "POST" && accountMatch) {
       this.store.setAccountDisabled(accountMatch[1], accountMatch[2] === "disable", principal.account_id);
+      if (accountMatch[2] === "disable") this.closeAccountSockets(accountMatch[1], "Account disabled");
       json(res, 200, { changed: true });
       return;
     }
@@ -1144,6 +1730,28 @@ export class RelayServer {
     const host = hostToken && this.store.authenticateHost(hostToken);
     if (!host) throw new RelayError("AUTH_FAILED", "Host 更新令牌无效");
     return { accountId: host.account_id as string, kind: "host", id: host.id as string };
+  }
+
+  private webPrincipal(req: IncomingMessage) {
+    const access = bearer(req);
+    const principal = access && this.store.authenticateAccess(access);
+    if (!principal || principal.principal_kind !== "device") throw new RelayError("AUTH_FAILED", "网页会话无效或已过期");
+    const session = this.store.webSessionById(principal.id);
+    if (!session) throw new RelayError("AUTH_FAILED", "网页会话无效或已过期");
+    return session;
+  }
+
+  private async verifyWebProof(login: any, device: any, body: Record<string, unknown>) {
+    await sodium.ready;
+    const signingPublicKey = base64Bytes(device.signing_public_key, "deviceSigningPublicKey");
+    const signature = base64Bytes(body.signature, "signature");
+    const response = base64Bytes(body.boxResponse, "boxResponse");
+    if (signingPublicKey.length !== sodium.crypto_sign_PUBLICKEYBYTES || signature.length !== sodium.crypto_sign_BYTES) {
+      throw new RelayError("INVALID_REQUEST", "设备签名证明格式无效");
+    }
+    const validSignature = sodium.crypto_sign_verify_detached(signature, Buffer.from(login.signing_challenge, "utf8"), signingPublicKey);
+    const expected = base64Bytes(login.box_nonce, "boxNonce");
+    if (!validSignature || !sodium.memcmp(response, expected)) throw new RelayError("AUTH_FAILED", "设备密钥持有证明失败");
   }
 
   private updateFile(relativePath: string) {
@@ -1386,6 +1994,9 @@ export class RelayServer {
     const access = bearer(req);
     const principal = access && this.store.authenticateAccess(access, allowPending);
     if (!principal || principal.principal_kind !== "device") throw new RelayError("AUTH_FAILED", "设备访问令牌无效");
+    if (this.store.db.prepare("SELECT 1 FROM web_devices WHERE device_id=?").get(principal.principal_id)) {
+      throw new RelayError("FORBIDDEN", "网页设备必须使用网页 API");
+    }
     return principal;
   }
 
@@ -1423,10 +2034,20 @@ export class RelayServer {
   }
 
   private serveAdmin(res: ServerResponse, pathname: string) {
-    const root = resolve(this.config.adminDir);
+    this.serveStatic(res, resolve(this.config.adminDir), pathname, false);
+  }
+
+  private serveWeb(res: ServerResponse, pathname: string) {
+    this.serveStatic(res, resolve(this.config.webDir || "web/dist"), pathname.replace(/^\/app(?=\/|$)/, ""), true);
+  }
+
+  private serveStatic(res: ServerResponse, root: string, pathname: string, web: boolean) {
     const relative = normalize(decodeURIComponent(pathname)).replace(/^([/\\])+/, "");
     let file = resolve(root, relative || "index.html");
-    if ((file !== root && !file.startsWith(`${root}${sep}`)) || !existsSync(file) || statSync(file).isDirectory()) file = join(root, "index.html");
+    if ((file !== root && !file.startsWith(`${root}${sep}`)) || !existsSync(file) || statSync(file).isDirectory()) {
+      if (web && extname(relative)) throw new RelayError("NOT_FOUND", "网页资源不存在");
+      file = join(root, "index.html");
+    }
     if (!existsSync(file)) throw new RelayError("NOT_FOUND", "管理后台尚未构建");
     const contentType: Record<string, string> = {
       ".html": "text/html; charset=utf-8",
@@ -1434,10 +2055,19 @@ export class RelayServer {
       ".css": "text/css; charset=utf-8",
       ".svg": "image/svg+xml",
       ".png": "image/png",
+      ".webmanifest": "application/manifest+json; charset=utf-8",
+      ".json": "application/json; charset=utf-8",
+      ".wasm": "application/wasm",
     };
+    // Release-directory dates are not content hashes. Only Vite assets may
+    // receive immutable caching; index/manifest/SW must always revalidate.
+    const isHashedAsset = file.startsWith(`${root}${sep}assets${sep}`) && /-[a-z0-9_-]{8,}\.(?:js|css|wasm)$/i.test(basename(file));
     res.writeHead(200, {
       "content-type": contentType[extname(file)] || "application/octet-stream",
-      "content-security-policy": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
+      "cache-control": isHashedAsset ? "public, max-age=31536000, immutable" : "no-cache",
+      "content-security-policy": web
+        ? "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' ws: wss:"
+        : "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
       "x-frame-options": "DENY",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",

@@ -35,6 +35,7 @@ internal data class RelayCredentials(
     val accountSigningPrivateKey: String? = null,
     val accountEncryptionPrivateKey: String? = null,
     val contentKey: String? = null,
+    val requiresLogin: Boolean = false,
 ) {
     val approved: Boolean get() = deviceStatus == "approved" && !contentKey.isNullOrBlank()
 }
@@ -47,18 +48,21 @@ internal data class PendingHostEnrollment(
     val capturedAt: Long,
 )
 
-internal class SecurePrefs(context: Context) {
+internal class SecurePrefs(context: Context) : RelayCredentialStore {
+    private companion object { val credentialLock = Any() }
     private val prefs = context.getSharedPreferences("relay_v2", Context.MODE_PRIVATE)
     private val alias = "agent-pocket-relay-v2"
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
-    fun save(credentials: RelayCredentials) {
+    override fun save(credentials: RelayCredentials) = synchronized(credentialLock) {
         saveEncrypted("credentials", json.encodeToString(credentials))
     }
 
-    fun load(): RelayCredentials? = runCatching {
-        json.decodeFromString<RelayCredentials>(loadEncrypted("credentials") ?: return null)
-    }.getOrElse { clearCredentials(); null }
+    override fun load(): RelayCredentials? = synchronized(credentialLock) {
+        runCatching {
+            json.decodeFromString<RelayCredentials>(loadEncrypted("credentials") ?: return@synchronized null)
+        }.getOrElse { null }
+    }
 
     fun savePendingHostEnrollment(enrollment: PendingHostEnrollment) {
         saveEncrypted("pendingHostEnrollment", json.encodeToString(enrollment))
@@ -86,29 +90,31 @@ internal class SecurePrefs(context: Context) {
         return UUID.randomUUID().toString().also { prefs.edit().putString("installationId", it).apply() }
     }
 
-    fun clear() {
-        prefs.edit().clear().apply()
+    fun clear() = synchronized(credentialLock) {
+        check(prefs.edit().clear().commit()) { "无法保存退出状态" }
     }
 
-    fun clearCredentials() {
-        prefs.edit().remove("credentials").remove("credentials:iv").remove("iv").apply()
+    override fun clearCredentials() = synchronized(credentialLock) {
+        check(prefs.edit().remove("credentials").remove("credentials:iv").remove("iv").commit()) { "无法保存退出状态" }
     }
 
-    private fun saveEncrypted(name: String, value: String) {
+    private fun saveEncrypted(name: String, value: String) = synchronized(credentialLock) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
-        prefs.edit()
+        val saved = prefs.edit()
             .putString(name, Base64.encodeToString(cipher.doFinal(value.toByteArray()), Base64.NO_WRAP))
             .putString("$name:iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-            .apply()
+            .commit()
+        check(saved) { "无法保存加密登录信息，请检查手机存储空间" }
     }
 
     private fun loadEncrypted(name: String): String? {
-        val encoded = prefs.getString(name, null) ?: return null
+        val snapshot = prefs.all
+        val encoded = snapshot[name] as? String ?: return null
         val encrypted = Base64.decode(encoded, Base64.NO_WRAP)
         // "iv" is the v0.3.1 credential key and remains readable during upgrade.
-        val encodedIv = prefs.getString("$name:iv", null)
-            ?: (if (name == "credentials") prefs.getString("iv", null) else null)
+        val encodedIv = snapshot["$name:iv"] as? String
+            ?: (if (name == "credentials") snapshot["iv"] as? String else null)
             ?: error("加密数据缺少 IV")
         val iv = Base64.decode(encodedIv, Base64.NO_WRAP)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")

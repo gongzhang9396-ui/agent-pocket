@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -13,6 +14,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
+import android.app.Activity
+import android.content.ContextWrapper
 import com.agentpocket.app.data.PocketRepository
 import com.agentpocket.app.data.model.ThreadRef
 import com.agentpocket.app.navigation.Screen
@@ -24,6 +30,7 @@ import com.agentpocket.app.ui.screens.PairingScreen
 import com.agentpocket.app.ui.screens.SessionDetailScreen
 import com.agentpocket.app.ui.screens.SettingsScreen
 import com.agentpocket.app.ui.theme.AgentPocketTheme
+import com.agentpocket.app.ui.theme.SkinStyle
 import com.agentpocket.app.update.AppUpdateManager
 
 /**
@@ -39,7 +46,18 @@ fun PocketApp(
     initialEventId: String? = null,
     launchRequestKey: Long = 0L,
 ) {
-    AgentPocketTheme {
+    val context = LocalContext.current
+    val appearance = remember(context) { context.getSharedPreferences("appearance", android.content.Context.MODE_PRIVATE) }
+    var skin by remember { mutableStateOf(SkinStyle.fromId(appearance.getString("skin", null))) }
+    val view = LocalView.current
+    SideEffect {
+        val activity = generateSequence(context) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<Activity>().firstOrNull()
+        activity?.let { WindowCompat.getInsetsController(it.window, view).apply {
+            isAppearanceLightStatusBars = skin != SkinStyle.Pixel
+            isAppearanceLightNavigationBars = skin != SkinStyle.Pixel
+        } }
+    }
+    AgentPocketTheme(skin = skin, onSkinChange = { selected -> skin = selected; appearance.edit().putString("skin", selected.id).apply() }) {
         val paired by repo.isPaired.collectAsState()
         val updateState by updater.state.collectAsState()
         val backStack = remember {

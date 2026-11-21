@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { randomBytes } from "node:crypto";
 import { WebSocket } from "ws";
 import { RpcError, toRpcError, type BridgeEvent } from "./protocol.ts";
 import type { BridgeServer } from "./server.ts";
@@ -381,6 +382,11 @@ export class RelayConnector extends EventEmitter {
     try {
       await this.flushPendingSnapshot();
       const threads = await this.bridge.dispatchRelay("relay-snapshot", "thread/list", { limit: 200 });
+      if (this.bridge.dsh) {
+        const dsh = await this.bridge.dispatchRelay("relay-snapshot", "thread/list", { agentId: "dsh", limit: 200 });
+        threads.data = [...(threads.data || []), ...dsh.data].sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        threads.dshNextCursor = dsh.nextCursor;
+      }
       const counter = this.identity.snapshotCounter + 1;
       const envelope = await encryptAccountPayload(this.identity, {
         accountId: this.identity.accountId!,
@@ -409,6 +415,10 @@ export async function beginHostEnrollment(relayUrl: string, hostName: string, id
     saveHostIdentity(identityPath, identity);
   }
   if (identity.hostToken) throw new Error("这台 Host 已经完成 Relay 绑定");
+  if (identity.pendingEnrollment) {
+    if (identity.relayUrl !== base.href.replace(/\/$/, "")) throw new Error("上次绑定结果待确认，请使用原 Relay 地址恢复");
+    return { identity, enrollment: identity.pendingEnrollment };
+  }
   const response = await fetch(new URL("api/host/enroll/start", `${base.href.replace(/\/$/, "")}/`), {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -432,6 +442,29 @@ export async function waitForHostEnrollment(
 ) {
   const base = relayHttpUrl(relayUrl);
   const endpoint = (path: string) => new URL(path, `${base.href.replace(/\/$/, "")}/`);
+  const finish = async () => {
+    const pending = identity.pendingEnrollment!;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetch(endpoint("api/host/enroll/complete"), {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enrollmentId: pending.id, secret: pending.secret, proposedHostToken: pending.proposedHostToken }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const completed = await response.json() as any;
+        if (!response.ok && response.status < 500) throw Object.assign(new Error(completed?.error?.message || "完成 Host 绑定失败"), { definitive: true });
+        if (!response.ok) throw new Error("Relay 暂时无法完成绑定");
+        if (completed.hostToken !== pending.proposedHostToken || completed.host?.signing_public_key !== identity.signingPublicKey
+          || completed.host?.encryption_public_key !== identity.encryptionPublicKey) throw Object.assign(new Error("Relay 绑定结果与本地身份不一致"), { definitive: true });
+        await applyHostEnrollment(identity, completed);
+        saveHostIdentity(identityPath, identity);
+        return identity;
+      } catch (error: any) { lastError = error; if (error.definitive) throw error; if (attempt < 2) await delay(2000); }
+    }
+    throw new Error(`绑定结果待确认，本地恢复记录已保留；重新打开配对助手会恢复同一请求。${lastError instanceof Error ? lastError.message : ""}`);
+  };
+  if (identity.pendingEnrollment) return finish();
   while (Date.now() < enrollment.expiresAt) {
     await delay(2000);
     const statusResponse = await fetch(endpoint("api/host/enroll/status"), {
@@ -447,16 +480,11 @@ export async function waitForHostEnrollment(
       expiresAt: Number(status.expiresAt || enrollment.expiresAt),
     });
     if (!status.approved) continue;
-    const completeResponse = await fetch(endpoint("api/host/enroll/complete"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ enrollmentId: enrollment.id, secret: enrollment.secret }),
-    });
-    const completed = await completeResponse.json() as any;
-    if (!completeResponse.ok) throw new Error(completed?.error?.message || "完成 Host 绑定失败");
-    await applyHostEnrollment(identity, completed);
+    identity.pendingEnrollment = { ...enrollment, pairUri: `agentpocket://relay-host?relay=${encodeURIComponent(identity.relayUrl)}&enrollmentId=${enrollment.id}&secret=${enrollment.secret}`, proposedHostToken: randomBytes(32).toString("base64url") };
+    // Persist under CurrentUser DPAPI before submitting the only bearer value.
+    // Relay stores its hash, so a lost response can safely repeat this request.
     saveHostIdentity(identityPath, identity);
-    return identity;
+    return finish();
   }
   throw new Error("Host 绑定二维码已过期，请重新执行绑定");
 }

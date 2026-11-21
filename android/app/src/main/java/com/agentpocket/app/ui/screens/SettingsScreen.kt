@@ -1,5 +1,8 @@
 package com.agentpocket.app.ui.screens
 
+import com.agentpocket.app.ui.theme.SkinGeometry
+import com.agentpocket.app.ui.theme.skinRule
+
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -18,6 +21,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.InstallMobile
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -57,6 +61,7 @@ import com.agentpocket.app.ui.components.ConnectionPill
 import com.agentpocket.app.ui.components.QrScannerButton
 import com.agentpocket.app.ui.components.SectionLabel
 import com.agentpocket.app.ui.theme.AgentPocketTheme
+import com.agentpocket.app.ui.theme.SkinPicker
 import com.agentpocket.app.update.AppUpdateState
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -81,10 +86,22 @@ fun SettingsScreen(
     var currentPassword by rememberSaveable { mutableStateOf("") }
     var newPassword by rememberSaveable { mutableStateOf("") }
     var confirmPassword by rememberSaveable { mutableStateOf("") }
+    var confirmSignOut by rememberSaveable { mutableStateOf(false) }
+
+    if (confirmSignOut) {
+        AlertDialog(
+            onDismissRequest = { confirmSignOut = false },
+            title = { Text("退出并清除手机身份？") },
+            text = { Text("这会删除本机登录凭据和设备密钥。再次登录可能需要其他已信任设备批准。若只是连接异常，请使用“重新登录 Relay”。") },
+            confirmButton = { TextButton(onClick = { confirmSignOut = false; repo.resetPairing() }) { Text("退出并清除") } },
+            dismissButton = { TextButton(onClick = { confirmSignOut = false }) { Text("保留登录") } },
+        )
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier.skinRule(),
                 title = { Text("设置") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -99,6 +116,7 @@ fun SettingsScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            item(key = "appearance", contentType = "card") { SettingsCard { SkinPicker() } }
             item(key = "relay", contentType = "card") {
                 SettingsCard {
                     SectionLabel("Relay")
@@ -221,6 +239,7 @@ fun SettingsScreen(
                     SectionLabel("账号")
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
+                        shape = SkinGeometry.action,
                         onClick = { showPasswordForm = !showPasswordForm },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
@@ -258,6 +277,7 @@ fun SettingsScreen(
                         )
                         Spacer(Modifier.height(8.dp))
                         Button(
+                            shape = SkinGeometry.action,
                             onClick = { repo.changePassword(currentPassword, newPassword) },
                             enabled = currentPassword.length in 12..128 && newPassword.length in 12..128 && confirmPassword == newPassword,
                             modifier = Modifier.fillMaxWidth(),
@@ -275,6 +295,7 @@ fun SettingsScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
+                        shape = SkinGeometry.action,
                         onClick = onReenterPairing,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
@@ -282,7 +303,7 @@ fun SettingsScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     TextButton(
-                        onClick = { repo.resetPairing() },
+                        onClick = { confirmSignOut = true },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text("退出并清除本机凭据")
@@ -298,6 +319,7 @@ fun SettingsScreen(
                         AppUpdateState.Idle -> UpdateText("尚未检查更新")
                         AppUpdateState.Checking -> UpdateText("正在通过 Relay 检查私有更新")
                         AppUpdateState.UpToDate -> UpdateText("当前已是最新版本")
+                        AppUpdateState.SignInRequired -> UpdateText("登录已失效，请重新登录后更新。设备身份已保留。")
                         is AppUpdateState.Available -> UpdateText("发现版本 ${update.version}，安装包约 ${megabytes(update.sizeBytes)} MB")
                         is AppUpdateState.Downloading -> {
                             UpdateText("正在下载版本 ${update.version} · ${update.progress}%")
@@ -309,18 +331,22 @@ fun SettingsScreen(
                     }
                     Spacer(Modifier.height(10.dp))
                     when (updateState) {
-                        is AppUpdateState.Available -> Button(onClick = onDownloadUpdate, modifier = Modifier.fillMaxWidth()) {
+                        AppUpdateState.SignInRequired -> Button(shape = SkinGeometry.action, onClick = onReenterPairing, modifier = Modifier.fillMaxWidth()) {
+                            Text("重新登录并更新")
+                        }
+                        is AppUpdateState.Available -> Button(shape = SkinGeometry.action, onClick = onDownloadUpdate, modifier = Modifier.fillMaxWidth()) {
                             Icon(Icons.Filled.Download, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
                             Text("下载更新")
                         }
-                        is AppUpdateState.Ready -> Button(onClick = onInstallUpdate, modifier = Modifier.fillMaxWidth()) {
+                        is AppUpdateState.Ready -> Button(shape = SkinGeometry.action, onClick = onInstallUpdate, modifier = Modifier.fillMaxWidth()) {
                             Icon(Icons.Filled.InstallMobile, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
                             Text("安装更新")
                         }
                         is AppUpdateState.Downloading -> Unit
                         else -> OutlinedButton(
+                            shape = SkinGeometry.action,
                             onClick = onCheckForUpdates,
                             enabled = updateState !is AppUpdateState.Checking,
                             modifier = Modifier.fillMaxWidth(),
@@ -361,7 +387,7 @@ private fun DeviceRow(item: Device, isCurrent: Boolean, onApprove: () -> Unit, o
             )
         }
         if (item.status == "pending") {
-            Button(onClick = onApprove) { Text("批准") }
+            Button(shape = SkinGeometry.action, onClick = onApprove) { Text("批准") }
         } else {
             TextButton(onClick = onRevoke) { Text(if (isCurrent) "撤销并退出" else "撤销") }
         }

@@ -34,6 +34,8 @@ Source: "payload\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs creat
 Name: "desktopintegration"; Description: "同时连接 Codex Desktop（可选，API 模式无需此项）"; Check: IsFirstInstall
 
 [Icons]
+Name: "{group}\DeepSeek（Pocket 共用）"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\open-dsh-desktop.ps1"""
+Name: "{userdesktop}\DeepSeek（Pocket 共用）"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\open-dsh-desktop.ps1"""
 Name: "{group}\Agent Pocket 配对助手"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\scripts\pairing-assistant.ps1"""
 Name: "{group}\检查 Agent Pocket Host 更新"; Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\check-host-update.ps1"" -InstallDir ""{app}"" -Interactive"
 Name: "{group}\卸载 Agent Pocket Host"; Filename: "{uninstallexe}"

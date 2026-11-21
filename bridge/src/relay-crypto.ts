@@ -28,6 +28,7 @@ export type HostIdentity = {
   acceptedChannelIds?: Record<string, number>;
   pendingEvent?: { bridgeSeq: number; eventId: string; envelope: RelayCipherEnvelope };
   pendingSnapshot?: { envelope: RelayCipherEnvelope };
+  pendingEnrollment?: { id: string; secret: string; expiresAt: number; pairUri: string; proposedHostToken: string };
   _protectedSecrets?: string;
   _protectedSecretHash?: string;
 };
@@ -205,6 +206,7 @@ export function saveHostIdentity(path: string, identity: HostIdentity) {
     encryptionPrivateKey: identity.encryptionPrivateKey,
     hostToken: identity.hostToken,
     contentKey: identity.contentKey,
+    pendingEnrollment: identity.pendingEnrollment,
   };
   const secretText = JSON.stringify(secrets);
   const secretHash = createHash("sha256").update(secretText).digest("hex");
@@ -261,6 +263,7 @@ export async function applyHostEnrollment(identity: HostIdentity, completed: any
   identity.accountSigningPublicKey = String(completed.account.signingPublicKey);
   identity.accountEncryptionPublicKey = String(completed.account.encryptionPublicKey);
   identity.contentKey = contentKey;
+  delete identity.pendingEnrollment;
   return identity;
 }
 

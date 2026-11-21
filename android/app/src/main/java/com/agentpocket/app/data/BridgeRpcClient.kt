@@ -142,9 +142,20 @@ internal class BridgeRpcClient(
         }
     }
 
-    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = finish(null)
+    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+        webSocket.close(code, null)
+        finish(if (code == 4003) BridgeRpcException("Relay 登录已失效", "AUTH_FAILED") else null)
+    }
 
-    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = finish(t)
+    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+        android.util.Log.i("PocketTransport", "WebSocket closed: code=$code")
+        finish(if (code == 4003) BridgeRpcException("Relay 登录已失效", "AUTH_FAILED") else null)
+    }
+
+    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+        android.util.Log.w("PocketTransport", "WebSocket failed: type=${t.javaClass.simpleName}, http=${response?.code ?: 0}")
+        finish(if (response?.code == 401) BridgeRpcException("Relay 登录已失效", "AUTH_FAILED", t) else t)
+    }
 
     private fun finish(cause: Throwable?) {
         if (!finished.compareAndSet(false, true)) return

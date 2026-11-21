@@ -1,0 +1,11 @@
+build/
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+Local.xcconfig
+*.ipa
+*.xcarchive/
+__pycache__/
+
+

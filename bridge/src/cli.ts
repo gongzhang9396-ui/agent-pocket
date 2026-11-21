@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,6 +9,7 @@ import { DesktopAttachClient } from "./desktop-attach.ts";
 import { FcmNotifier } from "./fcm.ts";
 import { GrokAgent, resolveGrokCommand } from "./grok.ts";
 import { GrokNativeCatalog } from "./grok-native-catalog.ts";
+import { DshAgent } from "./dsh.ts";
 import { checkForHostUpdate } from "./host-updater.ts";
 import { BridgeServer } from "./server.ts";
 import { BridgeStore } from "./store.ts";
@@ -75,6 +76,23 @@ export async function printPairingQr(uri: string) {
   } else {
     console.log("\n未找到本地二维码生成器，请使用手动配对码；不会把配对内容上传到第三方服务。");
   }
+}
+
+export function webHostPairingUrl(relayUrl: string, enrollment: { id: string; secret: string }) {
+  const relay = new URL(relayUrl);
+  if (relay.protocol !== "https:" || relay.username || relay.password || relay.pathname !== "/" || relay.search || relay.hash) throw new Error("网页配对需要完整的 HTTPS Relay 根地址");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(enrollment.id) || !/^[A-Za-z0-9_-]{24,128}$/.test(enrollment.secret)) throw new Error("Host 配对码格式无效");
+  const url = new URL("/app/", relay);
+  url.hash = new URLSearchParams({ pair: `${enrollment.id}.${enrollment.secret}` }).toString();
+  return url.href;
+}
+
+export function writeWebPairingLink(uri: string, pairingId: string) {
+  const directory = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "AgentPocket");
+  mkdirSync(directory, { recursive: true });
+  const file = join(directory, `pairing-${pairingId}-web.txt`);
+  writeFileSync(file, uri, { encoding: "utf8", mode: 0o600 });
+  return file;
 }
 
 export function normalizePublicUrl(value: string | undefined) {
@@ -149,10 +167,15 @@ export async function main(argv = process.argv.slice(2)) {
     if (!relayUrl) throw new Error("缺少 Relay 地址；请执行 relay-enroll https://你的Relay域名");
     const started = await beginHostEnrollment(relayUrl, config.hostName, config.relayIdentityPath);
     const pngFile = await writePairingPng(started.enrollment.pairUri, started.enrollment.id, output !== "ndjson");
+    const webUri = webHostPairingUrl(relayUrl, started.enrollment);
+    const webQrFile = await writePairingPng(webUri, `${started.enrollment.id}-web`, false);
+    const webLinkFile = writeWebPairingLink(webUri, started.enrollment.id);
     if (output === "ndjson") {
       console.log(JSON.stringify({
         event: "enrollment_started",
         qrFile: pngFile,
+        webQrFile,
+        webLinkFile,
         expiresAt: started.enrollment.expiresAt,
         relayUrl,
         hostName: config.hostName,
@@ -162,6 +185,7 @@ export async function main(argv = process.argv.slice(2)) {
       if (pngFile) console.log(`\n已生成二维码图片并尝试打开：${pngFile}`);
       console.log("\n请用 Agent Pocket 手机扫码确认这台电脑：");
       await printPairingQr(started.enrollment.pairUri);
+      console.log(`\niPhone / 浏览器：用相机扫描 ${webQrFile || "网页二维码"}，或打开下面链接：\n${webUri}`);
     }
     await waitForHostEnrollment(
       relayUrl,
@@ -233,8 +257,9 @@ export async function main(argv = process.argv.slice(2)) {
     store,
     codex,
     new FcmNotifier(config.firebaseServiceAccount),
-    new DesktopAttachClient(),
+    config.desktopIntegrationEnabled === false ? undefined : new DesktopAttachClient(),
     new GrokAgent(store, config.projectRoots, resolveGrokCommand(config.grokCommand), undefined, new GrokNativeCatalog(config.projectRoots)),
+    new DshAgent(store, config.projectRoots, { runtimeRoot: config.dshRuntimeRoot, home: config.dshHome }),
   );
   await bridge.start();
   const relayIdentity = loadHostIdentity(config.relayIdentityPath);

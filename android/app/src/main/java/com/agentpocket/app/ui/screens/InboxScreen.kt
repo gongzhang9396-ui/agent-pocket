@@ -72,6 +72,10 @@ import com.agentpocket.app.ui.components.HostRuntimeCard
 import com.agentpocket.app.ui.components.ThreadStatusChip
 import com.agentpocket.app.ui.theme.AgentPocketTheme
 import com.agentpocket.app.ui.theme.StatusColors
+import com.agentpocket.app.ui.theme.LocalSkin
+import com.agentpocket.app.ui.theme.SkinStyle
+import com.agentpocket.app.ui.theme.SkinGeometry
+import com.agentpocket.app.ui.theme.skinRule
 
 /** 按 Agent 查看各电脑上的项目与对话。Agent 选择由导航层保留。 */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -85,6 +89,7 @@ fun InboxScreen(
     onOpenSettings: () -> Unit,
 ) {
     val host by repo.host.collectAsState()
+    val skin = LocalSkin.current
     val hosts by repo.hosts.collectAsState()
     val hostRuntimes by repo.hostRuntimes.collectAsState()
     val selectedHostId by repo.selectedHostId.collectAsState()
@@ -117,9 +122,10 @@ fun InboxScreen(
         topBar = {
             Column {
                 TopAppBar(
+                    modifier = Modifier.skinRule(),
                     title = {
                         Column {
-                            Text("Agent Pocket", style = MaterialTheme.typography.titleMedium)
+                            Text("Agent Pocket", style = MaterialTheme.typography.titleLarge)
                             ConnectionPill(state = host.connectionState, relayName = host.relayName)
                         }
                     },
@@ -155,6 +161,9 @@ fun InboxScreen(
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
+                shape = SkinGeometry.panel,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
                 onClick = { onNewTask(selectedAgentId ?: "codex") },
                 icon = { Icon(Icons.Filled.Add, contentDescription = null) },
                 text = { Text(selectedAgent?.let { "新建 ${it.displayName} 任务" } ?: "新建任务") },
@@ -191,6 +200,7 @@ fun InboxScreen(
                                 runtime = hostRuntimes[item.id],
                                 onRefresh = { repo.refreshHostRuntime(item.id) },
                                 onLaunch = { repo.launchDesktop(item.id) },
+                                safeWake = repo.hostSupports("desktop-wake-safe-v2", item.id),
                             )
                         }
                     }
@@ -301,7 +311,7 @@ fun InboxScreen(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 4.dp),
-                    shape = RoundedCornerShape(50),
+                    shape = SkinGeometry.badge,
                     color = MaterialTheme.colorScheme.surface,
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
                 ) {
@@ -355,7 +365,7 @@ private fun StatsRow(running: Int, attention: Int, unread: Int) {
 private fun StatPill(label: String, color: androidx.compose.ui.graphics.Color, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(50),
+        shape = SkinGeometry.badge,
         color = color.copy(alpha = 0.10f),
     ) {
         Text(
@@ -373,7 +383,8 @@ private fun ProjectHeader(section: ThreadSection, collapsed: Boolean, onToggle: 
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onToggle)
-            .padding(top = 10.dp, bottom = 2.dp),
+            .skinRule()
+            .padding(top = 14.dp, bottom = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -397,7 +408,7 @@ private fun ProjectHeader(section: ThreadSection, collapsed: Boolean, onToggle: 
         Spacer(Modifier.weight(1f))
         Spacer(Modifier.width(8.dp))
         Surface(
-            shape = RoundedCornerShape(50),
+            shape = SkinGeometry.badge,
             color = MaterialTheme.colorScheme.surfaceVariant,
         ) {
             Text(
@@ -421,7 +432,7 @@ private fun ThreadCard(thread: ThreadSummary, showHost: Boolean, onClick: () -> 
     Card(
         onClick = onClick,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp),
+        shape = SkinGeometry.panel,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
     ) {
         Column(Modifier.padding(12.dp)) {

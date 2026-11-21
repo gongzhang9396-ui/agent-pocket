@@ -11,7 +11,10 @@ export type BridgeConfig = {
   attachmentsPath?: string;
   codexHome: string;
   codexCommand: string;
+  desktopIntegrationEnabled?: boolean;
   grokCommand?: string;
+  dshRuntimeRoot?: string;
+  dshHome?: string;
   minCodexVersion: string;
   projectRoots: string[];
   firebaseServiceAccount?: string;
@@ -52,7 +55,10 @@ export function loadConfig(
     attachmentsPath,
     codexHome: resolve(env.CODEX_HOME || join(homedir(), ".codex")),
     codexCommand: env.AGENT_POCKET_CODEX || "codex",
+    desktopIntegrationEnabled: env.AGENT_POCKET_DESKTOP_INTEGRATION_ENABLED !== "0",
     grokCommand: env.AGENT_POCKET_GROK,
+    dshRuntimeRoot: env.AGENT_POCKET_DSH_RUNTIME,
+    dshHome: env.DSH_HOME,
     minCodexVersion: env.AGENT_POCKET_MIN_CODEX || "0.150.0-alpha.8",
     projectRoots: roots,
     firebaseServiceAccount: env.AGENT_POCKET_FIREBASE_SERVICE_ACCOUNT,

@@ -1,5 +1,7 @@
 package com.agentpocket.app.ui.screens
 
+import com.agentpocket.app.ui.theme.skinRule
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -61,6 +63,7 @@ fun DiffScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier.skinRule(),
                 title = { Text("代码变更") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {

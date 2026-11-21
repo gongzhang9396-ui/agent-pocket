@@ -27,6 +27,8 @@ For the Agent Pocket Bridge, Codex Desktop initialization now makes a best-effor
 - `thread/create`
 - `thread/send`
 - `thread/wait`
+- `thread/approvals`
+- `approval/respond` (only command/file requests; `desktop-approval-v1` required)
 
 `project/list` maps to Desktop's `list_projects`. The Bridge exposes only valid local projects whose canonical paths remain inside its configured project roots.
 
@@ -41,3 +43,11 @@ The detached host is not a watchdog: it does not monitor, restart, or take owner
 The Bridge pipe and registration file are created only when Codex Desktop provides `CODEX_APP_TOOLS_PIPE_PATH`. If an independent app-server loads the plugin, `desktop_attach_probe` reports `not-desktop-host` and that process is not allowed to publish or replace the Desktop registration. A new plugin process also needs a real Desktop caller task id from the host environment or an initial `desktop_attach_probe`; it never fabricates a caller id for background Bridge requests.
 
 The implementation relies on the internal `CODEX_APP_TOOLS_PIPE_PATH` environment variable supplied by Codex Desktop. This is not a public compatibility contract. If the pipe or required task tools are unavailable, write calls fail closed and Agent Pocket must not fall back to another writer for a Desktop-owned task.
+
+## Native approvals
+
+The two approval methods use a separate, short-lived connection to Desktop's local follower pipe (`\\\\.\\pipe\\codex-ipc` on Windows). The authenticated Bridge remains the only caller; no approval MCP tool or network listener is added. `thread/approvals` requires a fresh local snapshot with matching thread, canonical directory and native owner. The registration capability describes adapter support; individual cards are enabled only after this live check succeeds.
+
+`approval/respond` rechecks the native request identity, full content fingerprint, owner and allowed choices before forwarding to the original Desktop owner. Supported choices are allow once, deny and cancel. Permissions, MCP forms, identity verification, unsupported versions and incomplete request details remain Desktop-only. Short connections never resume threads or acquire a writer. The Bridge durably reserves the native request before IPC and prevents replay after a lost acknowledgement, including when a caller supplies a different operation ID.
+
+See [the approval contract and validation guide](../docs/DESKTOP-APPROVALS.md) for deployment, tests and the distinction between synthetic protocol coverage and real Desktop validation.

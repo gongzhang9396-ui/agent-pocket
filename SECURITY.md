@@ -15,6 +15,7 @@ Use [GitHub private vulnerability reporting](https://github.com/gongzhang9396-ui
 - Routing metadata remains visible to Relay: account, Host, device, channel, counter, event type, timing and ciphertext size.
 - The offline administrator recovery private key can recover account keys to a new device. This is administrator-custodied E2EE, not absolute zero knowledge.
 - Codex Desktop remains the only writer for Desktop-owned tasks. Never remove writer locks or fall back to a second app-server.
+- Experimental Desktop approval forwarding is limited to live command/file requests on the local native owner. Native request identity includes the thread, owner client and typed request ID; the full request fingerprint and canonical project directory are checked again before forwarding. Persistent request reservations prohibit repeat submissions after unknown outcomes, even with a new operation ID or a Host restart. No persistent approval scope, identity-verification challenge or generic native RPC is exposed.
 
 ## Deployment rules
 
@@ -28,6 +29,19 @@ Use [GitHub private vulnerability reporting](https://github.com/gongzhang9396-ui
 - Persist event and snapshot outboxes before upload; an acknowledgement retry must reuse the exact same signed metadata and ciphertext.
 - Do not place model-provider API keys, recovery private keys or Host update private keys in Android, Relay or Git.
 - Do not modify unrelated proxies, VPNs, firewall rules or UDP listeners as part of Agent Pocket deployment.
+
+## Web client trust boundary (v3)
+
+- `/app` is same-origin with Relay and is disabled unless `AGENT_POCKET_WEB_ENABLED=true`; `/admin` remains a separate administrator-cookie surface and `/invite` remains an activation surface.
+- Web login sends the account password over the configured HTTPS origin. Relay checks the password and, when enabled, standard SHA-1/6-digit/30-second TOTP. TOTP authenticates the online session; it is deliberately not part of the static key-package KDF.
+- Relay stores only the password-encrypted web key package (`Argon2id + XChaCha20-Poly1305`) and routing metadata. The browser derives the package key locally, unlocks the account signing/encryption keys and `contentKey`, and keeps access tokens in memory.
+- A self-hosted Relay process, HTTPS terminator and `/app` JavaScript are trusted components. A malicious Relay can record the password and TOTP or replace the JavaScript and therefore can decrypt the package. TOTP, CSP and ciphertext-at-rest do not defend against a malicious Relay.
+- Web devices use independent Ed25519/X25519 keys. Automatic approval requires both a signature challenge and an X25519 sealed-challenge response; password or TOTP alone never approves a device. Device revocation closes its WebSockets and all tabs clear in-memory keys.
+- First-time iPhone accounts are explicitly provisioned with a durable web-only activation policy. Legacy Android activation cannot claim them. Browser-generated account/device keys prove both Ed25519 and X25519 possession; the challenge binds the configured origin, provision, credential verifier, operation and encrypted material. Activation commits the account and encrypted package atomically, forces TOTP enrollment, and issues no device or session. Exact completed-request receipts support uncertain-result recovery; credential reset and cancellation invalidate pending transactions.
+- Host web pairing uses the same five-minute enrollment capability as Android. The browser rejects foreign Relay origins, shows the Host name/key fingerprint for confirmation, and seals the unchanged account content key to that Host. The link secret stays in the URL fragment until consumed, then only in page memory; it is never placed in server access-log queries or installed release files. The local assistant QR/link files remain sensitive until expiration.
+- Lock clears plaintext keys, task contents and channels while retaining only the encrypted IndexedDB record. Logout revokes the web session. “Forget device” clears IndexedDB first and reports server revocation separately if the network is unavailable. Closing a tab only closes its browser connection; it never interrupts a Host task.
+- Browser WebSockets use a single-use, 60-second ticket in `Sec-WebSocket-Protocol`; long-lived access and refresh tokens are never placed in a URL. Service Worker caching is limited to the public static shell and never includes API responses, tokens, key packages, task ciphertext or attachments.
+- Browser Markdown is escaped and rendered through a small URL allowlist; the web client does not inject arbitrary HTML or executable attachment content. Attachment names/MIME types are validated before upload and unknown types are not rendered. Attachments remain capped at three total, 450 KiB per image, 512 KiB per file and 800 KiB aggregate, with the final encrypted envelope measured before send.
 
 ## Release rules
 

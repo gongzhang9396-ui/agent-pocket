@@ -11,7 +11,10 @@ import android.util.Base64
 import androidx.core.content.FileProvider
 import com.agentpocket.app.BuildConfig
 import com.agentpocket.app.data.RelayCrypto
-import com.agentpocket.app.data.SecurePrefs
+import com.agentpocket.app.data.AccessRejectedException
+import com.agentpocket.app.data.RelaySessionManager
+import com.agentpocket.app.data.RelaySessionSnapshot
+import com.agentpocket.app.data.SignInRequiredException
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -34,6 +37,7 @@ sealed interface AppUpdateState {
     data object Idle : AppUpdateState
     data object Checking : AppUpdateState
     data object UpToDate : AppUpdateState
+    data object SignInRequired : AppUpdateState
     data class Available(val version: String, val sizeBytes: Long) : AppUpdateState
     data class Downloading(val version: String, val progress: Int) : AppUpdateState
     data class Ready(val version: String) : AppUpdateState
@@ -124,76 +128,84 @@ private fun sameOrigin(endpoint: String, downloadUrl: String): Boolean = runCatc
         download.userInfo == null && download.query == null && download.fragment == null && download.path.startsWith("/api/updates/android/")
 }.getOrDefault(false)
 
-class AppUpdateManager(private val context: Context) {
+class AppUpdateManager internal constructor(private val context: Context, private val sessions: RelaySessionManager) {
     private val json = Json { ignoreUnknownKeys = true }
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _state = MutableStateFlow<AppUpdateState>(AppUpdateState.Idle)
     val state: StateFlow<AppUpdateState> = _state.asStateFlow()
 
     private var activeJob: Job? = null
-    private var candidate: UpdateCandidate? = null
-    private var downloadedFile: File? = null
+    @Volatile private var candidate: UpdateCandidate? = null
+    @Volatile private var candidateSession: RelaySessionSnapshot? = null
+    @Volatile private var downloadedFile: File? = null
 
-    fun checkForUpdates() {
+    @Synchronized fun checkForUpdates() {
         if (activeJob?.isActive == true || _state.value is AppUpdateState.Downloading) return
         activeJob = scope.launch {
             _state.value = AppUpdateState.Checking
+            candidate = null
+            candidateSession = null
+            downloadedFile = null
             runCatching {
-                val credentials = SecurePrefs(context).load()?.takeIf { it.approved }
-                    ?: return@runCatching AppUpdateState.UpToDate
+                val session = sessions.snapshot()
                 if (BuildConfig.UPDATE_PUBLIC_KEY_SPKI.isBlank()) throw IOException("当前安装包未配置更新签名公钥")
-                val request = Request.Builder()
-                    .url("${credentials.endpoint.trimEnd('/')}/api/updates/android/latest")
-                    .header("Authorization", "Bearer ${credentials.accessToken}")
-                    .header("Accept", "application/json")
-                    .header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}")
-                    .build()
-                val release = client.newCall(request).execute().use { response ->
-                    if (response.code == 404) return@use null
-                    if (!response.isSuccessful) throw IOException("更新检查失败 (${response.code})")
-                    val body = response.body?.string() ?: throw IOException("更新检查返回为空")
-                    json.decodeFromString<RelayUpdateResponse>(body)
+                val release = sessions.read(session) { credentials ->
+                    val request = Request.Builder()
+                        .url("${credentials.endpoint.trimEnd('/')}/api/updates/android/latest")
+                        .header("Authorization", "Bearer ${credentials.accessToken}")
+                        .header("Accept", "application/json")
+                        .header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}")
+                        .build()
+                    client.newCall(request).execute().use { response ->
+                        if (response.code == 401) throw AccessRejectedException()
+                        if (response.code == 404) return@use null
+                        if (!response.isSuccessful) throw IOException("更新检查失败 (${response.code})")
+                        val body = response.body?.string() ?: throw IOException("更新检查返回为空")
+                        json.decodeFromString<RelayUpdateResponse>(body)
+                    }
                 }
-                if (release == null) {
-                    candidate = null
-                    AppUpdateState.UpToDate
-                } else {
-                    if (!sameOrigin(credentials.endpoint, release.downloadUrl)) throw IOException("更新下载地址不属于当前 Relay")
+                val next = release?.let {
+                    if (!sameOrigin(session.credentials.endpoint, release.downloadUrl)) throw IOException("更新下载地址不属于当前 Relay")
                     val signatureValid = UpdateProtocol.verifyManifest(
                         release.manifestJson,
                         release.manifestSignature,
                         BuildConfig.UPDATE_PUBLIC_KEY_SPKI,
                     )
-                    val next = UpdateProtocol.candidate(release, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE.toLong(), signatureValid)
-                    candidate = next
-                    if (next == null) AppUpdateState.UpToDate
-                    else AppUpdateState.Available(next.version, next.size)
+                    UpdateProtocol.candidate(release, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE.toLong(), signatureValid)
                 }
-            }.onSuccess { _state.value = it }
-                .onFailure { _state.value = AppUpdateState.Error(updateError(it)) }
+                sessions.withCurrent(session) {
+                    candidate = next
+                    candidateSession = session
+                    _state.value = if (next == null) AppUpdateState.UpToDate else AppUpdateState.Available(next.version, next.size)
+                }
+            }.onFailure { _state.value = failureState(it) }
         }
     }
 
-    fun downloadUpdate() {
+    @Synchronized fun downloadUpdate() {
         val update = candidate ?: run {
             checkForUpdates()
             return
         }
+        val session = candidateSession ?: return
         if (activeJob?.isActive == true) return
         activeJob = scope.launch {
             _state.value = AppUpdateState.Downloading(update.version, 0)
             runCatching {
-                val credentials = SecurePrefs(context).load()?.takeIf { it.approved && sameOrigin(it.endpoint, update.downloadUrl) }
-                    ?: throw IOException("登录已失效，请重新登录后下载")
+                sessions.withCurrent(session) {
+                    if (!sameOrigin(it.endpoint, update.downloadUrl)) throw IOException("更新下载地址不属于当前 Relay")
+                }
                 val updateDir = File(context.cacheDir, "updates").apply { mkdirs() }
                 updateDir.listFiles()?.forEach { if (it.isFile) it.delete() }
                 val partial = File(updateDir, "${update.name}.part")
                 val target = File(updateDir, update.name)
-                downloadApk(update, partial, credentials.accessToken)
+                sessions.read(session) { credentials -> downloadApk(update, partial, credentials.accessToken) }
                 val actualChecksum = sha256(partial)
                 if (partial.length() != update.size || actualChecksum != update.sha256) throw IOException("APK 校验失败，请重新下载")
                 if (!partial.renameTo(target)) {
@@ -201,14 +213,20 @@ class AppUpdateManager(private val context: Context) {
                     partial.delete()
                 }
                 verifyInstallablePackage(target)
-                downloadedFile = target
-                AppUpdateState.Ready(update.version)
-            }.onSuccess { _state.value = it }
-                .onFailure { _state.value = AppUpdateState.Error(updateError(it)) }
+                sessions.withCurrent(session) {
+                    downloadedFile = target
+                    _state.value = AppUpdateState.Ready(update.version)
+                }
+            }.onFailure { _state.value = failureState(it) }
         }
     }
 
     fun installUpdate() {
+        val session = candidateSession ?: return
+        try { sessions.withCurrent(session) { } } catch (error: IOException) {
+            _state.value = failureState(error)
+            return
+        }
         val file = downloadedFile?.takeIf(File::isFile) ?: run {
             _state.value = AppUpdateState.Error("更新文件已失效，请重新下载")
             return
@@ -234,6 +252,7 @@ class AppUpdateManager(private val context: Context) {
             .header("User-Agent", "Agent-Pocket/${BuildConfig.VERSION_NAME}")
             .build()
         client.newCall(request).execute().use { response ->
+            if (response.code == 401) throw AccessRejectedException()
             if (!response.isSuccessful) throw IOException("APK 下载失败 (${response.code})")
             val body = response.body ?: throw IOException("APK 下载返回为空")
             val declared = body.contentLength()
@@ -337,5 +356,8 @@ class AppUpdateManager(private val context: Context) {
         is IOException -> error.message ?: "更新失败，请稍后重试"
         else -> "更新失败，请稍后重试"
     }
+
+    private fun failureState(error: Throwable): AppUpdateState =
+        if (error is SignInRequiredException) AppUpdateState.SignInRequired else AppUpdateState.Error(updateError(error))
 
 }

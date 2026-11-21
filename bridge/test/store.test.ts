@@ -47,6 +47,25 @@ test("pending responses are idempotent", () => {
   store.close();
 });
 
+test("operation records replay, reject fingerprint conflicts, and preserve unknown state", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-pocket-operation-"));
+  const path = join(dir, "test.db");
+  const first = new BridgeStore(path);
+  assert.equal(first.recordOperation("op-1", "turn/start", "fp-1").created, true);
+  assert.equal(first.updateOperation("op-1", "succeeded", { turnId: "turn-1" }).status, "succeeded");
+  assert.deepEqual(first.recordOperation("op-1", "turn/start", "fp-1").result, { turnId: "turn-1" });
+  assert.throws(() => first.recordOperation("op-1", "turn/start", "different"), (error: any) => error?.nameCode === "CONFLICT");
+  first.recordOperation("op-2", "turn/start", "fp-2");
+  assert.equal(first.updateOperation("op-2", { state: "unknown", error: { reason: "timeout" } }).state, "unknown");
+  first.close();
+
+  const reopened = new BridgeStore(path);
+  assert.equal(reopened.getOperation("op-1")?.status, "succeeded");
+  assert.equal(reopened.getOperation("op-2")?.status, "unknown");
+  assert.deepEqual(reopened.getOperation("op-2")?.error, { reason: "timeout" });
+  reopened.close();
+});
+
 test("thread owner claims are exclusive and persist across Bridge restarts", () => {
   const dir = mkdtempSync(join(tmpdir(), "agent-pocket-owner-"));
   const path = join(dir, "test.db");

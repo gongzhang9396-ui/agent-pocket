@@ -18,6 +18,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.agentpocket.app.ui.theme.AgentAccents
+import com.agentpocket.app.ui.theme.LocalSkin
+import com.agentpocket.app.ui.theme.SkinStyle
+import com.agentpocket.app.ui.theme.SkinGeometry
+import androidx.compose.ui.graphics.lerp
 
 enum class AgentKind(val id: String) {
     Codex("codex"),
@@ -66,10 +70,11 @@ object AgentRegistry {
 
 @Composable
 fun AgentBadge(agent: AgentProfile, modifier: Modifier = Modifier) {
-    val color = if (agent.available) agent.accent else MaterialTheme.colorScheme.onSurfaceVariant
+    val color = if (!agent.available) MaterialTheme.colorScheme.onSurfaceVariant
+        else if (LocalSkin.current == SkinStyle.Pixel) lerp(agent.accent, Color.White, 0.55f) else agent.accent
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(6.dp),
+        shape = SkinGeometry.badge,
         color = color.copy(alpha = if (agent.available) 0.14f else 0.08f),
     ) {
         Row(
@@ -80,7 +85,7 @@ fun AgentBadge(agent: AgentProfile, modifier: Modifier = Modifier) {
             Box(
                 Modifier
                     .size(6.dp)
-                    .clip(CircleShape)
+                    .clip(SkinGeometry.badge)
                     .background(color.copy(alpha = if (agent.available) 1f else 0.5f)),
             )
             Text(

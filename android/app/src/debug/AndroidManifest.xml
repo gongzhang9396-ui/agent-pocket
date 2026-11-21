@@ -2,5 +2,6 @@
     <application>
         <!-- Debug-only, deterministic UI preview; absent from release builds. -->
         <activity android:name=".UiPreviewActivity" android:exported="true" />
+        <activity android:name=".LegacyMigrationActivity" android:exported="true" />
     </application>
 </manifest>
